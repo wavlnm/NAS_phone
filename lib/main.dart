@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 
 void main() {
@@ -43,6 +44,18 @@ class _NasHomePageState extends State<NasHomePage> {
 
   ProbeState _probeState = const ProbeState.idle();
   bool _isProbing = false;
+  bool _isLoadingFiles = false;
+  bool _isUploading = false;
+
+  Uri? _baseUri;
+  String? _authToken;
+  String _currentDirectory = '/';
+  List<FileBrowserEntry> _entries = const [];
+  String? _fileError;
+  String? _busyEntryPath;
+
+  bool get _hasFileSession => _baseUri != null && _authToken != null;
+  bool get _canGoUp => _hasFileSession && _currentDirectory != '/';
 
   @override
   void dispose() {
@@ -51,8 +64,9 @@ class _NasHomePageState extends State<NasHomePage> {
   }
 
   Future<void> _probeHost() async {
-    final uri = _buildProbeUri(_hostController.text);
-    if (uri == null) {
+    final baseUri = _buildBaseUri(_hostController.text);
+    if (baseUri == null) {
+      _resetFileSession();
       setState(() {
         _probeState = const ProbeState.error('请输入可访问的宿主地址，例如 http://192.168.1.10:5034。');
       });
@@ -60,75 +74,52 @@ class _NasHomePageState extends State<NasHomePage> {
     }
 
     FocusScope.of(context).unfocus();
-
     setState(() {
       _isProbing = true;
       _probeState = const ProbeState.loading();
+      _fileError = null;
     });
 
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
-
     try {
-      final request = await client.getUrl(uri).timeout(const Duration(seconds: 8));
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
+      final status = await _fetchHostStatus(baseUri);
 
-      final response = await request.close().timeout(const Duration(seconds: 8));
-      final responseBody = await utf8.decodeStream(response).timeout(const Duration(seconds: 8));
+      String? token;
+      FileBrowserDirectory? directory;
+      String? fileError;
+
+      try {
+        token = await _loginToFileBrowser(baseUri);
+        directory = await _fetchDirectory(baseUri, token, '/');
+      } on NasApiException catch (error) {
+        fileError = error.message;
+      }
 
       if (!mounted) {
         return;
       }
 
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        setState(() {
-          _probeState = ProbeState.error(
-            '宿主返回了 ${response.statusCode}。${_compactBody(responseBody)}',
-          );
-        });
-        return;
-      }
-
       setState(() {
-        _probeState = _parseProbeState(uri, responseBody);
-      });
-    } on TimeoutException {
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        _probeState = const ProbeState.error('连接超时，请确认手机和宿主在同一网络，且 5034 端口可访问。');
-      });
-    } on SocketException catch (error) {
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        _probeState = ProbeState.error('无法连接宿主：${error.message}');
-      });
-    } on HttpException catch (error) {
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        _probeState = ProbeState.error('请求失败：${error.message}');
-      });
-    } on FormatException {
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
+        _baseUri = baseUri;
+        _authToken = token;
+        _currentDirectory = directory?.path ?? '/';
+        _entries = directory?.items ?? const [];
+        _fileError = fileError;
         _probeState = ProbeState.success(
-          endpoint: uri.origin,
-          hostName: '宿主已响应',
-          detail: '接口返回了非 JSON 内容，请确认目标是 loal_NAS 宿主的 /api/system/status。',
+          endpoint: baseUri.origin,
+          hostName: status.hostName,
+          detail: _buildProbeDetail(status, fileError: fileError),
         );
       });
+    } on NasApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      _resetFileSession();
+      setState(() {
+        _probeState = ProbeState.error(error.message);
+      });
     } finally {
-      client.close(force: true);
       if (mounted) {
         setState(() {
           _isProbing = false;
@@ -137,49 +128,343 @@ class _NasHomePageState extends State<NasHomePage> {
     }
   }
 
-  Uri? _buildProbeUri(String input) {
+  Future<void> _refreshFiles({String? path, bool showLoading = true}) async {
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null) {
+      return;
+    }
+
+    if (showLoading) {
+      setState(() {
+        _isLoadingFiles = true;
+        _fileError = null;
+      });
+    }
+
+    try {
+      final directory = await _fetchDirectory(baseUri, token, path ?? _currentDirectory);
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _currentDirectory = directory.path;
+        _entries = directory.items;
+        _fileError = null;
+      });
+    } on NasApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _fileError = error.message;
+      });
+    } finally {
+      if (mounted && showLoading) {
+        setState(() {
+          _isLoadingFiles = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _pickAndUploadFiles() async {
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null || _isUploading) {
+      return;
+    }
+
+    final files = await openFiles();
+    if (files.isEmpty) {
+      return;
+    }
+
+    setState(() {
+      _isUploading = true;
+      _fileError = null;
+    });
+
+    try {
+      for (final file in files) {
+        await _uploadFile(baseUri, token, _currentDirectory, file);
+      }
+
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已上传 ${files.length} 个文件。')),
+      );
+      await _refreshFiles(showLoading: false);
+    } on NasApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _fileError = error.message;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message)),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isUploading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _deleteEntry(FileBrowserEntry entry) async {
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null) {
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('删除确认'),
+        content: Text('确定要删除 ${entry.name} 吗？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) {
+      return;
+    }
+
+    setState(() {
+      _busyEntryPath = entry.path;
+      _fileError = null;
+    });
+
+    try {
+      await _deleteResource(baseUri, token, entry.path);
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${entry.name} 已删除。')),
+      );
+      await _refreshFiles(showLoading: false);
+    } on NasApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _fileError = error.message;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message)),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busyEntryPath = null;
+        });
+      }
+    }
+  }
+
+  Uri? _buildBaseUri(String input) {
     final trimmed = input.trim();
     if (trimmed.isEmpty) {
       return null;
     }
 
     final normalized = trimmed.contains('://') ? trimmed : 'http://$trimmed';
-    final baseUri = Uri.tryParse(normalized);
-    if (baseUri == null || baseUri.host.isEmpty) {
+    final uri = Uri.tryParse(normalized);
+    if (uri == null || uri.host.isEmpty) {
       return null;
     }
 
-    return baseUri.replace(path: '/api/system/status', query: '');
+    return Uri.parse(uri.origin);
   }
 
-  ProbeState _parseProbeState(Uri uri, String body) {
-    final decoded = jsonDecode(body);
-    if (decoded is! Map<String, dynamic>) {
-      return ProbeState.success(
-        endpoint: uri.origin,
-        hostName: '宿主已响应',
-        detail: _compactBody(body),
-      );
+  Future<NasHostStatus> _fetchHostStatus(Uri baseUri) async {
+    final response = await _sendTextRequest(
+      baseUri.replace(path: '/api/system/status'),
+      headers: const {HttpHeaders.acceptHeader: 'application/json'},
+    );
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw NasApiException('宿主返回了 ${response.statusCode}。${_compactBody(response.body)}');
     }
 
-    final hostName = decoded['name']?.toString() ?? 'loal_NAS 宿主';
-    final fileBrowser = decoded['fileBrowser'];
-    final running = fileBrowser is Map ? fileBrowser['running'] as bool? : null;
-    final baseUrl = fileBrowser is Map ? fileBrowser['baseUrl']?.toString() : null;
-    final sharedRoot = fileBrowser is Map ? fileBrowser['sharedRoot']?.toString() : null;
+    try {
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map<String, dynamic>) {
+        throw const FormatException('Unexpected response');
+      }
 
-    final details = <String>[
-      '状态接口可达。',
-      if (running != null) 'FileBrowser: ${running ? '运行中' : '未运行'}',
-      if (baseUrl != null && baseUrl.isNotEmpty) '内部地址: $baseUrl',
-      if (sharedRoot != null && sharedRoot.isNotEmpty) '共享目录: $sharedRoot',
-    ].join('\n');
+      return NasHostStatus.fromJson(decoded);
+    } on FormatException {
+      throw const NasApiException('宿主状态接口返回了非 JSON 内容。');
+    }
+  }
 
-    return ProbeState.success(
-      endpoint: uri.origin,
-      hostName: hostName,
-      detail: details,
+  Future<String> _loginToFileBrowser(Uri baseUri) async {
+    final response = await _sendTextRequest(baseUri.replace(path: '/api/filebrowser/login'));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw NasApiException('FileBrowser 登录失败：${response.statusCode}。${_compactBody(response.body)}');
+    }
+
+    final token = response.body.trim();
+    if (token.isEmpty) {
+      throw const NasApiException('FileBrowser 登录失败：token 为空。');
+    }
+
+    return token;
+  }
+
+  Future<FileBrowserDirectory> _fetchDirectory(Uri baseUri, String token, String resourcePath) async {
+    final response = await _sendTextRequest(
+      _buildResourceUri(baseUri, resourcePath),
+      headers: {'X-Auth': token, HttpHeaders.acceptHeader: 'application/json'},
     );
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw NasApiException('读取文件列表失败：${response.statusCode}。${_compactBody(response.body)}');
+    }
+
+    try {
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map<String, dynamic>) {
+        throw const FormatException('Unexpected response');
+      }
+
+      return FileBrowserDirectory.fromJson(decoded);
+    } on FormatException {
+      throw const NasApiException('文件列表接口返回了无法解析的内容。');
+    }
+  }
+
+  Future<void> _uploadFile(Uri baseUri, String token, String directoryPath, XFile file) async {
+    final targetPath = _joinResourcePath(directoryPath, file.name);
+    final uri = _buildResourceUri(baseUri, targetPath, queryParameters: const {'override': 'true'});
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
+
+    try {
+      final request = await client.postUrl(uri).timeout(const Duration(seconds: 15));
+      request.headers.set('X-Auth', token);
+      request.headers.contentType = ContentType.binary;
+      request.contentLength = await file.length();
+      await request.addStream(file.openRead()).timeout(const Duration(seconds: 30));
+
+      final response = await request.close().timeout(const Duration(seconds: 30));
+      final body = await utf8.decodeStream(response).timeout(const Duration(seconds: 30));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw NasApiException('上传 ${file.name} 失败：${response.statusCode}。${_compactBody(body)}');
+      }
+    } on TimeoutException {
+      throw NasApiException('上传 ${file.name} 超时。');
+    } on SocketException catch (error) {
+      throw NasApiException('上传 ${file.name} 失败：${error.message}');
+    } on HttpException catch (error) {
+      throw NasApiException('上传 ${file.name} 失败：${error.message}');
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> _deleteResource(Uri baseUri, String token, String resourcePath) async {
+    final response = await _sendTextRequest(
+      _buildResourceUri(baseUri, resourcePath),
+      method: 'DELETE',
+      headers: {'X-Auth': token},
+    );
+
+    if (response.statusCode != 204 && response.statusCode != 200) {
+      throw NasApiException('删除失败：${response.statusCode}。${_compactBody(response.body)}');
+    }
+  }
+
+  Future<SimpleHttpResponse> _sendTextRequest(
+    Uri uri, {
+    String method = 'GET',
+    Map<String, String>? headers,
+  }) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+
+    try {
+      late HttpClientRequest request;
+      switch (method) {
+        case 'DELETE':
+          request = await client.deleteUrl(uri).timeout(const Duration(seconds: 8));
+          break;
+        case 'GET':
+          request = await client.getUrl(uri).timeout(const Duration(seconds: 8));
+          break;
+        default:
+          request = await client.openUrl(method, uri).timeout(const Duration(seconds: 8));
+      }
+
+      headers?.forEach(request.headers.set);
+      final response = await request.close().timeout(const Duration(seconds: 8));
+      final body = await utf8.decodeStream(response).timeout(const Duration(seconds: 8));
+      return SimpleHttpResponse(response.statusCode, body);
+    } on TimeoutException {
+      throw const NasApiException('请求超时，请确认宿主仍然在线。');
+    } on SocketException catch (error) {
+      throw NasApiException('无法连接宿主：${error.message}');
+    } on HttpException catch (error) {
+      throw NasApiException('请求失败：${error.message}');
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Uri _buildResourceUri(Uri baseUri, String resourcePath, {Map<String, String>? queryParameters}) {
+    final encodedPath = _encodeResourcePath(resourcePath);
+    return baseUri.replace(
+      path: '/api/filebrowser/resources$encodedPath',
+      queryParameters: queryParameters,
+    );
+  }
+
+  String _buildProbeDetail(NasHostStatus status, {String? fileError}) {
+    final lines = <String>[
+      '状态接口可达。',
+      if (status.fileBrowserRunning != null)
+        'FileBrowser: ${status.fileBrowserRunning! ? '运行中' : '未运行'}',
+      if (status.fileBrowserBaseUrl != null && status.fileBrowserBaseUrl!.isNotEmpty)
+        '内部地址: ${status.fileBrowserBaseUrl}',
+      if (status.sharedRoot != null && status.sharedRoot!.isNotEmpty)
+        '共享目录: ${status.sharedRoot}',
+      if (fileError == null)
+        '已连接 FileBrowser，可浏览、上传、删除文件。'
+      else
+        '宿主在线，但文件接口连接失败：$fileError',
+    ];
+
+    return lines.join('\n');
+  }
+
+  void _resetFileSession() {
+    _baseUri = null;
+    _authToken = null;
+    _currentDirectory = '/';
+    _entries = const [];
+    _fileError = null;
+    _busyEntryPath = null;
   }
 
   String _compactBody(String body) {
@@ -227,7 +512,7 @@ class _NasHomePageState extends State<NasHomePage> {
                   ),
                   SizedBox(height: 12),
                   Text(
-                    '先验证手机能否访问宿主的 /api/system/status，后续再接登录、文件浏览和上传。',
+                    '连接成功后直接复用 FileBrowser 原生接口，展示文件列表，并支持上传和删除。',
                     style: TextStyle(
                       color: Color(0xFFD1FAE5),
                       height: 1.5,
@@ -243,10 +528,7 @@ class _NasHomePageState extends State<NasHomePage> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      '宿主地址',
-                      style: theme.textTheme.titleMedium,
-                    ),
+                    Text('宿主地址', style: theme.textTheme.titleMedium),
                     const SizedBox(height: 12),
                     TextField(
                       controller: _hostController,
@@ -273,13 +555,11 @@ class _NasHomePageState extends State<NasHomePage> {
                                 child: CircularProgressIndicator(strokeWidth: 2),
                               )
                             : const Icon(Icons.wifi_tethering),
-                        label: Text(_isProbing ? '探测中...' : '探测宿主'),
+                        label: Text(_isProbing ? '连接中...' : '连接并加载文件'),
                       ),
                     ),
                     const SizedBox(height: 12),
-                    const Text(
-                      '提示：IPv6 地址必须带中括号，例如 http://[fc00::55:ca]:5034。',
-                    ),
+                    const Text('提示：IPv6 地址必须带中括号，例如 http://[fc00::55:ca]:5034。'),
                   ],
                 ),
               ),
@@ -291,10 +571,7 @@ class _NasHomePageState extends State<NasHomePage> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      '探测结果',
-                      style: theme.textTheme.titleMedium,
-                    ),
+                    Text('探测结果', style: theme.textTheme.titleMedium),
                     const SizedBox(height: 12),
                     Text(
                       _probeState.headline,
@@ -312,6 +589,116 @@ class _NasHomePageState extends State<NasHomePage> {
                     if (_probeState.hostName != null) ...[
                       const SizedBox(height: 8),
                       Text('宿主名称: ${_probeState.hostName}'),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('文件列表', style: theme.textTheme.titleMedium),
+                    const SizedBox(height: 12),
+                    Text('当前目录: $_currentDirectory'),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        FilledButton.tonalIcon(
+                          onPressed: _hasFileSession && !_isLoadingFiles ? () => _refreshFiles() : null,
+                          icon: const Icon(Icons.refresh),
+                          label: const Text('刷新'),
+                        ),
+                        FilledButton.tonalIcon(
+                          onPressed: _canGoUp && !_isLoadingFiles
+                              ? () => _refreshFiles(path: _parentDirectoryPath(_currentDirectory))
+                              : null,
+                          icon: const Icon(Icons.arrow_upward),
+                          label: const Text('上级目录'),
+                        ),
+                        FilledButton.icon(
+                          onPressed: _hasFileSession && !_isUploading ? _pickAndUploadFiles : null,
+                          icon: _isUploading
+                              ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                )
+                              : const Icon(Icons.upload_file),
+                          label: Text(_isUploading ? '上传中...' : '上传文件'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    if (_isLoadingFiles) ...[
+                      const LinearProgressIndicator(),
+                      const SizedBox(height: 12),
+                    ],
+                    if (_fileError != null) ...[
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFFEE4E2),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Text(
+                          _fileError!,
+                          style: const TextStyle(color: Color(0xFFB42318)),
+                        ),
+                      ),
+                    ] else if (!_hasFileSession) ...[
+                      const Text('先连接宿主后加载文件列表。'),
+                    ] else if (_entries.isEmpty) ...[
+                      const Text('当前目录为空。'),
+                    ] else ...[
+                      ListView.separated(
+                        shrinkWrap: true,
+                        physics: const NeverScrollableScrollPhysics(),
+                        itemCount: _entries.length,
+                        separatorBuilder: (_, _) => const Divider(height: 1),
+                        itemBuilder: (context, index) {
+                          final entry = _entries[index];
+                          final isBusy = _busyEntryPath == entry.path;
+
+                          return ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            leading: CircleAvatar(
+                              backgroundColor: entry.isDir ? const Color(0xFFD1FAE5) : const Color(0xFFE0F2FE),
+                              child: Icon(
+                                entry.isDir ? Icons.folder_outlined : Icons.description_outlined,
+                                color: entry.isDir ? const Color(0xFF0F766E) : const Color(0xFF0369A1),
+                              ),
+                            ),
+                            title: Text(entry.name),
+                            subtitle: Text(entry.isDir ? '目录' : _formatFileSize(entry.size)),
+                            onTap: entry.isDir ? () => _refreshFiles(path: entry.path) : null,
+                            trailing: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                if (entry.isDir) const Icon(Icons.chevron_right),
+                                if (isBusy)
+                                  const SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(strokeWidth: 2),
+                                  )
+                                else
+                                  IconButton(
+                                    onPressed: () => _deleteEntry(entry),
+                                    icon: const Icon(Icons.delete_outline),
+                                    tooltip: '删除',
+                                  ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
                     ],
                   ],
                 ),
@@ -336,14 +723,14 @@ class ProbeState {
   const ProbeState.idle()
       : this._(
           headline: '尚未探测',
-          detail: '输入宿主地址后点击“探测宿主”，先确认手机和 NAS 宿主之间的基础联通。',
+          detail: '输入宿主地址后点击“连接并加载文件”，先确认手机和 NAS 宿主之间的基础联通。',
           color: const Color(0xFF475569),
         );
 
   const ProbeState.loading()
       : this._(
           headline: '正在连接',
-          detail: '正在请求 /api/system/status ...',
+          detail: '正在请求 /api/system/status，并登录 FileBrowser ...',
           color: const Color(0xFF0F766E),
         );
 
@@ -361,7 +748,7 @@ class ProbeState {
   }) : this._(
           headline: '宿主在线',
           detail: detail,
-      color: const Color(0xFF0F766E),
+          color: const Color(0xFF0F766E),
           endpoint: endpoint,
           hostName: hostName,
         );
@@ -371,4 +758,191 @@ class ProbeState {
   final Color color;
   final String? endpoint;
   final String? hostName;
+}
+
+class NasHostStatus {
+  const NasHostStatus({
+    required this.hostName,
+    this.fileBrowserRunning,
+    this.fileBrowserBaseUrl,
+    this.sharedRoot,
+  });
+
+  factory NasHostStatus.fromJson(Map<String, dynamic> json) {
+    final fileBrowser = json['fileBrowser'];
+    final fileBrowserMap = fileBrowser is Map<String, dynamic>
+        ? fileBrowser
+        : fileBrowser is Map
+            ? Map<String, dynamic>.from(fileBrowser)
+            : const <String, dynamic>{};
+    final running = fileBrowserMap['running'];
+
+    return NasHostStatus(
+      hostName: json['name']?.toString() ?? 'loal_NAS 宿主',
+      fileBrowserRunning: running is bool ? running : null,
+      fileBrowserBaseUrl: fileBrowserMap['baseUrl']?.toString(),
+      sharedRoot: fileBrowserMap['sharedRoot']?.toString(),
+    );
+  }
+
+  final String hostName;
+  final bool? fileBrowserRunning;
+  final String? fileBrowserBaseUrl;
+  final String? sharedRoot;
+}
+
+class FileBrowserDirectory {
+  const FileBrowserDirectory({required this.path, required this.items});
+
+  factory FileBrowserDirectory.fromJson(Map<String, dynamic> json) {
+    final rawItems = json['items'];
+    final items = rawItems is List
+        ? rawItems
+            .whereType<Map>()
+            .map((item) => FileBrowserEntry.fromJson(Map<String, dynamic>.from(item)))
+            .toList()
+        : <FileBrowserEntry>[];
+
+    items.sort((left, right) {
+      if (left.isDir != right.isDir) {
+        return left.isDir ? -1 : 1;
+      }
+
+      return left.name.toLowerCase().compareTo(right.name.toLowerCase());
+    });
+
+    return FileBrowserDirectory(
+      path: _normalizeDirectoryPath(json['path']?.toString() ?? '/'),
+      items: items,
+    );
+  }
+
+  final String path;
+  final List<FileBrowserEntry> items;
+}
+
+class FileBrowserEntry {
+  const FileBrowserEntry({
+    required this.name,
+    required this.path,
+    required this.isDir,
+    required this.size,
+  });
+
+  factory FileBrowserEntry.fromJson(Map<String, dynamic> json) {
+    final isDir = json['isDir'] == true;
+    final rawSize = json['size'];
+    final size = rawSize is num ? rawSize.toInt() : 0;
+
+    return FileBrowserEntry(
+      name: json['name']?.toString() ?? '(unnamed)',
+      path: _normalizeResourcePath(json['path']?.toString() ?? '', isDirectory: isDir),
+      isDir: isDir,
+      size: size,
+    );
+  }
+
+  final String name;
+  final String path;
+  final bool isDir;
+  final int size;
+}
+
+class SimpleHttpResponse {
+  const SimpleHttpResponse(this.statusCode, this.body);
+
+  final int statusCode;
+  final String body;
+}
+
+class NasApiException implements Exception {
+  const NasApiException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+String _normalizeDirectoryPath(String rawPath) {
+  if (rawPath.isEmpty || rawPath == '/') {
+    return '/';
+  }
+
+  var normalized = rawPath.startsWith('/') ? rawPath : '/$rawPath';
+  if (!normalized.endsWith('/')) {
+    normalized = '$normalized/';
+  }
+
+  return normalized;
+}
+
+String _normalizeResourcePath(String rawPath, {required bool isDirectory}) {
+  if (rawPath.isEmpty || rawPath == '/') {
+    return '/';
+  }
+
+  var normalized = rawPath.startsWith('/') ? rawPath : '/$rawPath';
+  if (isDirectory && !normalized.endsWith('/')) {
+    normalized = '$normalized/';
+  }
+  if (!isDirectory && normalized.endsWith('/')) {
+    normalized = normalized.substring(0, normalized.length - 1);
+  }
+
+  return normalized;
+}
+
+String _encodeResourcePath(String resourcePath) {
+  final normalized = resourcePath.isEmpty ? '/' : resourcePath;
+  if (normalized == '/') {
+    return '/';
+  }
+
+  final hasTrailingSlash = normalized.endsWith('/');
+  final segments = normalized
+      .split('/')
+      .where((segment) => segment.isNotEmpty)
+      .map(Uri.encodeComponent)
+      .join('/');
+
+  return '/$segments${hasTrailingSlash ? '/' : ''}';
+}
+
+String _parentDirectoryPath(String currentDirectory) {
+  if (currentDirectory == '/') {
+    return '/';
+  }
+
+  final trimmed = currentDirectory.endsWith('/')
+      ? currentDirectory.substring(0, currentDirectory.length - 1)
+      : currentDirectory;
+  final lastSlashIndex = trimmed.lastIndexOf('/');
+  if (lastSlashIndex <= 0) {
+    return '/';
+  }
+
+  return '${trimmed.substring(0, lastSlashIndex)}/';
+}
+
+String _joinResourcePath(String directoryPath, String fileName) {
+  final safeDirectory = directoryPath == '/' ? '/' : _normalizeDirectoryPath(directoryPath);
+  return safeDirectory == '/' ? '/$fileName' : '$safeDirectory$fileName';
+}
+
+String _formatFileSize(int bytes) {
+  if (bytes < 1024) {
+    return '$bytes B';
+  }
+
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  var value = bytes.toDouble();
+  var unitIndex = -1;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex++;
+  }
+
+  final precision = value >= 10 ? 0 : 1;
+  return '${value.toStringAsFixed(precision)} ${units[unitIndex]}';
 }

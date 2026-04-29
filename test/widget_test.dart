@@ -9,7 +9,8 @@ void main() {
     expect(find.text('NAS Phone'), findsOneWidget);
     expect(find.text('连接你的 loal_NAS 宿主'), findsOneWidget);
     expect(find.text('宿主地址'), findsOneWidget);
-    expect(find.text('探测宿主'), findsOneWidget);
+    expect(find.text('连接并加载文件'), findsOneWidget);
     expect(find.text('尚未探测'), findsOneWidget);
+    expect(find.text('文件列表'), findsOneWidget);
   });
 }
