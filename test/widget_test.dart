@@ -62,6 +62,35 @@ void main() {
     expect(status.storage!.freeBytes, 300);
   });
 
+  test('serializes local note json', () {
+    final source = LocalNote(
+      id: '1',
+      title: '测试',
+      content: '内容',
+      updatedAt: DateTime.parse('2026-04-30T12:00:00Z'),
+    );
+
+    final restored = LocalNote.fromJson(source.toJson());
+
+    expect(restored.id, '1');
+    expect(restored.title, '测试');
+    expect(restored.content, '内容');
+    expect(restored.updatedAt.toUtc(), DateTime.parse('2026-04-30T12:00:00Z'));
+  });
+
+  test('hides dot-prefixed directories from file lists', () {
+    final directory = FileBrowserDirectory.fromJson({
+      'path': '/',
+      'items': [
+        {'name': '.note', 'path': '/.note/', 'isDir': true, 'size': 0},
+        {'name': '照片', 'path': '/照片/', 'isDir': true, 'size': 0},
+        {'name': '.env', 'path': '/.env', 'isDir': false, 'size': 12},
+      ],
+    });
+
+    expect(directory.items.map((entry) => entry.name).toList(), ['照片', '.env']);
+  });
+
   testWidgets('renders NAS host probe shell', (tester) async {
     await tester.pumpWidget(const NasPhoneApp());
 

@@ -107,10 +107,29 @@ class LocalNote {
     required this.updatedAt,
   });
 
+  factory LocalNote.fromJson(Map<String, dynamic> json) {
+    final parsedUpdatedAt = DateTime.tryParse(json['updatedAt']?.toString() ?? '');
+    return LocalNote(
+      id: json['id']?.toString() ?? DateTime.now().microsecondsSinceEpoch.toString(),
+      title: json['title']?.toString() ?? '未命名笔记',
+      content: json['content']?.toString() ?? '',
+      updatedAt: parsedUpdatedAt ?? DateTime.now(),
+    );
+  }
+
   final String id;
   final String title;
   final String content;
   final DateTime updatedAt;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'title': title,
+      'content': content,
+      'updatedAt': updatedAt.toIso8601String(),
+    };
+  }
 
   String get preview {
     final normalized = content.replaceAll(RegExp(r'\s+'), ' ').trim();
@@ -121,6 +140,9 @@ class LocalNote {
     return normalized.length <= 56 ? normalized : '${normalized.substring(0, 56)}...';
   }
 }
+
+const String _notesDirectoryPath = '/.note/';
+const String _notesFilePath = '/.note/notes.json';
 
 const List<FileCategoryShortcut> _fileCategoryShortcuts = [
   FileCategoryShortcut(
@@ -1017,6 +1039,40 @@ class _NasHomePageState extends State<NasHomePage> {
     }
   }
 
+  Future<void> _uploadTextFile(
+    Uri baseUri,
+    String token,
+    String resourcePath,
+    String content, {
+    String contentType = 'text/plain; charset=utf-8',
+  }) async {
+    final uri = _buildResourceUri(baseUri, resourcePath, queryParameters: const {'override': 'true'});
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
+
+    try {
+      final request = await client.postUrl(uri).timeout(const Duration(seconds: 15));
+      final bytes = utf8.encode(content);
+      request.headers.set('X-Auth', token);
+      request.headers.set(HttpHeaders.contentTypeHeader, contentType);
+      request.contentLength = bytes.length;
+      request.add(bytes);
+
+      final response = await request.close().timeout(const Duration(seconds: 30));
+      final body = await utf8.decodeStream(response).timeout(const Duration(seconds: 30));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw NasApiException('保存笔记失败：${response.statusCode}。${_compactBody(body)}');
+      }
+    } on TimeoutException {
+      throw const NasApiException('保存笔记超时。');
+    } on SocketException catch (error) {
+      throw NasApiException('保存笔记失败：${error.message}');
+    } on HttpException catch (error) {
+      throw NasApiException('保存笔记失败：${error.message}');
+    } finally {
+      client.close(force: true);
+    }
+  }
+
   Future<void> _createDirectory(Uri baseUri, String token, String directoryPath) async {
     final response = await _sendTextRequest(
       _buildResourceUri(baseUri, directoryPath),
@@ -1541,11 +1597,94 @@ class _NasHomePageState extends State<NasHomePage> {
     });
   }
 
+  Future<void> _ensureNotesDirectoryExists() async {
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null) {
+      throw const NasApiException('当前还没有有效的文件会话，请先重新连接宿主。');
+    }
+
+    final response = await _sendTextRequest(
+      _buildResourceUri(baseUri, _notesDirectoryPath),
+      headers: {'X-Auth': token, HttpHeaders.acceptHeader: 'application/json'},
+    );
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      return;
+    }
+
+    if (response.statusCode == 404) {
+      await _createDirectory(baseUri, token, _notesDirectoryPath);
+      return;
+    }
+
+    throw NasApiException('读取笔记目录失败：${response.statusCode}。${_compactBody(response.body)}');
+  }
+
+  Future<List<LocalNote>> _loadNotesFromCloud() async {
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null) {
+      throw const NasApiException('当前还没有有效的文件会话，请先重新连接宿主。');
+    }
+
+    await _ensureNotesDirectoryExists();
+    final response = await _sendTextRequest(
+      _buildRawDownloadUri(baseUri, _notesFilePath),
+      headers: {'X-Auth': token, HttpHeaders.acceptHeader: 'application/json'},
+    );
+    if (response.statusCode == 404) {
+      return const [];
+    }
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw NasApiException('读取云端笔记失败：${response.statusCode}。${_compactBody(response.body)}');
+    }
+
+    final trimmedBody = response.body.trim();
+    if (trimmedBody.isEmpty) {
+      return const [];
+    }
+
+    try {
+      final decoded = jsonDecode(trimmedBody);
+      if (decoded is! List) {
+        throw const FormatException('Unexpected note payload');
+      }
+
+      return decoded
+          .whereType<Map>()
+          .map((item) => LocalNote.fromJson(Map<String, dynamic>.from(item)))
+          .toList(growable: false)
+        ..sort((left, right) => right.updatedAt.compareTo(left.updatedAt));
+    } on FormatException {
+      throw const NasApiException('云端笔记文件内容无法解析，请检查 /.note/notes.json。');
+    }
+  }
+
+  Future<void> _saveNotesToCloud(List<LocalNote> notes) async {
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null) {
+      throw const NasApiException('当前还没有有效的文件会话，请先重新连接宿主。');
+    }
+
+    await _ensureNotesDirectoryExists();
+    final requestBody = jsonEncode(notes.map((note) => note.toJson()).toList(growable: false));
+    await _uploadTextFile(
+      baseUri,
+      token,
+      _notesFilePath,
+      requestBody,
+      contentType: 'application/json; charset=utf-8',
+    );
+  }
+
   Future<void> _openNotesToolPage() async {
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (context) => NotesToolPage(
           initialNotes: _notes,
+          loadNotes: _loadNotesFromCloud,
+          saveNotes: _saveNotesToCloud,
           onNotesChanged: _updateNotes,
         ),
       ),
@@ -2621,11 +2760,15 @@ class _MineOptionTile extends StatelessWidget {
 class NotesToolPage extends StatefulWidget {
   const NotesToolPage({
     required this.initialNotes,
+    required this.loadNotes,
+    required this.saveNotes,
     required this.onNotesChanged,
     super.key,
   });
 
   final List<LocalNote> initialNotes;
+  final Future<List<LocalNote>> Function() loadNotes;
+  final Future<void> Function(List<LocalNote> notes) saveNotes;
   final ValueChanged<List<LocalNote>> onNotesChanged;
 
   @override
@@ -2634,19 +2777,81 @@ class NotesToolPage extends StatefulWidget {
 
 class _NotesToolPageState extends State<NotesToolPage> {
   late List<LocalNote> _notes;
+  bool _isLoading = true;
+  bool _isSaving = false;
+  String? _loadError;
 
   @override
   void initState() {
     super.initState();
     _notes = List<LocalNote>.from(widget.initialNotes)..sort(_compareNotes);
+    unawaited(_loadNotes());
   }
 
   int _compareNotes(LocalNote left, LocalNote right) {
     return right.updatedAt.compareTo(left.updatedAt);
   }
 
-  void _persistNotes() {
-    widget.onNotesChanged(_notes);
+  Future<void> _loadNotes() async {
+    setState(() {
+      _isLoading = true;
+      _loadError = null;
+    });
+
+    try {
+      final notes = await widget.loadNotes();
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _notes = List<LocalNote>.from(notes)..sort(_compareNotes);
+      });
+      widget.onNotesChanged(_notes);
+    } on NasApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _loadError = error.message;
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _persistNotes(List<LocalNote> nextNotes, {required List<LocalNote> previousNotes}) async {
+    setState(() {
+      _isSaving = true;
+      _loadError = null;
+    });
+
+    try {
+      await widget.saveNotes(nextNotes);
+      widget.onNotesChanged(nextNotes);
+    } on NasApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _notes = previousNotes;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message)),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isSaving = false;
+        });
+      }
+    }
   }
 
   Future<void> _editNote([LocalNote? existing]) async {
@@ -2719,20 +2924,26 @@ class _NotesToolPageState extends State<NotesToolPage> {
       return;
     }
 
+    final previousNotes = List<LocalNote>.from(_notes);
+    final nextNotes = [
+      result,
+      ..._notes.where((note) => note.id != result.id),
+    ]..sort(_compareNotes);
+
     setState(() {
-      _notes = [
-        result,
-        ..._notes.where((note) => note.id != result.id),
-      ]..sort(_compareNotes);
+      _notes = nextNotes;
     });
-    _persistNotes();
+    await _persistNotes(List<LocalNote>.from(nextNotes), previousNotes: previousNotes);
   }
 
-  void _deleteNote(LocalNote note) {
+  Future<void> _deleteNote(LocalNote note) async {
+    final previousNotes = List<LocalNote>.from(_notes);
+    final nextNotes = _notes.where((item) => item.id != note.id).toList(growable: false);
+
     setState(() {
-      _notes = _notes.where((item) => item.id != note.id).toList(growable: false);
+      _notes = nextNotes;
     });
-    _persistNotes();
+    await _persistNotes(nextNotes, previousNotes: previousNotes);
   }
 
   @override
@@ -2742,14 +2953,39 @@ class _NotesToolPageState extends State<NotesToolPage> {
         title: const Text('笔记'),
         actions: [
           IconButton(
-            onPressed: _editNote,
+            onPressed: _isLoading || _isSaving ? null : _editNote,
             icon: const Icon(Icons.add),
             tooltip: '新建笔记',
           ),
         ],
       ),
       body: SafeArea(
-        child: _notes.isEmpty
+        child: _isLoading
+            ? const Center(child: CircularProgressIndicator())
+            : _loadError != null
+                ? Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          const Icon(Icons.cloud_off_outlined, size: 48, color: Color(0xFF94A3B8)),
+                          const SizedBox(height: 14),
+                          Text(
+                            _loadError!,
+                            textAlign: TextAlign.center,
+                            style: Theme.of(context).textTheme.bodyLarge,
+                          ),
+                          const SizedBox(height: 14),
+                          FilledButton.tonal(
+                            onPressed: _loadNotes,
+                            child: const Text('重试'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  )
+            : _notes.isEmpty
             ? Center(
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
@@ -2762,8 +2998,9 @@ class _NotesToolPageState extends State<NotesToolPage> {
                     ),
                     const SizedBox(height: 8),
                     Text(
-                      '点右上角加号，先记下一条。',
+                      '云端笔记保存在根目录的 /.note 文件夹下，点右上角加号先记下一条。',
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: const Color(0xFF64748B)),
+                      textAlign: TextAlign.center,
                     ),
                   ],
                 ),
@@ -2779,7 +3016,7 @@ class _NotesToolPageState extends State<NotesToolPage> {
                     borderRadius: BorderRadius.circular(24),
                     child: InkWell(
                       borderRadius: BorderRadius.circular(24),
-                      onTap: () => _editNote(note),
+                      onTap: _isSaving ? null : () => _editNote(note),
                       child: Padding(
                         padding: const EdgeInsets.all(18),
                         child: Row(
@@ -2816,7 +3053,7 @@ class _NotesToolPageState extends State<NotesToolPage> {
                               ),
                             ),
                             IconButton(
-                              onPressed: () => _deleteNote(note),
+                              onPressed: _isSaving ? null : () => _deleteNote(note),
                               icon: const Icon(Icons.delete_outline),
                               tooltip: '删除笔记',
                             ),
@@ -2829,8 +3066,14 @@ class _NotesToolPageState extends State<NotesToolPage> {
               ),
       ),
       floatingActionButton: FloatingActionButton(
-        onPressed: _editNote,
-        child: const Icon(Icons.add),
+        onPressed: _isLoading || _isSaving ? null : _editNote,
+        child: _isSaving
+            ? const SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : const Icon(Icons.add),
       ),
     );
   }
@@ -3446,6 +3689,7 @@ class FileBrowserDirectory {
         ? rawItems
             .whereType<Map>()
             .map((item) => FileBrowserEntry.fromJson(Map<String, dynamic>.from(item)))
+        .where((entry) => !(entry.isDir && entry.name.startsWith('.')))
             .toList()
         : <FileBrowserEntry>[];
 
