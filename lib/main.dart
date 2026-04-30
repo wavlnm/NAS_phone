@@ -9,6 +9,13 @@ void main() {
   runApp(const NasPhoneApp());
 }
 
+enum EntryMenuAction {
+  delete,
+  move,
+  rename,
+  download,
+}
+
 class NasPhoneApp extends StatelessWidget {
   const NasPhoneApp({super.key});
 
@@ -264,7 +271,7 @@ class _NasHomePageState extends State<NasHomePage> {
       return;
     }
 
-    final validationError = _validateFolderName(folderName);
+    final validationError = _validateEntryName(folderName);
     if (validationError != null) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(validationError)),
@@ -302,6 +309,262 @@ class _NasHomePageState extends State<NasHomePage> {
       if (mounted) {
         setState(() {
           _isCreatingFolder = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _handleEntryAction(FileBrowserEntry entry, EntryMenuAction action) async {
+    if (_busyEntryPath != null) {
+      return;
+    }
+
+    switch (action) {
+      case EntryMenuAction.delete:
+        await _deleteEntry(entry);
+      case EntryMenuAction.move:
+        await _moveEntry(entry);
+      case EntryMenuAction.rename:
+        await _renameEntry(entry);
+      case EntryMenuAction.download:
+        await _downloadEntry(entry);
+    }
+  }
+
+  Future<void> _renameEntry(FileBrowserEntry entry) async {
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null) {
+      return;
+    }
+
+    final controller = TextEditingController(text: entry.name);
+    final nextName = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('重命名'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            border: OutlineInputBorder(),
+            hintText: '输入新的名称',
+          ),
+          onSubmitted: (value) => Navigator.of(dialogContext).pop(value.trim()),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(controller.text.trim()),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+
+    if (!mounted || nextName == null) {
+      return;
+    }
+
+    final validationError = _validateEntryName(nextName);
+    if (validationError != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(validationError)),
+      );
+      return;
+    }
+
+    final parentDirectory = _parentDirectoryPath(entry.path);
+    final destinationPath = entry.isDir
+        ? _joinDirectoryPath(parentDirectory, nextName)
+        : _joinResourcePath(parentDirectory, nextName);
+    if (destinationPath == entry.path) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('名称未变化。')),
+      );
+      return;
+    }
+
+    setState(() {
+      _busyEntryPath = entry.path;
+      _fileError = null;
+    });
+
+    try {
+      await _moveResource(baseUri, token, entry.path, destinationPath);
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${entry.name} 已重命名为 $nextName。')),
+      );
+      await _refreshFiles(showLoading: false);
+    } on NasApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _fileError = error.message;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message)),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busyEntryPath = null;
+        });
+      }
+    }
+  }
+
+  Future<void> _moveEntry(FileBrowserEntry entry) async {
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null) {
+      return;
+    }
+
+    final controller = TextEditingController(text: _parentDirectoryPath(entry.path));
+    final targetDirectoryInput = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('移动到目录'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            border: OutlineInputBorder(),
+            hintText: '输入目标目录，例如 /照片/',
+          ),
+          onSubmitted: (value) => Navigator.of(dialogContext).pop(value.trim()),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(controller.text.trim()),
+            child: const Text('移动'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+
+    if (!mounted || targetDirectoryInput == null) {
+      return;
+    }
+
+    final targetDirectory = _normalizeAbsoluteDirectoryInput(targetDirectoryInput);
+    if (targetDirectory == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('目标目录必须是以 / 开头的绝对路径。')),
+      );
+      return;
+    }
+
+    final destinationPath = entry.isDir
+        ? _joinDirectoryPath(targetDirectory, entry.name)
+        : _joinResourcePath(targetDirectory, entry.name);
+    if (destinationPath == entry.path) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('目标目录未变化。')),
+      );
+      return;
+    }
+
+    setState(() {
+      _busyEntryPath = entry.path;
+      _fileError = null;
+    });
+
+    try {
+      await _moveResource(baseUri, token, entry.path, destinationPath);
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${entry.name} 已移动到 $targetDirectory。')),
+      );
+      await _refreshFiles(showLoading: false);
+    } on NasApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _fileError = error.message;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message)),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busyEntryPath = null;
+        });
+      }
+    }
+  }
+
+  Future<void> _downloadEntry(FileBrowserEntry entry) async {
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null) {
+      return;
+    }
+
+    final selectedDirectory = await getDirectoryPath();
+    if (!mounted || selectedDirectory == null || selectedDirectory.isEmpty) {
+      return;
+    }
+
+    setState(() {
+      _busyEntryPath = entry.path;
+      _fileError = null;
+    });
+
+    try {
+      final downloadedFiles = await _downloadEntryToLocal(
+        baseUri,
+        token,
+        entry,
+        selectedDirectory,
+      );
+      if (!mounted) {
+        return;
+      }
+
+      final message = entry.isDir
+          ? '${entry.name} 已下载到本地，共 $downloadedFiles 个文件。'
+          : '${entry.name} 已下载到本地。';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(message)),
+      );
+    } on NasApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _fileError = error.message;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message)),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busyEntryPath = null;
         });
       }
     }
@@ -526,6 +789,94 @@ class _NasHomePageState extends State<NasHomePage> {
     }
   }
 
+  Future<void> _moveResource(
+    Uri baseUri,
+    String token,
+    String sourcePath,
+    String destinationPath,
+  ) async {
+    final response = await _sendTextRequest(
+      _buildResourceUri(
+        baseUri,
+        sourcePath,
+        queryParameters: {
+          'action': 'rename',
+          'destination': destinationPath,
+        },
+      ),
+      method: 'PATCH',
+      headers: {'X-Auth': token},
+    );
+
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      return;
+    }
+
+    if (response.statusCode == 409) {
+      throw const NasApiException('目标位置已存在同名文件或目录。');
+    }
+
+    throw NasApiException('移动或重命名失败：${response.statusCode}。${_compactBody(response.body)}');
+  }
+
+  Future<int> _downloadEntryToLocal(
+    Uri baseUri,
+    String token,
+    FileBrowserEntry entry,
+    String localParentDirectory,
+  ) async {
+    if (entry.isDir) {
+      final localDirectoryPath = _joinLocalPath(localParentDirectory, entry.name);
+      await Directory(localDirectoryPath).create(recursive: true);
+
+      final directory = await _fetchDirectory(baseUri, token, entry.path);
+      var downloadedFiles = 0;
+      for (final child in directory.items) {
+        downloadedFiles += await _downloadEntryToLocal(baseUri, token, child, localDirectoryPath);
+      }
+
+      return downloadedFiles;
+    }
+
+    final localFilePath = _joinLocalPath(localParentDirectory, entry.name);
+    await _downloadRemoteFileToLocal(baseUri, token, entry.path, localFilePath);
+    return 1;
+  }
+
+  Future<void> _downloadRemoteFileToLocal(
+    Uri baseUri,
+    String token,
+    String resourcePath,
+    String localFilePath,
+  ) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
+
+    try {
+      final request = await client.getUrl(_buildRawDownloadUri(baseUri, resourcePath)).timeout(
+        const Duration(seconds: 15),
+      );
+      request.headers.set('X-Auth', token);
+
+      final response = await request.close().timeout(const Duration(seconds: 30));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        final body = await utf8.decodeStream(response).timeout(const Duration(seconds: 30));
+        throw NasApiException('下载失败：${response.statusCode}。${_compactBody(body)}');
+      }
+
+      final outputFile = File(localFilePath);
+      await outputFile.parent.create(recursive: true);
+      await response.pipe(outputFile.openWrite()).timeout(const Duration(seconds: 2 * 60));
+    } on TimeoutException {
+      throw const NasApiException('下载超时，请稍后重试。');
+    } on SocketException catch (error) {
+      throw NasApiException('下载失败：${error.message}');
+    } on HttpException catch (error) {
+      throw NasApiException('下载失败：${error.message}');
+    } finally {
+      client.close(force: true);
+    }
+  }
+
   Future<SimpleHttpResponse> _sendTextRequest(
     Uri uri, {
     String method = 'GET',
@@ -575,6 +926,11 @@ class _NasHomePageState extends State<NasHomePage> {
       path: '/api/filebrowser/raw$encodedPath',
       queryParameters: const {'inline': 'true'},
     );
+  }
+
+  Uri _buildRawDownloadUri(Uri baseUri, String resourcePath) {
+    final encodedPath = _encodeResourcePath(resourcePath);
+    return baseUri.replace(path: '/api/filebrowser/raw$encodedPath');
   }
 
   Uri _buildThumbPreviewUri(Uri baseUri, String resourcePath) {
@@ -651,7 +1007,7 @@ class _NasHomePageState extends State<NasHomePage> {
       if (status.sharedRoot != null && status.sharedRoot!.isNotEmpty)
         '共享目录: ${status.sharedRoot}',
       if (fileError == null)
-        '已连接 FileBrowser，可浏览、上传、删除文件。'
+        '已连接 FileBrowser，可浏览、上传、下载和管理文件。'
       else
         '宿主在线，但文件接口连接失败：$fileError',
     ];
@@ -713,7 +1069,7 @@ class _NasHomePageState extends State<NasHomePage> {
                   ),
                   SizedBox(height: 12),
                   Text(
-                    '连接成功后直接复用 FileBrowser 原生接口，展示文件列表，并支持上传和删除。',
+                    '连接成功后直接复用 FileBrowser 原生接口，展示文件列表，并支持上传、下载和常用管理操作。',
                     style: TextStyle(
                       color: Color(0xFFD1FAE5),
                       height: 1.5,
@@ -890,27 +1246,35 @@ class _NasHomePageState extends State<NasHomePage> {
                                       : _formatFileSize(entry.size),
                             ),
                             onTap: () => _openEntry(entry),
-                            trailing: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                if (entry.isDir || entry.isPreviewableImage)
-                                  Icon(
-                                    entry.isDir ? Icons.chevron_right : Icons.open_in_new,
-                                  ),
-                                if (isBusy)
-                                  const SizedBox(
+                            trailing: isBusy
+                                ? const SizedBox(
                                     width: 18,
                                     height: 18,
                                     child: CircularProgressIndicator(strokeWidth: 2),
                                   )
-                                else
-                                  IconButton(
-                                    onPressed: () => _deleteEntry(entry),
-                                    icon: const Icon(Icons.delete_outline),
-                                    tooltip: '删除',
+                                : PopupMenuButton<EntryMenuAction>(
+                                    tooltip: '更多操作',
+                                    onSelected: (action) => _handleEntryAction(entry, action),
+                                    itemBuilder: (context) => const [
+                                      PopupMenuItem<EntryMenuAction>(
+                                        value: EntryMenuAction.delete,
+                                        child: Text('删除'),
+                                      ),
+                                      PopupMenuItem<EntryMenuAction>(
+                                        value: EntryMenuAction.move,
+                                        child: Text('移动'),
+                                      ),
+                                      PopupMenuItem<EntryMenuAction>(
+                                        value: EntryMenuAction.rename,
+                                        child: Text('重命名'),
+                                      ),
+                                      PopupMenuItem<EntryMenuAction>(
+                                        value: EntryMenuAction.download,
+                                        child: Text('下载'),
+                                      ),
+                                    ],
+                                    icon: const Icon(Icons.more_vert),
                                   ),
-                              ],
-                            ),
                           );
                         },
                       ),
@@ -1204,19 +1568,28 @@ String _encodeResourcePath(String resourcePath) {
   return '/$segments${hasTrailingSlash ? '/' : ''}';
 }
 
-String? _validateFolderName(String folderName) {
-  final trimmed = folderName.trim();
+String? _validateEntryName(String value) {
+  final trimmed = value.trim();
   if (trimmed.isEmpty) {
-    return '文件夹名称不能为空。';
+    return '名称不能为空。';
   }
   if (trimmed == '.' || trimmed == '..') {
-    return '文件夹名称不能为 . 或 ..';
+    return '名称不能为 . 或 ..';
   }
   if (trimmed.contains('/') || trimmed.contains('\\')) {
-    return '文件夹名称不能包含 / 或 \\';
+    return '名称不能包含 / 或 \\';
   }
 
   return null;
+}
+
+String? _normalizeAbsoluteDirectoryInput(String value) {
+  final trimmed = value.trim();
+  if (trimmed.isEmpty || !trimmed.startsWith('/')) {
+    return null;
+  }
+
+  return _normalizeDirectoryPath(trimmed);
 }
 
 String _parentDirectoryPath(String currentDirectory) {
@@ -1242,6 +1615,14 @@ String _joinResourcePath(String directoryPath, String fileName) {
 
 String _joinDirectoryPath(String directoryPath, String folderName) {
   return '${_joinResourcePath(directoryPath, folderName)}/';
+}
+
+String _joinLocalPath(String directoryPath, String name) {
+  if (directoryPath.endsWith(Platform.pathSeparator)) {
+    return '$directoryPath$name';
+  }
+
+  return '$directoryPath${Platform.pathSeparator}$name';
 }
 
 String _formatFileSize(int bytes) {
