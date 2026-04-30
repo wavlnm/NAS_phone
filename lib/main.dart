@@ -1249,22 +1249,65 @@ class _NasHomePageState extends State<NasHomePage> {
     }
   }
 
-  List<FileBrowserEntry> _entriesForCategory(FileCategoryFilter filter) {
-    return _entries.where((entry) {
-      switch (filter) {
-        case FileCategoryFilter.image:
-          return entry.isPreviewableImage;
-        case FileCategoryFilter.video:
-          return entry.isPreviewableVideo;
-        case FileCategoryFilter.audio:
-          return entry.isPreviewableAudio;
-        case FileCategoryFilter.document:
-          return !entry.isDir &&
-              !entry.isPreviewableImage &&
-              !entry.isPreviewableAudio &&
-              !entry.isPreviewableVideo;
+  bool _matchesCategory(FileBrowserEntry entry, FileCategoryFilter filter) {
+    if (entry.isDir) {
+      return false;
+    }
+
+    switch (filter) {
+      case FileCategoryFilter.image:
+        return entry.isPreviewableImage;
+      case FileCategoryFilter.video:
+        return entry.isPreviewableVideo;
+      case FileCategoryFilter.audio:
+        return entry.isPreviewableAudio;
+      case FileCategoryFilter.document:
+        return entry.isCommonDocument;
+    }
+  }
+
+  Future<List<FileBrowserEntry>> _loadCategoryEntries(FileCategoryFilter filter) async {
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null) {
+      throw const NasApiException('当前还没有有效的文件会话，请先重新连接宿主。');
+    }
+
+    final collectedEntries = <FileBrowserEntry>[];
+    final visitedDirectories = <String>{};
+
+    Future<void> visitDirectory(String path) async {
+      final normalizedPath = _normalizeDirectoryPath(path);
+      if (!visitedDirectories.add(normalizedPath)) {
+        return;
       }
-    }).toList(growable: false);
+
+      final directory = await _fetchDirectory(baseUri, token, normalizedPath);
+      for (final entry in directory.items) {
+        if (entry.isDir) {
+          await visitDirectory(entry.path);
+          continue;
+        }
+
+        if (_matchesCategory(entry, filter)) {
+          collectedEntries.add(entry);
+        }
+      }
+    }
+
+    await visitDirectory('/');
+    collectedEntries.sort((left, right) {
+      final leftParent = _parentDirectoryPath(left.path).toLowerCase();
+      final rightParent = _parentDirectoryPath(right.path).toLowerCase();
+      final byParent = leftParent.compareTo(rightParent);
+      if (byParent != 0) {
+        return byParent;
+      }
+
+      return left.name.toLowerCase().compareTo(right.name.toLowerCase());
+    });
+
+    return collectedEntries;
   }
 
   String _buildEntrySubtitle(FileBrowserEntry entry) {
@@ -1284,7 +1327,11 @@ class _NasHomePageState extends State<NasHomePage> {
       return '视频 · ${_formatFileSize(entry.size)}';
     }
 
-    return '文档 · ${_formatFileSize(entry.size)}';
+    if (entry.isCommonDocument) {
+      return '文档 · ${_formatFileSize(entry.size)}';
+    }
+
+    return '文件 · ${_formatFileSize(entry.size)}';
   }
 
   Future<void> _openCategoryPage(FileCategoryShortcut shortcut) async {
@@ -1296,8 +1343,9 @@ class _NasHomePageState extends State<NasHomePage> {
       MaterialPageRoute<void>(
         builder: (context) => CategoryEntriesPage(
           title: shortcut.label,
-          directoryPath: _currentDirectory,
-          entries: _entriesForCategory(shortcut.filter),
+          scopeLabel: '个人空间 · 全部目录',
+          emptyHint: '整个个人空间里还没有符合这个分类的文件。',
+          loadEntries: () => _loadCategoryEntries(shortcut.filter),
           buildLeading: _buildEntryLeading,
           buildSubtitle: _buildEntrySubtitle,
           onOpenEntry: _openEntry,
@@ -1924,8 +1972,9 @@ class _CategoryShortcutButton extends StatelessWidget {
 class CategoryEntriesPage extends StatefulWidget {
   const CategoryEntriesPage({
     required this.title,
-    required this.directoryPath,
-    required this.entries,
+    required this.scopeLabel,
+    required this.emptyHint,
+    required this.loadEntries,
     required this.buildLeading,
     required this.buildSubtitle,
     required this.onOpenEntry,
@@ -1934,8 +1983,9 @@ class CategoryEntriesPage extends StatefulWidget {
   });
 
   final String title;
-  final String directoryPath;
-  final List<FileBrowserEntry> entries;
+  final String scopeLabel;
+  final String emptyHint;
+  final Future<List<FileBrowserEntry>> Function() loadEntries;
   final Widget Function(FileBrowserEntry entry) buildLeading;
   final String Function(FileBrowserEntry entry) buildSubtitle;
   final Future<void> Function(FileBrowserEntry entry) onOpenEntry;
@@ -1946,7 +1996,51 @@ class CategoryEntriesPage extends StatefulWidget {
 }
 
 class _CategoryEntriesPageState extends State<CategoryEntriesPage> {
+  List<FileBrowserEntry> _entries = const [];
+  bool _isLoading = true;
+  String? _error;
   String? _busyEntryPath;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadEntries());
+  }
+
+  Future<void> _loadEntries({bool showLoading = true}) async {
+    if (showLoading) {
+      setState(() {
+        _isLoading = true;
+        _error = null;
+      });
+    }
+
+    try {
+      final entries = await widget.loadEntries();
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _entries = entries;
+        _error = null;
+      });
+    } on NasApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _error = error.message;
+      });
+    } finally {
+      if (mounted && showLoading) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
+  }
 
   Future<void> _runEntryAction(FileBrowserEntry entry, EntryMenuAction action) async {
     setState(() {
@@ -1955,6 +2049,7 @@ class _CategoryEntriesPageState extends State<CategoryEntriesPage> {
 
     try {
       await widget.onHandleEntryAction(entry, action);
+      await _loadEntries(showLoading: false);
     } finally {
       if (mounted) {
         setState(() {
@@ -1976,19 +2071,68 @@ class _CategoryEntriesPageState extends State<CategoryEntriesPage> {
         child: ListView(
           padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
           children: [
-            Text(
-              '当前目录: ${widget.directoryPath}',
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: const Color(0xFF475569)),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Text(
+                    '范围: ${widget.scopeLabel}',
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: const Color(0xFF475569)),
+                  ),
+                ),
+                FilledButton.tonalIcon(
+                  onPressed: _isLoading ? null : _loadEntries,
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('刷新'),
+                ),
+              ],
             ),
             const SizedBox(height: 16),
-            if (widget.entries.isEmpty)
+            if (_isLoading)
+              Container(
+                padding: const EdgeInsets.all(24),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: const Column(
+                  children: [
+                    CircularProgressIndicator(),
+                    SizedBox(height: 12),
+                    Text('正在扫描整个空间，请稍候...'),
+                  ],
+                ),
+              )
+            else if (_error != null)
               Container(
                 padding: const EdgeInsets.all(20),
                 decoration: BoxDecoration(
                   color: Colors.white,
                   borderRadius: BorderRadius.circular(24),
                 ),
-                child: const Text('当前目录下没有符合这个分类的文件。'),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _error!,
+                      style: const TextStyle(color: Color(0xFFB42318)),
+                    ),
+                    const SizedBox(height: 12),
+                    FilledButton.tonal(
+                      onPressed: _loadEntries,
+                      child: const Text('重试'),
+                    ),
+                  ],
+                ),
+              )
+            else if (_entries.isEmpty)
+              Container(
+                padding: const EdgeInsets.all(20),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: Text(widget.emptyHint),
               )
             else
               Container(
@@ -2000,17 +2144,17 @@ class _CategoryEntriesPageState extends State<CategoryEntriesPage> {
                 child: ListView.separated(
                   shrinkWrap: true,
                   physics: const NeverScrollableScrollPhysics(),
-                  itemCount: widget.entries.length,
+                  itemCount: _entries.length,
                   separatorBuilder: (_, _) => const Divider(height: 1),
                   itemBuilder: (context, index) {
-                    final entry = widget.entries[index];
+                    final entry = _entries[index];
                     final isBusy = _busyEntryPath == entry.path;
 
                     return ListTile(
                       contentPadding: EdgeInsets.zero,
                       leading: widget.buildLeading(entry),
                       title: Text(entry.name),
-                      subtitle: Text(widget.buildSubtitle(entry)),
+                      subtitle: Text('${widget.buildSubtitle(entry)}\n位置: ${_parentDirectoryPath(entry.path)}'),
                       onTap: () => _runOpenEntry(entry),
                       trailing: isBusy
                           ? const SizedBox(
@@ -2191,6 +2335,7 @@ class FileBrowserEntry {
   bool get isPreviewableImage => !isDir && isPreviewableImagePath(name);
   bool get isPreviewableAudio => !isDir && isPreviewableAudioPath(name);
   bool get isPreviewableVideo => !isDir && isPreviewableVideoPath(name);
+  bool get isCommonDocument => !isDir && isCommonDocumentPath(name);
 }
 
 class ImagePreviewPage extends StatelessWidget {
@@ -2767,6 +2912,24 @@ bool isPreviewableImagePath(String path) {
       normalized.endsWith('.ts') ||
       normalized.endsWith('.m2ts');
     }
+
+bool isCommonDocumentPath(String path) {
+  final normalized = path.toLowerCase();
+  return normalized.endsWith('.pdf') ||
+      normalized.endsWith('.doc') ||
+      normalized.endsWith('.docx') ||
+      normalized.endsWith('.xls') ||
+      normalized.endsWith('.xlsx') ||
+      normalized.endsWith('.ppt') ||
+      normalized.endsWith('.pptx') ||
+      normalized.endsWith('.txt') ||
+      normalized.endsWith('.md') ||
+      normalized.endsWith('.csv') ||
+      normalized.endsWith('.rtf') ||
+      normalized.endsWith('.odt') ||
+      normalized.endsWith('.ods') ||
+      normalized.endsWith('.odp');
+}
 
 String _safeLocalFileName(String value) {
   final sanitized = value.replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_').trim();

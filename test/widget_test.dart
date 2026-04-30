@@ -24,6 +24,14 @@ void main() {
     expect(isPreviewableVideoPath('/notes.txt'), isFalse);
   });
 
+  test('detects common document paths', () {
+    expect(isCommonDocumentPath('/report.PDF'), isTrue);
+    expect(isCommonDocumentPath('/sheet.xlsx'), isTrue);
+    expect(isCommonDocumentPath('/slides.pptx'), isTrue);
+    expect(isCommonDocumentPath('/movie.mp4'), isFalse);
+    expect(isCommonDocumentPath('/archive.zip'), isFalse);
+  });
+
   testWidgets('renders NAS host probe shell', (tester) async {
     await tester.pumpWidget(const NasPhoneApp());
 
