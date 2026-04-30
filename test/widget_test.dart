@@ -17,6 +17,13 @@ void main() {
     expect(isPreviewableAudioPath('/notes.txt'), isFalse);
   });
 
+  test('detects previewable video paths', () {
+    expect(isPreviewableVideoPath('/movie.MP4'), isTrue);
+    expect(isPreviewableVideoPath('/clip.mkv'), isTrue);
+    expect(isPreviewableVideoPath('/voice.m4a'), isFalse);
+    expect(isPreviewableVideoPath('/notes.txt'), isFalse);
+  });
+
   testWidgets('renders NAS host probe shell', (tester) async {
     await tester.pumpWidget(const NasPhoneApp());
 

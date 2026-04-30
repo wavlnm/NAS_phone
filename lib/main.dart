@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
 
 void main() {
@@ -48,6 +49,8 @@ class NasHomePage extends StatefulWidget {
 }
 
 class _NasHomePageState extends State<NasHomePage> {
+  static const MethodChannel _systemOpenChannel = MethodChannel('nas_phone/system_open');
+
   final TextEditingController _hostController = TextEditingController();
 
   ProbeState _probeState = const ProbeState.idle();
@@ -645,13 +648,91 @@ class _NasHomePageState extends State<NasHomePage> {
       return;
     }
 
+    if (entry.isPreviewableVideo) {
+      await _openVideoExternally(entry);
+      return;
+    }
+
     if (!mounted) {
       return;
     }
 
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('当前支持图片和音频在线预览。')),
+      const SnackBar(content: Text('当前支持图片、音频和视频。视频会调用系统播放器打开。')),
     );
+  }
+
+  Future<void> _openVideoExternally(FileBrowserEntry entry) async {
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null) {
+      return;
+    }
+
+    setState(() {
+      _busyEntryPath = entry.path;
+      _fileError = null;
+    });
+
+    try {
+      final relayUri = await _createMediaRelayUri(baseUri, token, entry.path);
+      final launched = await _systemOpenChannel.invokeMethod<bool>('openVideoUrl', {
+        'url': relayUri.toString(),
+      });
+      if (!mounted) {
+        return;
+      }
+
+      if (launched != true) {
+        throw const NasApiException('系统没有可用的外部播放器来打开这个视频。');
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已交给系统播放器打开 ${entry.name}。')),
+      );
+    } on NasApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _fileError = error.message;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message)),
+      );
+    } on PlatformException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      final message = error.message?.trim();
+      final detail = message == null || message.isEmpty ? '调用系统播放器失败。' : message;
+      setState(() {
+        _fileError = detail;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(detail)),
+      );
+    } on MissingPluginException {
+      if (!mounted) {
+        return;
+      }
+
+      const detail = '当前平台暂未接入外部视频打开能力。';
+      setState(() {
+        _fileError = detail;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text(detail)),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busyEntryPath = null;
+        });
+      }
+    }
   }
 
   Uri? _buildBaseUri(String input) {
@@ -871,6 +952,7 @@ class _NasHomePageState extends State<NasHomePage> {
     Uri uri, {
     String method = 'GET',
     Map<String, String>? headers,
+    String? requestBody,
   }) async {
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
 
@@ -888,9 +970,14 @@ class _NasHomePageState extends State<NasHomePage> {
       }
 
       headers?.forEach(request.headers.set);
+      if (requestBody != null) {
+        final bytes = utf8.encode(requestBody);
+        request.contentLength = bytes.length;
+        request.add(bytes);
+      }
       final response = await request.close().timeout(const Duration(seconds: 8));
-      final body = await utf8.decodeStream(response).timeout(const Duration(seconds: 8));
-      return SimpleHttpResponse(response.statusCode, body);
+      final responseBody = await utf8.decodeStream(response).timeout(const Duration(seconds: 8));
+      return SimpleHttpResponse(response.statusCode, responseBody);
     } on TimeoutException {
       throw const NasApiException('请求超时，请确认宿主仍然在线。');
     } on SocketException catch (error) {
@@ -928,6 +1015,44 @@ class _NasHomePageState extends State<NasHomePage> {
     return baseUri.replace(path: '/api/filebrowser/preview/thumb$encodedPath');
   }
 
+  Future<Uri> _createMediaRelayUri(Uri baseUri, String token, String resourcePath) async {
+    final response = await _sendTextRequest(
+      baseUri.replace(path: '/api/system/media-tickets'),
+      method: 'POST',
+      headers: {
+        'X-Auth': token,
+        HttpHeaders.acceptHeader: 'application/json',
+        HttpHeaders.contentTypeHeader: 'application/json; charset=utf-8',
+      },
+      requestBody: jsonEncode({'path': resourcePath}),
+    );
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw NasApiException('创建视频播放链接失败：${response.statusCode}。${_compactBody(response.body)}');
+    }
+
+    try {
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map<String, dynamic>) {
+        throw const FormatException('Unexpected response');
+      }
+
+      final url = decoded['url']?.toString();
+      if (url == null || url.isEmpty) {
+        throw const FormatException('Missing url');
+      }
+
+      final relayUri = Uri.tryParse(url);
+      if (relayUri == null) {
+        throw const FormatException('Invalid url');
+      }
+
+      return relayUri.hasScheme ? relayUri : baseUri.resolveUri(relayUri);
+    } on FormatException {
+      throw const NasApiException('视频播放链接接口返回了无法解析的内容。');
+    }
+  }
+
   Widget _buildEntryLeading(FileBrowserEntry entry) {
     if (!entry.isPreviewableImage || _baseUri == null || _authToken == null) {
       return CircleAvatar(
@@ -937,6 +1062,8 @@ class _NasHomePageState extends State<NasHomePage> {
                 ? const Color(0xFFFFEDD5)
                 : entry.isPreviewableAudio
                     ? const Color(0xFFEEE7FF)
+            : entry.isPreviewableVideo
+              ? const Color(0xFFE0E7FF)
                 : const Color(0xFFE0F2FE),
         child: Icon(
           entry.isDir
@@ -945,6 +1072,8 @@ class _NasHomePageState extends State<NasHomePage> {
                   ? Icons.image_outlined
                   : entry.isPreviewableAudio
                       ? Icons.music_note_outlined
+              : entry.isPreviewableVideo
+                ? Icons.movie_outlined
                   : Icons.description_outlined,
           color: entry.isDir
               ? const Color(0xFF0F766E)
@@ -952,6 +1081,8 @@ class _NasHomePageState extends State<NasHomePage> {
                   ? const Color(0xFFEA580C)
                   : entry.isPreviewableAudio
                       ? const Color(0xFF6D28D9)
+              : entry.isPreviewableVideo
+                ? const Color(0xFF3730A3)
                   : const Color(0xFF0369A1),
         ),
       );
@@ -1241,6 +1372,8 @@ class _NasHomePageState extends State<NasHomePage> {
                                       ? '图片 · ${_formatFileSize(entry.size)}'
                                   : entry.isPreviewableAudio
                                     ? '音频 · ${_formatFileSize(entry.size)}'
+                                      : entry.isPreviewableVideo
+                                        ? '视频 · ${_formatFileSize(entry.size)}'
                                       : _formatFileSize(entry.size),
                             ),
                             onTap: () => _openEntry(entry),
@@ -1426,6 +1559,7 @@ class FileBrowserEntry {
 
   bool get isPreviewableImage => !isDir && isPreviewableImagePath(name);
   bool get isPreviewableAudio => !isDir && isPreviewableAudioPath(name);
+  bool get isPreviewableVideo => !isDir && isPreviewableVideoPath(name);
 }
 
 class ImagePreviewPage extends StatelessWidget {
@@ -1983,6 +2117,24 @@ bool isPreviewableImagePath(String path) {
       normalized.endsWith('.ogg') ||
       normalized.endsWith('.oga') ||
       normalized.endsWith('.opus');
+    }
+
+    bool isPreviewableVideoPath(String path) {
+      final normalized = path.toLowerCase();
+      return normalized.endsWith('.mp4') ||
+      normalized.endsWith('.m4v') ||
+      normalized.endsWith('.mov') ||
+      normalized.endsWith('.mkv') ||
+      normalized.endsWith('.webm') ||
+      normalized.endsWith('.avi') ||
+      normalized.endsWith('.wmv') ||
+      normalized.endsWith('.flv') ||
+      normalized.endsWith('.mpeg') ||
+      normalized.endsWith('.mpg') ||
+      normalized.endsWith('.3gp') ||
+      normalized.endsWith('.3g2') ||
+      normalized.endsWith('.ts') ||
+      normalized.endsWith('.m2ts');
     }
 
 String _safeLocalFileName(String value) {
