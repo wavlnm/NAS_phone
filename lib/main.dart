@@ -53,6 +53,52 @@ class FileCategoryShortcut {
   final Color foregroundColor;
 }
 
+class RecentFileVisit {
+  const RecentFileVisit({
+    required this.entry,
+    required this.visitedAt,
+  });
+
+  final FileBrowserEntry entry;
+  final DateTime visitedAt;
+}
+
+enum TransferTaskKind {
+  download,
+  upload,
+}
+
+class ActiveTransferTask {
+  const ActiveTransferTask({
+    required this.id,
+    required this.kind,
+    required this.entry,
+    required this.startedAt,
+    required this.targetLocation,
+    this.processedFiles = 0,
+  });
+
+  final String id;
+  final TransferTaskKind kind;
+  final FileBrowserEntry entry;
+  final DateTime startedAt;
+  final String targetLocation;
+  final int processedFiles;
+
+  ActiveTransferTask copyWith({
+    int? processedFiles,
+  }) {
+    return ActiveTransferTask(
+      id: id,
+      kind: kind,
+      entry: entry,
+      startedAt: startedAt,
+      targetLocation: targetLocation,
+      processedFiles: processedFiles ?? this.processedFiles,
+    );
+  }
+}
+
 const List<FileCategoryShortcut> _fileCategoryShortcuts = [
   FileCategoryShortcut(
     filter: FileCategoryFilter.image,
@@ -131,6 +177,8 @@ class _NasHomePageState extends State<NasHomePage> {
   List<FileBrowserEntry> _entries = const [];
   String? _fileError;
   String? _busyEntryPath;
+  List<RecentFileVisit> _recentFileVisits = const [];
+  List<ActiveTransferTask> _activeTransferTasks = const [];
   bool _showMainShell = false;
   MainTab _selectedTab = MainTab.home;
   SpaceScope _selectedSpace = SpaceScope.personal;
@@ -185,6 +233,8 @@ class _NasHomePageState extends State<NasHomePage> {
         _currentDirectory = directory?.path ?? '/';
         _entries = directory?.items ?? const [];
         _fileError = fileError;
+        _recentFileVisits = const [];
+        _activeTransferTasks = const [];
         _showMainShell = token != null && directory != null;
         _selectedTab = MainTab.home;
         _selectedSpace = SpaceScope.personal;
@@ -274,7 +324,23 @@ class _NasHomePageState extends State<NasHomePage> {
 
     try {
       for (final file in files) {
-        await _uploadFile(baseUri, token, _currentDirectory, file);
+        final uploadEntry = FileBrowserEntry(
+          name: file.name,
+          path: _joinResourcePath(_currentDirectory, file.name),
+          isDir: false,
+          size: await file.length(),
+        );
+        final taskId = _startTransferTask(
+          kind: TransferTaskKind.upload,
+          entry: uploadEntry,
+          targetLocation: _currentDirectory,
+        );
+
+        try {
+          await _uploadFile(baseUri, token, _currentDirectory, file);
+        } finally {
+          _finishTransferTask(taskId);
+        }
       }
 
       if (!mounted) {
@@ -582,12 +648,23 @@ class _NasHomePageState extends State<NasHomePage> {
       _fileError = null;
     });
 
+    final downloadTaskId = _startTransferTask(
+      kind: TransferTaskKind.download,
+      entry: entry,
+      targetLocation: selectedDirectory,
+    );
+    var downloadedFileCount = 0;
+
     try {
       final downloadedFiles = await _downloadEntryToLocal(
         baseUri,
         token,
         entry,
         selectedDirectory,
+        onFileDownloaded: () {
+          downloadedFileCount += 1;
+          _updateTransferTaskProgress(downloadTaskId, downloadedFileCount);
+        },
       );
       if (!mounted) {
         return;
@@ -616,6 +693,8 @@ class _NasHomePageState extends State<NasHomePage> {
           _busyEntryPath = null;
         });
       }
+
+      _finishTransferTask(downloadTaskId);
     }
   }
 
@@ -694,6 +773,8 @@ class _NasHomePageState extends State<NasHomePage> {
     if (baseUri == null || token == null) {
       return;
     }
+
+    _recordRecentFileVisit(entry);
 
     if (entry.isPreviewableImage) {
       await Navigator.of(context).push(
@@ -968,6 +1049,7 @@ class _NasHomePageState extends State<NasHomePage> {
     String token,
     FileBrowserEntry entry,
     String localParentDirectory,
+    {void Function()? onFileDownloaded,}
   ) async {
     if (entry.isDir) {
       final localDirectoryPath = _joinLocalPath(localParentDirectory, entry.name);
@@ -976,7 +1058,13 @@ class _NasHomePageState extends State<NasHomePage> {
       final directory = await _fetchDirectory(baseUri, token, entry.path);
       var downloadedFiles = 0;
       for (final child in directory.items) {
-        downloadedFiles += await _downloadEntryToLocal(baseUri, token, child, localDirectoryPath);
+        downloadedFiles += await _downloadEntryToLocal(
+          baseUri,
+          token,
+          child,
+          localDirectoryPath,
+          onFileDownloaded: onFileDownloaded,
+        );
       }
 
       return downloadedFiles;
@@ -984,6 +1072,7 @@ class _NasHomePageState extends State<NasHomePage> {
 
     final localFilePath = _joinLocalPath(localParentDirectory, entry.name);
     await _downloadRemoteFileToLocal(baseUri, token, entry.path, localFilePath);
+    onFileDownloaded?.call();
     return 1;
   }
 
@@ -1222,6 +1311,8 @@ class _NasHomePageState extends State<NasHomePage> {
     _entries = const [];
     _fileError = null;
     _busyEntryPath = null;
+    _recentFileVisits = const [];
+    _activeTransferTasks = const [];
     _showMainShell = false;
     _selectedTab = MainTab.home;
     _selectedSpace = SpaceScope.personal;
@@ -1353,6 +1444,67 @@ class _NasHomePageState extends State<NasHomePage> {
         ),
       ),
     );
+  }
+
+  void _recordRecentFileVisit(FileBrowserEntry entry) {
+    if (entry.isDir) {
+      return;
+    }
+
+    final visit = RecentFileVisit(entry: entry, visitedAt: DateTime.now());
+    setState(() {
+      _recentFileVisits = [
+        visit,
+        ..._recentFileVisits.where((item) => item.entry.path != entry.path),
+      ].take(20).toList(growable: false);
+    });
+  }
+
+  String _startTransferTask({
+    required TransferTaskKind kind,
+    required FileBrowserEntry entry,
+    required String targetLocation,
+  }) {
+    final taskId = '${DateTime.now().microsecondsSinceEpoch}:${entry.path}';
+    final task = ActiveTransferTask(
+      id: taskId,
+      kind: kind,
+      entry: entry,
+      startedAt: DateTime.now(),
+      targetLocation: targetLocation,
+    );
+
+    setState(() {
+      _activeTransferTasks = [task, ..._activeTransferTasks];
+    });
+
+    return taskId;
+  }
+
+  void _updateTransferTaskProgress(String taskId, int processedFiles) {
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _activeTransferTasks = _activeTransferTasks
+          .map(
+            (task) => task.id == taskId ? task.copyWith(processedFiles: processedFiles) : task,
+          )
+          .toList(growable: false);
+    });
+  }
+
+  void _finishTransferTask(String taskId) {
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _activeTransferTasks = _activeTransferTasks
+          .where((task) => task.id != taskId)
+          .toList(growable: false);
+    });
   }
 
   Widget _buildSectionCard({required Widget child}) {
@@ -1780,6 +1932,145 @@ class _NasHomePageState extends State<NasHomePage> {
     );
   }
 
+  Widget _buildRecentTab(ThemeData theme) {
+    return SafeArea(
+      child: ListView(
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+        children: [
+          _buildSectionCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        '进行中的任务',
+                        style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                    Text(
+                      _activeTransferTasks.isEmpty ? '空闲中' : '${_activeTransferTasks.length} 个进行中',
+                      style: theme.textTheme.bodySmall?.copyWith(color: const Color(0xFF64748B)),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                if (_activeTransferTasks.isEmpty)
+                  const Text('当前没有进行中的上传或下载任务。')
+                else
+                  ListView.separated(
+                    shrinkWrap: true,
+                    physics: const NeverScrollableScrollPhysics(),
+                    itemCount: _activeTransferTasks.length,
+                    separatorBuilder: (_, _) => const SizedBox(height: 12),
+                    itemBuilder: (context, index) {
+                      final task = _activeTransferTasks[index];
+                      final actionText = task.kind == TransferTaskKind.download ? '下载中' : '上传中';
+                      final subtitle = task.entry.isDir
+                          ? '目录$actionText · 已处理 ${task.processedFiles} 个文件'
+                          : '文件$actionText · 正在传输';
+
+                      return Container(
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFF8FAFC),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                _buildEntryLeading(task.entry),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        task.entry.name,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600),
+                                      ),
+                                      const SizedBox(height: 4),
+                                      Text(subtitle, style: theme.textTheme.bodySmall),
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        '目标位置: ${task.targetLocation}',
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: theme.textTheme.bodySmall?.copyWith(color: const Color(0xFF64748B)),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 12),
+                            const LinearProgressIndicator(),
+                            const SizedBox(height: 8),
+                            Text(
+                              '开始于 ${_formatRelativeTime(task.startedAt)}',
+                              style: theme.textTheme.bodySmall?.copyWith(color: const Color(0xFF64748B)),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          _buildSectionCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '最近',
+                  style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '这里展示当前会话里真实访问过的文件。',
+                  style: theme.textTheme.bodyMedium?.copyWith(color: const Color(0xFF64748B)),
+                ),
+                const SizedBox(height: 14),
+                if (_recentFileVisits.isEmpty)
+                  const Text('还没有访问记录。先打开一个文件，最近页就会出现内容。')
+                else
+                  ListView.separated(
+                    shrinkWrap: true,
+                    physics: const NeverScrollableScrollPhysics(),
+                    itemCount: _recentFileVisits.length,
+                    separatorBuilder: (_, _) => const Divider(height: 1),
+                    itemBuilder: (context, index) {
+                      final visit = _recentFileVisits[index];
+                      final entry = visit.entry;
+
+                      return ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: _buildEntryLeading(entry),
+                        title: Text(entry.name),
+                        subtitle: Text(
+                          '${_buildEntrySubtitle(entry)}\n位置: ${_parentDirectoryPath(entry.path)} · ${_formatRelativeTime(visit.visitedAt)}',
+                        ),
+                        isThreeLine: true,
+                        trailing: const Icon(Icons.chevron_right),
+                        onTap: () => _openEntry(entry),
+                      );
+                    },
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildSimpleTab({
     required ThemeData theme,
     required String title,
@@ -1876,12 +2167,7 @@ class _NasHomePageState extends State<NasHomePage> {
         body = _buildHomeTab(theme);
         break;
       case MainTab.recent:
-        body = _buildSimpleTab(
-          theme: theme,
-          title: '最近',
-          description: '最近访问和下载任务下一阶段再接。先把导航位置留出来，首页文件浏览优先完成。',
-          icon: Icons.history,
-        );
+        body = _buildRecentTab(theme);
         break;
       case MainTab.tools:
         body = _buildToolsTab(theme);
@@ -3044,6 +3330,28 @@ String _formatFileSize(int bytes) {
 
   final precision = value >= 10 ? 0 : 1;
   return '${value.toStringAsFixed(precision)} ${units[unitIndex]}';
+}
+
+String _formatRelativeTime(DateTime timestamp) {
+  final delta = DateTime.now().difference(timestamp);
+  if (delta.inSeconds < 60) {
+    return '刚刚';
+  }
+  if (delta.inMinutes < 60) {
+    return '${delta.inMinutes} 分钟前';
+  }
+  if (delta.inHours < 24) {
+    return '${delta.inHours} 小时前';
+  }
+  if (delta.inDays < 7) {
+    return '${delta.inDays} 天前';
+  }
+
+  final month = timestamp.month.toString().padLeft(2, '0');
+  final day = timestamp.day.toString().padLeft(2, '0');
+  final hour = timestamp.hour.toString().padLeft(2, '0');
+  final minute = timestamp.minute.toString().padLeft(2, '0');
+  return '$month-$day $hour:$minute';
 }
 
 String _formatMediaDuration(Duration duration) {
