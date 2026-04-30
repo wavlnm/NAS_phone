@@ -3,6 +3,13 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:nas_phone/main.dart';
 
 void main() {
+  test('detects previewable image paths', () {
+    expect(isPreviewableImagePath('/photo.JPG'), isTrue);
+    expect(isPreviewableImagePath('/cover.png'), isTrue);
+    expect(isPreviewableImagePath('/clip.mp4'), isFalse);
+    expect(isPreviewableImagePath('/notes.txt'), isFalse);
+  });
+
   testWidgets('renders NAS host probe shell', (tester) async {
     await tester.pumpWidget(const NasPhoneApp());
 
@@ -12,5 +19,6 @@ void main() {
     expect(find.text('连接并加载文件'), findsOneWidget);
     expect(find.text('尚未探测'), findsOneWidget);
     expect(find.text('文件列表'), findsOneWidget);
+    expect(find.text('新建文件夹'), findsOneWidget);
   });
 }

@@ -46,6 +46,7 @@ class _NasHomePageState extends State<NasHomePage> {
   bool _isProbing = false;
   bool _isLoadingFiles = false;
   bool _isUploading = false;
+  bool _isCreatingFolder = false;
 
   Uri? _baseUri;
   String? _authToken;
@@ -220,6 +221,92 @@ class _NasHomePageState extends State<NasHomePage> {
     }
   }
 
+  Future<void> _createFolder() async {
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null || _isCreatingFolder) {
+      return;
+    }
+
+    final controller = TextEditingController();
+    final folderName = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('新建文件夹'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            border: OutlineInputBorder(),
+            hintText: '输入文件夹名称',
+          ),
+          onSubmitted: (value) => Navigator.of(dialogContext).pop(value.trim()),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(controller.text.trim()),
+            child: const Text('创建'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+
+    if (!mounted) {
+      return;
+    }
+
+    if (folderName == null || folderName.isEmpty) {
+      return;
+    }
+
+    final validationError = _validateFolderName(folderName);
+    if (validationError != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(validationError)),
+      );
+      return;
+    }
+
+    setState(() {
+      _isCreatingFolder = true;
+      _fileError = null;
+    });
+
+    try {
+      await _createDirectory(baseUri, token, _joinDirectoryPath(_currentDirectory, folderName));
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('文件夹“$folderName”已创建。')),
+      );
+      await _refreshFiles(showLoading: false);
+    } on NasApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _fileError = error.message;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message)),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isCreatingFolder = false;
+        });
+      }
+    }
+  }
+
   Future<void> _deleteEntry(FileBrowserEntry entry) async {
     final baseUri = _baseUri;
     final token = _authToken;
@@ -282,6 +369,36 @@ class _NasHomePageState extends State<NasHomePage> {
         });
       }
     }
+  }
+
+  Future<void> _openEntry(FileBrowserEntry entry) async {
+    if (entry.isDir) {
+      await _refreshFiles(path: entry.path);
+      return;
+    }
+
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null) {
+      return;
+    }
+
+    if (!entry.isPreviewableImage) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('当前先支持图片在线预览。')),
+      );
+      return;
+    }
+
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => ImagePreviewPage(
+          title: entry.name,
+          imageUri: _buildRawResourceUri(baseUri, entry.path),
+          authToken: token,
+        ),
+      ),
+    );
   }
 
   Uri? _buildBaseUri(String input) {
@@ -385,6 +502,18 @@ class _NasHomePageState extends State<NasHomePage> {
     }
   }
 
+  Future<void> _createDirectory(Uri baseUri, String token, String directoryPath) async {
+    final response = await _sendTextRequest(
+      _buildResourceUri(baseUri, directoryPath),
+      method: 'POST',
+      headers: {'X-Auth': token},
+    );
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw NasApiException('创建文件夹失败：${response.statusCode}。${_compactBody(response.body)}');
+    }
+  }
+
   Future<void> _deleteResource(Uri baseUri, String token, String resourcePath) async {
     final response = await _sendTextRequest(
       _buildResourceUri(baseUri, resourcePath),
@@ -437,6 +566,78 @@ class _NasHomePageState extends State<NasHomePage> {
     return baseUri.replace(
       path: '/api/filebrowser/resources$encodedPath',
       queryParameters: queryParameters,
+    );
+  }
+
+  Uri _buildRawResourceUri(Uri baseUri, String resourcePath) {
+    final encodedPath = _encodeResourcePath(resourcePath);
+    return baseUri.replace(
+      path: '/api/filebrowser/raw$encodedPath',
+      queryParameters: const {'inline': 'true'},
+    );
+  }
+
+  Uri _buildThumbPreviewUri(Uri baseUri, String resourcePath) {
+    final encodedPath = _encodeResourcePath(resourcePath);
+    return baseUri.replace(path: '/api/filebrowser/preview/thumb$encodedPath');
+  }
+
+  Widget _buildEntryLeading(FileBrowserEntry entry) {
+    if (!entry.isPreviewableImage || _baseUri == null || _authToken == null) {
+      return CircleAvatar(
+        backgroundColor: entry.isDir
+            ? const Color(0xFFD1FAE5)
+            : entry.isPreviewableImage
+                ? const Color(0xFFFFEDD5)
+                : const Color(0xFFE0F2FE),
+        child: Icon(
+          entry.isDir
+              ? Icons.folder_outlined
+              : entry.isPreviewableImage
+                  ? Icons.image_outlined
+                  : Icons.description_outlined,
+          color: entry.isDir
+              ? const Color(0xFF0F766E)
+              : entry.isPreviewableImage
+                  ? const Color(0xFFEA580C)
+                  : const Color(0xFF0369A1),
+        ),
+      );
+    }
+
+    return SizedBox(
+      width: 44,
+      height: 44,
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: Image.network(
+          _buildThumbPreviewUri(_baseUri!, entry.path).toString(),
+          headers: {'X-Auth': _authToken!},
+          fit: BoxFit.cover,
+          errorBuilder: (context, error, stackTrace) {
+            return Container(
+              color: const Color(0xFFFFEDD5),
+              alignment: Alignment.center,
+              child: const Icon(Icons.image_outlined, color: Color(0xFFEA580C)),
+            );
+          },
+          loadingBuilder: (context, child, loadingProgress) {
+            if (loadingProgress == null) {
+              return child;
+            }
+
+            return Container(
+              color: const Color(0xFFFFEDD5),
+              alignment: Alignment.center,
+              child: const SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            );
+          },
+        ),
+      ),
     );
   }
 
@@ -632,6 +833,17 @@ class _NasHomePageState extends State<NasHomePage> {
                               : const Icon(Icons.upload_file),
                           label: Text(_isUploading ? '上传中...' : '上传文件'),
                         ),
+                        FilledButton.tonalIcon(
+                          onPressed: _hasFileSession && !_isCreatingFolder ? _createFolder : null,
+                          icon: _isCreatingFolder
+                              ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                )
+                              : const Icon(Icons.create_new_folder_outlined),
+                          label: Text(_isCreatingFolder ? '创建中...' : '新建文件夹'),
+                        ),
                       ],
                     ),
                     const SizedBox(height: 16),
@@ -668,20 +880,23 @@ class _NasHomePageState extends State<NasHomePage> {
 
                           return ListTile(
                             contentPadding: EdgeInsets.zero,
-                            leading: CircleAvatar(
-                              backgroundColor: entry.isDir ? const Color(0xFFD1FAE5) : const Color(0xFFE0F2FE),
-                              child: Icon(
-                                entry.isDir ? Icons.folder_outlined : Icons.description_outlined,
-                                color: entry.isDir ? const Color(0xFF0F766E) : const Color(0xFF0369A1),
-                              ),
-                            ),
+                            leading: _buildEntryLeading(entry),
                             title: Text(entry.name),
-                            subtitle: Text(entry.isDir ? '目录' : _formatFileSize(entry.size)),
-                            onTap: entry.isDir ? () => _refreshFiles(path: entry.path) : null,
+                            subtitle: Text(
+                              entry.isDir
+                                  ? '目录'
+                                  : entry.isPreviewableImage
+                                      ? '图片 · ${_formatFileSize(entry.size)}'
+                                      : _formatFileSize(entry.size),
+                            ),
+                            onTap: () => _openEntry(entry),
                             trailing: Row(
                               mainAxisSize: MainAxisSize.min,
                               children: [
-                                if (entry.isDir) const Icon(Icons.chevron_right),
+                                if (entry.isDir || entry.isPreviewableImage)
+                                  Icon(
+                                    entry.isDir ? Icons.chevron_right : Icons.open_in_new,
+                                  ),
                                 if (isBusy)
                                   const SizedBox(
                                     width: 18,
@@ -846,6 +1061,74 @@ class FileBrowserEntry {
   final String path;
   final bool isDir;
   final int size;
+
+  bool get isPreviewableImage => !isDir && isPreviewableImagePath(name);
+}
+
+class ImagePreviewPage extends StatelessWidget {
+  const ImagePreviewPage({
+    required this.title,
+    required this.imageUri,
+    required this.authToken,
+    super.key,
+  });
+
+  final String title;
+  final Uri imageUri;
+  final String authToken;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text(title)),
+      backgroundColor: Colors.black,
+      body: Center(
+        child: InteractiveViewer(
+          minScale: 0.8,
+          maxScale: 5,
+          child: Image.network(
+            imageUri.toString(),
+            headers: {'X-Auth': authToken},
+            fit: BoxFit.contain,
+            loadingBuilder: (context, child, loadingProgress) {
+              if (loadingProgress == null) {
+                return child;
+              }
+
+              return Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const CircularProgressIndicator(),
+                  const SizedBox(height: 16),
+                  Text(
+                    '正在加载图片...',
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: Colors.white),
+                  ),
+                ],
+              );
+            },
+            errorBuilder: (context, error, stackTrace) {
+              return Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const Icon(Icons.broken_image_outlined, size: 64, color: Colors.white70),
+                    const SizedBox(height: 16),
+                    Text(
+                      '图片预览失败，请稍后重试。',
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(color: Colors.white),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class SimpleHttpResponse {
@@ -862,6 +1145,18 @@ class NasApiException implements Exception {
 
   @override
   String toString() => message;
+}
+
+bool isPreviewableImagePath(String path) {
+  final normalized = path.toLowerCase();
+  return normalized.endsWith('.jpg') ||
+      normalized.endsWith('.jpeg') ||
+      normalized.endsWith('.png') ||
+      normalized.endsWith('.gif') ||
+      normalized.endsWith('.webp') ||
+      normalized.endsWith('.bmp') ||
+      normalized.endsWith('.heic') ||
+      normalized.endsWith('.heif');
 }
 
 String _normalizeDirectoryPath(String rawPath) {
@@ -909,6 +1204,21 @@ String _encodeResourcePath(String resourcePath) {
   return '/$segments${hasTrailingSlash ? '/' : ''}';
 }
 
+String? _validateFolderName(String folderName) {
+  final trimmed = folderName.trim();
+  if (trimmed.isEmpty) {
+    return '文件夹名称不能为空。';
+  }
+  if (trimmed == '.' || trimmed == '..') {
+    return '文件夹名称不能为 . 或 ..';
+  }
+  if (trimmed.contains('/') || trimmed.contains('\\')) {
+    return '文件夹名称不能包含 / 或 \\';
+  }
+
+  return null;
+}
+
 String _parentDirectoryPath(String currentDirectory) {
   if (currentDirectory == '/') {
     return '/';
@@ -928,6 +1238,10 @@ String _parentDirectoryPath(String currentDirectory) {
 String _joinResourcePath(String directoryPath, String fileName) {
   final safeDirectory = directoryPath == '/' ? '/' : _normalizeDirectoryPath(directoryPath);
   return safeDirectory == '/' ? '/$fileName' : '$safeDirectory$fileName';
+}
+
+String _joinDirectoryPath(String directoryPath, String folderName) {
+  return '${_joinResourcePath(directoryPath, folderName)}/';
 }
 
 String _formatFileSize(int bytes) {
