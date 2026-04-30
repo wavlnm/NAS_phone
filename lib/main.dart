@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:just_audio/just_audio.dart';
 
 void main() {
   runApp(const NasPhoneApp());
@@ -618,21 +619,38 @@ class _NasHomePageState extends State<NasHomePage> {
       return;
     }
 
-    if (!entry.isPreviewableImage) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('当前先支持图片在线预览。')),
+    if (entry.isPreviewableImage) {
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (context) => ImagePreviewPage(
+            title: entry.name,
+            imageUri: _buildRawResourceUri(baseUri, entry.path),
+            authToken: token,
+          ),
+        ),
       );
       return;
     }
 
-    await Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (context) => ImagePreviewPage(
-          title: entry.name,
-          imageUri: _buildRawResourceUri(baseUri, entry.path),
-          authToken: token,
+    if (entry.isPreviewableAudio) {
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (context) => AudioPreviewPage(
+            title: entry.name,
+            audioUri: _buildRawDownloadUri(baseUri, entry.path),
+            authToken: token,
+          ),
         ),
-      ),
+      );
+      return;
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('当前支持图片和音频在线预览。')),
     );
   }
 
@@ -917,17 +935,23 @@ class _NasHomePageState extends State<NasHomePage> {
             ? const Color(0xFFD1FAE5)
             : entry.isPreviewableImage
                 ? const Color(0xFFFFEDD5)
+                : entry.isPreviewableAudio
+                    ? const Color(0xFFEEE7FF)
                 : const Color(0xFFE0F2FE),
         child: Icon(
           entry.isDir
               ? Icons.folder_outlined
               : entry.isPreviewableImage
                   ? Icons.image_outlined
+                  : entry.isPreviewableAudio
+                      ? Icons.music_note_outlined
                   : Icons.description_outlined,
           color: entry.isDir
               ? const Color(0xFF0F766E)
               : entry.isPreviewableImage
                   ? const Color(0xFFEA580C)
+                  : entry.isPreviewableAudio
+                      ? const Color(0xFF6D28D9)
                   : const Color(0xFF0369A1),
         ),
       );
@@ -1215,6 +1239,8 @@ class _NasHomePageState extends State<NasHomePage> {
                                   ? '目录'
                                   : entry.isPreviewableImage
                                       ? '图片 · ${_formatFileSize(entry.size)}'
+                                  : entry.isPreviewableAudio
+                                    ? '音频 · ${_formatFileSize(entry.size)}'
                                       : _formatFileSize(entry.size),
                             ),
                             onTap: () => _openEntry(entry),
@@ -1399,6 +1425,7 @@ class FileBrowserEntry {
   final int size;
 
   bool get isPreviewableImage => !isDir && isPreviewableImagePath(name);
+  bool get isPreviewableAudio => !isDir && isPreviewableAudioPath(name);
 }
 
 class ImagePreviewPage extends StatelessWidget {
@@ -1460,6 +1487,304 @@ class ImagePreviewPage extends StatelessWidget {
                 ),
               );
             },
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class AudioPreviewPage extends StatefulWidget {
+  const AudioPreviewPage({
+    required this.title,
+    required this.audioUri,
+    required this.authToken,
+    super.key,
+  });
+
+  final String title;
+  final Uri audioUri;
+  final String authToken;
+
+  @override
+  State<AudioPreviewPage> createState() => _AudioPreviewPageState();
+}
+
+class _AudioPreviewPageState extends State<AudioPreviewPage> {
+  final AudioPlayer _player = AudioPlayer();
+
+  StreamSubscription<Duration>? _positionSubscription;
+  StreamSubscription<Duration?>? _durationSubscription;
+  StreamSubscription<PlayerState>? _playerStateSubscription;
+
+  Directory? _tempAudioDirectory;
+  Duration _position = Duration.zero;
+  Duration _duration = Duration.zero;
+  double? _dragValueMs;
+  bool _isPreparing = true;
+  bool _isPlaying = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _positionSubscription = _player.positionStream.listen((position) {
+      if (!mounted || _dragValueMs != null) {
+        return;
+      }
+
+      setState(() {
+        _position = position;
+      });
+    });
+
+    _durationSubscription = _player.durationStream.listen((duration) {
+      if (!mounted || duration == null) {
+        return;
+      }
+
+      setState(() {
+        _duration = duration;
+      });
+    });
+
+    _playerStateSubscription = _player.playerStateStream.listen((state) {
+      if (state.processingState == ProcessingState.completed) {
+        unawaited(_player.pause());
+        unawaited(_player.seek(Duration.zero));
+      }
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _isPlaying = state.playing;
+      });
+    });
+
+    unawaited(_initializeAudio());
+  }
+
+  Future<void> _initializeAudio() async {
+    try {
+      final duration = Platform.isWindows
+          ? await _loadWindowsAudioFromTempFile()
+          : await _player.setUrl(
+              widget.audioUri.toString(),
+              headers: {'X-Auth': widget.authToken},
+            );
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _duration = duration ?? Duration.zero;
+        _isPreparing = false;
+        _error = null;
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _isPreparing = false;
+        _error = _describeAudioError(error, fallback: '音频加载失败，请稍后重试。');
+      });
+    }
+  }
+
+  Future<Duration?> _loadWindowsAudioFromTempFile() async {
+    final tempDirectory = await Directory.systemTemp.createTemp('nas_phone_audio_');
+    final localFilePath = _joinLocalPath(tempDirectory.path, _safeLocalFileName(widget.title));
+    final localFile = File(localFilePath);
+
+    await _downloadAudioToLocalFile(localFile);
+
+    final previousTempDirectory = _tempAudioDirectory;
+    _tempAudioDirectory = tempDirectory;
+    if (previousTempDirectory != null) {
+      unawaited(_deleteDirectoryQuietly(previousTempDirectory));
+    }
+
+    return _player.setFilePath(localFile.path);
+  }
+
+  Future<void> _downloadAudioToLocalFile(File localFile) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
+
+    try {
+      final request = await client.getUrl(widget.audioUri).timeout(const Duration(seconds: 15));
+      request.headers.set('X-Auth', widget.authToken);
+
+      final response = await request.close().timeout(const Duration(seconds: 30));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        final body = await utf8.decodeStream(response).timeout(const Duration(seconds: 30));
+        throw NasApiException('音频下载失败：${response.statusCode}。${_compactAudioErrorBody(body)}');
+      }
+
+      await localFile.parent.create(recursive: true);
+      await response.pipe(localFile.openWrite()).timeout(const Duration(seconds: 2 * 60));
+    } on TimeoutException {
+      throw const NasApiException('音频下载超时，请稍后重试。');
+    } on SocketException catch (error) {
+      throw NasApiException('音频下载失败：${error.message}');
+    } on HttpException catch (error) {
+      throw NasApiException('音频下载失败：${error.message}');
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> _togglePlayback() async {
+    if (_isPreparing || _error != null) {
+      return;
+    }
+
+    try {
+      if (_isPlaying) {
+        await _player.pause();
+        return;
+      }
+
+      if (_player.processingState == ProcessingState.completed) {
+        await _player.seek(Duration.zero);
+      }
+
+      await _player.play();
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _error = '音频播放失败，请稍后重试。';
+      });
+    }
+  }
+
+  Future<void> _seekTo(double value) async {
+    final target = Duration(milliseconds: value.round());
+    try {
+      await _player.seek(target);
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _position = target;
+        _dragValueMs = null;
+      });
+    } catch (_) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _dragValueMs = null;
+        _error = '跳转进度失败，请稍后重试。';
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _positionSubscription?.cancel();
+    _durationSubscription?.cancel();
+    _playerStateSubscription?.cancel();
+    final tempAudioDirectory = _tempAudioDirectory;
+    if (tempAudioDirectory != null) {
+      unawaited(_deleteDirectoryQuietly(tempAudioDirectory));
+    }
+    _player.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final totalMs = _duration.inMilliseconds.toDouble();
+    final hasKnownDuration = totalMs > 0;
+    final sliderMax = hasKnownDuration ? totalMs : 1.0;
+    final displayedPositionMs = _dragValueMs ?? _position.inMilliseconds.toDouble();
+    final sliderValue = hasKnownDuration ? displayedPositionMs.clamp(0.0, sliderMax) : 0.0;
+    final canSeek = !_isPreparing && _error == null && hasKnownDuration;
+    final effectivePosition = Duration(milliseconds: displayedPositionMs.round());
+
+    return Scaffold(
+      appBar: AppBar(title: Text(widget.title)),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 560),
+              child: Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const CircleAvatar(
+                        radius: 36,
+                        backgroundColor: Color(0xFFEEE7FF),
+                        child: Icon(
+                          Icons.music_note_outlined,
+                          size: 36,
+                          color: Color(0xFF6D28D9),
+                        ),
+                      ),
+                      const SizedBox(height: 20),
+                      Text(
+                        widget.title,
+                        textAlign: TextAlign.center,
+                        style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        _error ?? (_isPlaying ? '正在播放' : (_isPreparing ? '正在加载音频...' : '已暂停')),
+                        textAlign: TextAlign.center,
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: _error == null ? const Color(0xFF475569) : const Color(0xFFB42318),
+                        ),
+                      ),
+                      const SizedBox(height: 20),
+                      Slider(
+                        min: 0,
+                        max: sliderMax,
+                        value: sliderValue,
+                        onChanged: canSeek
+                            ? (value) {
+                                setState(() {
+                                  _dragValueMs = value;
+                                });
+                              }
+                            : null,
+                        onChangeEnd: canSeek ? _seekTo : null,
+                      ),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(_formatMediaDuration(effectivePosition)),
+                          Text(hasKnownDuration ? _formatMediaDuration(_duration) : '--:--'),
+                        ],
+                      ),
+                      const SizedBox(height: 20),
+                      Center(
+                        child: IconButton.filledTonal(
+                          onPressed: _error == null && !_isPreparing ? _togglePlayback : null,
+                          iconSize: 34,
+                          icon: Icon(_isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
           ),
         ),
       ),
@@ -1648,6 +1973,23 @@ bool isPreviewableImagePath(String path) {
       normalized.endsWith('.heif');
 }
 
+    bool isPreviewableAudioPath(String path) {
+      final normalized = path.toLowerCase();
+      return normalized.endsWith('.mp3') ||
+      normalized.endsWith('.m4a') ||
+      normalized.endsWith('.aac') ||
+      normalized.endsWith('.wav') ||
+      normalized.endsWith('.flac') ||
+      normalized.endsWith('.ogg') ||
+      normalized.endsWith('.oga') ||
+      normalized.endsWith('.opus');
+    }
+
+String _safeLocalFileName(String value) {
+  final sanitized = value.replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_').trim();
+  return sanitized.isEmpty ? 'audio.tmp' : sanitized;
+}
+
 String _normalizeDirectoryPath(String rawPath) {
   if (rawPath.isEmpty || rawPath == '/') {
     return '/';
@@ -1756,4 +2098,51 @@ String _formatFileSize(int bytes) {
 
   final precision = value >= 10 ? 0 : 1;
   return '${value.toStringAsFixed(precision)} ${units[unitIndex]}';
+}
+
+String _formatMediaDuration(Duration duration) {
+  final totalSeconds = duration.inSeconds;
+  final hours = totalSeconds ~/ 3600;
+  final minutes = (totalSeconds % 3600) ~/ 60;
+  final seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return '${hours.toString().padLeft(2, '0')}:${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+  }
+
+  return '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+}
+
+String _compactAudioErrorBody(String body) {
+  final singleLine = body.replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (singleLine.isEmpty) {
+    return '';
+  }
+
+  return singleLine.length <= 120 ? singleLine : '${singleLine.substring(0, 120)}...';
+}
+
+String _describeAudioError(Object error, {required String fallback}) {
+  if (error is PlayerException) {
+    final message = (error.message ?? '').trim();
+    if (message.isEmpty) {
+      return '$fallback (${error.code})';
+    }
+
+    return '$fallback ${error.code}: $message';
+  }
+
+  if (error is NasApiException) {
+    return error.message;
+  }
+
+  return fallback;
+}
+
+Future<void> _deleteDirectoryQuietly(Directory directory) async {
+  try {
+    await directory.delete(recursive: true);
+  } catch (_) {
+    // Ignore temp cleanup failures.
+  }
 }
