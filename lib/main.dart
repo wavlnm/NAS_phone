@@ -194,6 +194,7 @@ class _NasHomePageState extends State<NasHomePage> {
   bool _isUploading = false;
   bool _isCreatingFolder = false;
 
+  NasHostStatus? _hostStatus;
   Uri? _baseUri;
   String? _authToken;
   String _currentDirectory = '/';
@@ -252,6 +253,7 @@ class _NasHomePageState extends State<NasHomePage> {
       }
 
       setState(() {
+        _hostStatus = status;
         _baseUri = baseUri;
         _authToken = token;
         _currentDirectory = directory?.path ?? '/';
@@ -275,6 +277,7 @@ class _NasHomePageState extends State<NasHomePage> {
 
       _resetFileSession();
       setState(() {
+        _hostStatus = null;
         _showMainShell = false;
         _probeState = ProbeState.error(error.message);
       });
@@ -1329,6 +1332,7 @@ class _NasHomePageState extends State<NasHomePage> {
   }
 
   void _resetFileSession() {
+    _hostStatus = null;
     _baseUri = null;
     _authToken = null;
     _currentDirectory = '/';
@@ -2128,45 +2132,6 @@ class _NasHomePageState extends State<NasHomePage> {
     );
   }
 
-  Widget _buildSimpleTab({
-    required ThemeData theme,
-    required String title,
-    required String description,
-    IconData icon = Icons.hourglass_bottom_outlined,
-    List<Widget> extraChildren = const [],
-  }) {
-    return SafeArea(
-      child: ListView(
-        padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
-        children: [
-          _buildSectionCard(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                CircleAvatar(
-                  radius: 24,
-                  backgroundColor: const Color(0xFFE2E8F0),
-                  child: Icon(icon, color: const Color(0xFF334155)),
-                ),
-                const SizedBox(height: 16),
-                Text(
-                  title,
-                  style: theme.textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w700),
-                ),
-                const SizedBox(height: 10),
-                Text(description, style: theme.textTheme.bodyLarge),
-                for (final child in extraChildren) ...[
-                  const SizedBox(height: 16),
-                  child,
-                ],
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
   Widget _buildToolsTab(ThemeData theme) {
     return SafeArea(
       child: ListView(
@@ -2213,21 +2178,213 @@ class _NasHomePageState extends State<NasHomePage> {
     );
   }
 
-  Widget _buildMineTab(ThemeData theme) {
-    return _buildSimpleTab(
-      theme: theme,
-      title: '我的',
-      description: '这里先保留当前连接信息和返回连接页入口，后面再接账户、空间和设置。',
-      icon: Icons.person_outline,
-      extraChildren: [
-        Text('宿主名称: ${_probeState.hostName ?? '未连接'}'),
-        Text('连接地址: ${_baseUri?.origin ?? '未连接'}'),
-        FilledButton.tonalIcon(
-          onPressed: _returnToConnectionPage,
-          icon: const Icon(Icons.settings_ethernet),
-          label: const Text('返回连接页'),
+  String _mineDisplayName() {
+    final hostName = _hostStatus?.hostName.trim();
+    if (hostName == null ||
+        hostName.isEmpty ||
+        hostName == 'loal_NAS 宿主' ||
+        hostName == 'loal_NAS MVP host') {
+      return 'NAS 用户';
+    }
+
+    return hostName;
+  }
+
+  Future<void> _openAccountSecurityPage() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => AccountSecurityPage(
+          displayName: _mineDisplayName(),
+          hostName: _hostStatus?.hostName ?? '未连接',
+          connectionAddress: _baseUri?.origin ?? '未连接',
+          sharedRoot: _hostStatus?.sharedRoot,
+          onReturnToConnectionPage: _returnToConnectionPage,
         ),
-      ],
+      ),
+    );
+  }
+
+  Future<void> _openNotificationSettingsPage() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => const NotificationSettingsPage(),
+      ),
+    );
+  }
+
+  Future<void> _openContactDeveloperPage() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => const ContactDeveloperPage(),
+      ),
+    );
+  }
+
+  Widget _buildMineTab(ThemeData theme) {
+    final storage = _hostStatus?.storage;
+    final usedRatio = storage?.usedRatio ?? 0;
+    final usedPercent = '${(usedRatio * 100).toStringAsFixed(0)}%';
+
+    return SafeArea(
+      child: ListView(
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+        children: [
+          Container(
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(30),
+              boxShadow: const [
+                BoxShadow(
+                  color: Color(0x120F172A),
+                  blurRadius: 28,
+                  offset: Offset(0, 10),
+                ),
+              ],
+            ),
+            child: Row(
+              children: [
+                const CircleAvatar(
+                  radius: 30,
+                  backgroundColor: Color(0xFFE0F2FE),
+                  child: Icon(Icons.person_outline, color: Color(0xFF0369A1), size: 28),
+                ),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        _mineDisplayName(),
+                        style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        '个人空间',
+                        style: theme.textTheme.bodyMedium?.copyWith(color: const Color(0xFF64748B)),
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        _baseUri?.origin ?? '未连接宿主',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodySmall?.copyWith(color: const Color(0xFF94A3B8)),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          _buildSectionCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('存储空间', style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700)),
+                const SizedBox(height: 14),
+                if (storage == null)
+                  Text(
+                    '暂时无法读取共享目录所在硬盘的空间信息。',
+                    style: theme.textTheme.bodyMedium?.copyWith(color: const Color(0xFF64748B)),
+                  )
+                else ...[
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _StorageMetric(
+                          label: '全部',
+                          value: _formatFileSize(storage.totalBytes),
+                        ),
+                      ),
+                      Expanded(
+                        child: _StorageMetric(
+                          label: '已使用',
+                          value: _formatFileSize(storage.usedBytes),
+                        ),
+                      ),
+                      Expanded(
+                        child: _StorageMetric(
+                          label: '占用',
+                          value: usedPercent,
+                          alignment: CrossAxisAlignment.end,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(999),
+                    child: LinearProgressIndicator(
+                      value: usedRatio,
+                      minHeight: 8,
+                      backgroundColor: const Color(0xFFE2E8F0),
+                      valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF3B82F6)),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    '磁盘: ${storage.driveName.isEmpty ? '当前共享目录所在硬盘' : storage.driveName}',
+                    style: theme.textTheme.bodySmall?.copyWith(color: const Color(0xFF64748B)),
+                  ),
+                ],
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFFFFBEB),
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Padding(
+                        padding: EdgeInsets.only(top: 2),
+                        child: Icon(Icons.info_outline, size: 18, color: Color(0xFFB45309)),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          '这里只能显示当前硬盘的全部和已用空间。已用空间不一定都是云空间占用，计算机上的其他文件也会算进去。',
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: const Color(0xFF92400E),
+                            height: 1.5,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          _buildSectionCard(
+            child: Column(
+              children: [
+                _MineOptionTile(
+                  icon: Icons.shield_outlined,
+                  title: '账号与安全',
+                  onTap: _openAccountSecurityPage,
+                ),
+                const Divider(height: 1),
+                _MineOptionTile(
+                  icon: Icons.notifications_none_rounded,
+                  title: '通知设置',
+                  onTap: _openNotificationSettingsPage,
+                ),
+                const Divider(height: 1),
+                _MineOptionTile(
+                  icon: Icons.mail_outline,
+                  title: '联系开发者',
+                  trailingText: 'xfdlxyw@163.com',
+                  onTap: _openContactDeveloperPage,
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -2392,6 +2549,71 @@ class _ToolLauncherButton extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+class _StorageMetric extends StatelessWidget {
+  const _StorageMetric({
+    required this.label,
+    required this.value,
+    this.alignment = CrossAxisAlignment.start,
+  });
+
+  final String label;
+  final String value;
+  final CrossAxisAlignment alignment;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: alignment,
+      children: [
+        Text(
+          label,
+          style: Theme.of(context).textTheme.bodySmall?.copyWith(color: const Color(0xFF64748B)),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          value,
+          style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+        ),
+      ],
+    );
+  }
+}
+
+class _MineOptionTile extends StatelessWidget {
+  const _MineOptionTile({
+    required this.icon,
+    required this.title,
+    required this.onTap,
+    this.trailingText,
+  });
+
+  final IconData icon;
+  final String title;
+  final VoidCallback onTap;
+  final String? trailingText;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: CircleAvatar(
+        backgroundColor: const Color(0xFFF8FAFC),
+        child: Icon(icon, color: const Color(0xFF334155)),
+      ),
+      title: Text(title),
+      subtitle: trailingText == null
+          ? null
+          : Text(
+              trailingText!,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+      trailing: const Icon(Icons.chevron_right),
+      onTap: onTap,
     );
   }
 }
@@ -2656,6 +2878,208 @@ class RecycleBinToolPage extends StatelessWidget {
               ],
             ),
           ),
+        ),
+      ),
+    );
+  }
+}
+
+class AccountSecurityPage extends StatelessWidget {
+  const AccountSecurityPage({
+    required this.displayName,
+    required this.hostName,
+    required this.connectionAddress,
+    required this.sharedRoot,
+    required this.onReturnToConnectionPage,
+    super.key,
+  });
+
+  final String displayName;
+  final String hostName;
+  final String connectionAddress;
+  final String? sharedRoot;
+  final VoidCallback onReturnToConnectionPage;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('账号与安全')),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+          children: [
+            _PlainInfoCard(
+              title: '当前身份',
+              lines: [
+                '显示名称: $displayName',
+                '宿主名称: $hostName',
+                '连接地址: $connectionAddress',
+                if (sharedRoot != null && sharedRoot!.isNotEmpty) '共享目录: $sharedRoot',
+              ],
+            ),
+            const SizedBox(height: 16),
+            _PlainInfoCard(
+              title: '安全说明',
+              lines: const [
+                '当前版本没有独立账号体系，手机端通过宿主地址和 FileBrowser 会话访问文件。',
+                '如果需要切换宿主或重新建立连接，可以返回连接页重新探测。',
+              ],
+            ),
+            const SizedBox(height: 16),
+            FilledButton.tonalIcon(
+              onPressed: () {
+                Navigator.of(context).pop();
+                onReturnToConnectionPage();
+              },
+              icon: const Icon(Icons.settings_ethernet),
+              label: const Text('返回连接页'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class NotificationSettingsPage extends StatefulWidget {
+  const NotificationSettingsPage({super.key});
+
+  @override
+  State<NotificationSettingsPage> createState() => _NotificationSettingsPageState();
+}
+
+class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
+  bool _taskNotifications = true;
+  bool _connectionNotifications = true;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('通知设置')),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+          children: [
+            Material(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(24),
+              child: Column(
+                children: [
+                  SwitchListTile(
+                    value: _taskNotifications,
+                    onChanged: (value) => setState(() => _taskNotifications = value),
+                    title: const Text('任务完成提醒'),
+                    subtitle: const Text('上传、下载结束后在应用内提醒。'),
+                  ),
+                  const Divider(height: 1),
+                  SwitchListTile(
+                    value: _connectionNotifications,
+                    onChanged: (value) => setState(() => _connectionNotifications = value),
+                    title: const Text('连接异常提醒'),
+                    subtitle: const Text('宿主无法访问时给出明显提示。'),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              '这些设置当前只在本次运行中生效，后续再接持久化。',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(color: const Color(0xFF64748B)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class ContactDeveloperPage extends StatelessWidget {
+  const ContactDeveloperPage({super.key});
+
+  static const String _email = 'xfdlxyw@163.com';
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('联系开发者')),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Material(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(24),
+                child: Padding(
+                  padding: const EdgeInsets.all(20),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '邮箱地址',
+                        style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+                      ),
+                      const SizedBox(height: 10),
+                      SelectableText(
+                        _email,
+                        style: Theme.of(context).textTheme.bodyLarge,
+                      ),
+                      const SizedBox(height: 16),
+                      FilledButton.tonalIcon(
+                        onPressed: () {
+                          Clipboard.setData(const ClipboardData(text: _email));
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('邮箱地址已复制。')),
+                          );
+                        },
+                        icon: const Icon(Icons.copy_outlined),
+                        label: const Text('复制邮箱地址'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _PlainInfoCard extends StatelessWidget {
+  const _PlainInfoCard({
+    required this.title,
+    required this.lines,
+  });
+
+  final String title;
+  final List<String> lines;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(24),
+      child: Padding(
+        padding: const EdgeInsets.all(18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              title,
+              style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 12),
+            for (var index = 0; index < lines.length; index++) ...[
+              if (index > 0) const SizedBox(height: 8),
+              Text(
+                lines[index],
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: const Color(0xFF475569), height: 1.5),
+              ),
+            ],
+          ],
         ),
       ),
     );
@@ -2944,6 +3368,7 @@ class NasHostStatus {
     this.fileBrowserRunning,
     this.fileBrowserBaseUrl,
     this.sharedRoot,
+    this.storage,
   });
 
   factory NasHostStatus.fromJson(Map<String, dynamic> json) {
@@ -2953,13 +3378,20 @@ class NasHostStatus {
         : fileBrowser is Map
             ? Map<String, dynamic>.from(fileBrowser)
             : const <String, dynamic>{};
-    final running = fileBrowserMap['running'];
+    final running = fileBrowserMap['running'] ?? json['fileBrowserRunning'];
+    final storageJson = json['storage'];
+    final storageMap = storageJson is Map<String, dynamic>
+        ? storageJson
+        : storageJson is Map
+            ? Map<String, dynamic>.from(storageJson)
+            : null;
 
     return NasHostStatus(
       hostName: json['name']?.toString() ?? 'loal_NAS 宿主',
       fileBrowserRunning: running is bool ? running : null,
-      fileBrowserBaseUrl: fileBrowserMap['baseUrl']?.toString(),
-      sharedRoot: fileBrowserMap['sharedRoot']?.toString(),
+      fileBrowserBaseUrl: (fileBrowserMap['baseUrl'] ?? json['fileBrowserBaseUrl'])?.toString(),
+      sharedRoot: (fileBrowserMap['sharedRoot'] ?? json['sharedRootPath'])?.toString(),
+      storage: storageMap == null ? null : HostStorageSummary.fromJson(storageMap),
     );
   }
 
@@ -2967,6 +3399,42 @@ class NasHostStatus {
   final bool? fileBrowserRunning;
   final String? fileBrowserBaseUrl;
   final String? sharedRoot;
+  final HostStorageSummary? storage;
+}
+
+class HostStorageSummary {
+  const HostStorageSummary({
+    required this.driveName,
+    required this.totalBytes,
+    required this.usedBytes,
+    required this.freeBytes,
+  });
+
+  factory HostStorageSummary.fromJson(Map<String, dynamic> json) {
+    int toInt(dynamic value) {
+      return value is num ? value.toInt() : 0;
+    }
+
+    return HostStorageSummary(
+      driveName: json['driveName']?.toString() ?? '',
+      totalBytes: toInt(json['totalBytes']),
+      usedBytes: toInt(json['usedBytes']),
+      freeBytes: toInt(json['freeBytes']),
+    );
+  }
+
+  final String driveName;
+  final int totalBytes;
+  final int usedBytes;
+  final int freeBytes;
+
+  double get usedRatio {
+    if (totalBytes <= 0) {
+      return 0;
+    }
+
+    return (usedBytes / totalBytes).clamp(0, 1);
+  }
 }
 
 class FileBrowserDirectory {
