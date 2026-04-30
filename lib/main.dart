@@ -99,6 +99,29 @@ class ActiveTransferTask {
   }
 }
 
+class LocalNote {
+  const LocalNote({
+    required this.id,
+    required this.title,
+    required this.content,
+    required this.updatedAt,
+  });
+
+  final String id;
+  final String title;
+  final String content;
+  final DateTime updatedAt;
+
+  String get preview {
+    final normalized = content.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (normalized.isEmpty) {
+      return '空白笔记';
+    }
+
+    return normalized.length <= 56 ? normalized : '${normalized.substring(0, 56)}...';
+  }
+}
+
 const List<FileCategoryShortcut> _fileCategoryShortcuts = [
   FileCategoryShortcut(
     filter: FileCategoryFilter.image,
@@ -179,6 +202,7 @@ class _NasHomePageState extends State<NasHomePage> {
   String? _busyEntryPath;
   List<RecentFileVisit> _recentFileVisits = const [];
   List<ActiveTransferTask> _activeTransferTasks = const [];
+  List<LocalNote> _notes = const [];
   bool _showMainShell = false;
   MainTab _selectedTab = MainTab.home;
   SpaceScope _selectedSpace = SpaceScope.personal;
@@ -1507,6 +1531,39 @@ class _NasHomePageState extends State<NasHomePage> {
     });
   }
 
+  void _updateNotes(List<LocalNote> notes) {
+    setState(() {
+      _notes = List<LocalNote>.from(notes);
+    });
+  }
+
+  Future<void> _openNotesToolPage() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => NotesToolPage(
+          initialNotes: _notes,
+          onNotesChanged: _updateNotes,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openChatToolPage() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => const ChatToolPage(),
+      ),
+    );
+  }
+
+  Future<void> _openRecycleBinToolPage() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => const RecycleBinToolPage(),
+      ),
+    );
+  }
+
   Widget _buildSectionCard({required Widget child}) {
     return Container(
       padding: const EdgeInsets.all(18),
@@ -2111,34 +2168,48 @@ class _NasHomePageState extends State<NasHomePage> {
   }
 
   Widget _buildToolsTab(ThemeData theme) {
-    return _buildSimpleTab(
-      theme: theme,
-      title: '工具',
-      description: '这里先放当前阶段最常用的操作入口，后面再往这个页签继续扩。',
-      icon: Icons.grid_view_rounded,
-      extraChildren: [
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: [
-            FilledButton.tonalIcon(
-              onPressed: _hasFileSession && !_isLoadingFiles ? () => _refreshFiles() : null,
-              icon: const Icon(Icons.refresh),
-              label: const Text('刷新文件'),
-            ),
-            FilledButton.icon(
-              onPressed: _hasFileSession && !_isUploading ? _pickAndUploadFiles : null,
-              icon: const Icon(Icons.upload_file),
-              label: const Text('上传文件'),
-            ),
-            FilledButton.tonalIcon(
-              onPressed: _hasFileSession && !_isCreatingFolder ? _createFolder : null,
-              icon: const Icon(Icons.create_new_folder_outlined),
-              label: const Text('新建文件夹'),
-            ),
-          ],
-        ),
-      ],
+    return SafeArea(
+      child: ListView(
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+        children: [
+          Text(
+            '工具',
+            style: theme.textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            '先把独立工具入口收进来，每个工具单独进入自己的极简页面。',
+            style: theme.textTheme.bodyMedium?.copyWith(color: const Color(0xFF64748B)),
+          ),
+          const SizedBox(height: 18),
+          _ToolLauncherButton(
+            icon: Icons.edit_note_outlined,
+            title: '笔记',
+            subtitle: '记录临时想法、待办和说明。',
+            backgroundColor: const Color(0xFFF8FAFC),
+            foregroundColor: const Color(0xFF0F172A),
+            onTap: _openNotesToolPage,
+          ),
+          const SizedBox(height: 14),
+          _ToolLauncherButton(
+            icon: Icons.forum_outlined,
+            title: '聊天',
+            subtitle: '页面先留空，后续再接真实聊天功能。',
+            backgroundColor: const Color(0xFFEEF2FF),
+            foregroundColor: const Color(0xFF3730A3),
+            onTap: _openChatToolPage,
+          ),
+          const SizedBox(height: 14),
+          _ToolLauncherButton(
+            icon: Icons.delete_outline,
+            title: '回收站',
+            subtitle: '先单独给出回收站页面和当前状态说明。',
+            backgroundColor: const Color(0xFFFEF2F2),
+            foregroundColor: const Color(0xFFB91C1C),
+            onTap: _openRecycleBinToolPage,
+          ),
+        ],
+      ),
     );
   }
 
@@ -2248,6 +2319,342 @@ class _CategoryShortcutButton extends StatelessWidget {
                 ),
               ),
             ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ToolLauncherButton extends StatelessWidget {
+  const _ToolLauncherButton({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.backgroundColor,
+    required this.foregroundColor,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final Color backgroundColor;
+  final Color foregroundColor;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: backgroundColor,
+      borderRadius: BorderRadius.circular(28),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(28),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Row(
+            children: [
+              Container(
+                width: 56,
+                height: 56,
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.72),
+                  borderRadius: BorderRadius.circular(18),
+                ),
+                child: Icon(icon, color: foregroundColor),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                        color: foregroundColor,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      subtitle,
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: foregroundColor.withValues(alpha: 0.82),
+                        height: 1.4,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Icon(Icons.chevron_right, color: foregroundColor),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class NotesToolPage extends StatefulWidget {
+  const NotesToolPage({
+    required this.initialNotes,
+    required this.onNotesChanged,
+    super.key,
+  });
+
+  final List<LocalNote> initialNotes;
+  final ValueChanged<List<LocalNote>> onNotesChanged;
+
+  @override
+  State<NotesToolPage> createState() => _NotesToolPageState();
+}
+
+class _NotesToolPageState extends State<NotesToolPage> {
+  late List<LocalNote> _notes;
+
+  @override
+  void initState() {
+    super.initState();
+    _notes = List<LocalNote>.from(widget.initialNotes)..sort(_compareNotes);
+  }
+
+  int _compareNotes(LocalNote left, LocalNote right) {
+    return right.updatedAt.compareTo(left.updatedAt);
+  }
+
+  void _persistNotes() {
+    widget.onNotesChanged(_notes);
+  }
+
+  Future<void> _editNote([LocalNote? existing]) async {
+    final titleController = TextEditingController(text: existing?.title ?? '');
+    final contentController = TextEditingController(text: existing?.content ?? '');
+
+    final result = await showDialog<LocalNote>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(existing == null ? '新建笔记' : '编辑笔记'),
+        content: SizedBox(
+          width: 420,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: titleController,
+                decoration: const InputDecoration(
+                  labelText: '标题',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: contentController,
+                minLines: 6,
+                maxLines: 10,
+                decoration: const InputDecoration(
+                  labelText: '内容',
+                  alignLabelWithHint: true,
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () {
+              final rawTitle = titleController.text.trim();
+              final rawContent = contentController.text.trim();
+              final derivedTitle = rawTitle.isNotEmpty
+                  ? rawTitle
+                  : rawContent.isNotEmpty
+                      ? rawContent.split('\n').first.trim()
+                      : '未命名笔记';
+              Navigator.of(dialogContext).pop(
+                LocalNote(
+                  id: existing?.id ?? DateTime.now().microsecondsSinceEpoch.toString(),
+                  title: derivedTitle,
+                  content: rawContent,
+                  updatedAt: DateTime.now(),
+                ),
+              );
+            },
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+
+    titleController.dispose();
+    contentController.dispose();
+
+    if (!mounted || result == null) {
+      return;
+    }
+
+    setState(() {
+      _notes = [
+        result,
+        ..._notes.where((note) => note.id != result.id),
+      ]..sort(_compareNotes);
+    });
+    _persistNotes();
+  }
+
+  void _deleteNote(LocalNote note) {
+    setState(() {
+      _notes = _notes.where((item) => item.id != note.id).toList(growable: false);
+    });
+    _persistNotes();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('笔记'),
+        actions: [
+          IconButton(
+            onPressed: _editNote,
+            icon: const Icon(Icons.add),
+            tooltip: '新建笔记',
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: _notes.isEmpty
+            ? Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const Icon(Icons.note_alt_outlined, size: 48, color: Color(0xFF94A3B8)),
+                    const SizedBox(height: 14),
+                    Text(
+                      '还没有笔记',
+                      style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      '点右上角加号，先记下一条。',
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: const Color(0xFF64748B)),
+                    ),
+                  ],
+                ),
+              )
+            : ListView.separated(
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+                itemCount: _notes.length,
+                separatorBuilder: (_, _) => const SizedBox(height: 12),
+                itemBuilder: (context, index) {
+                  final note = _notes[index];
+                  return Material(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(24),
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(24),
+                      onTap: () => _editNote(note),
+                      child: Padding(
+                        padding: const EdgeInsets.all(18),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Icon(Icons.sticky_note_2_outlined, color: Color(0xFF0F766E)),
+                            const SizedBox(width: 14),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    note.title,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+                                  ),
+                                  const SizedBox(height: 6),
+                                  Text(
+                                    note.preview,
+                                    maxLines: 2,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                                      color: const Color(0xFF475569),
+                                      height: 1.4,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 10),
+                                  Text(
+                                    _formatRelativeTime(note.updatedAt),
+                                    style: Theme.of(context).textTheme.bodySmall?.copyWith(color: const Color(0xFF94A3B8)),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            IconButton(
+                              onPressed: () => _deleteNote(note),
+                              icon: const Icon(Icons.delete_outline),
+                              tooltip: '删除笔记',
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: _editNote,
+        child: const Icon(Icons.add),
+      ),
+    );
+  }
+}
+
+class ChatToolPage extends StatelessWidget {
+  const ChatToolPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('聊天')),
+      body: const SafeArea(child: SizedBox.expand()),
+    );
+  }
+}
+
+class RecycleBinToolPage extends StatelessWidget {
+  const RecycleBinToolPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('回收站')),
+      body: SafeArea(
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(Icons.delete_outline, size: 52, color: Color(0xFFB91C1C)),
+                const SizedBox(height: 16),
+                Text(
+                  '当前还没有接入回收站',
+                  style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  '现在的删除操作会直接调用 FileBrowser 的删除接口，不会先进入回收站。后续如果改成软删除，这里会显示可恢复的项目。',
+                  style: Theme.of(context).textTheme.bodyLarge?.copyWith(color: const Color(0xFF475569), height: 1.5),
+                  textAlign: TextAlign.center,
+                ),
+              ],
+            ),
           ),
         ),
       ),
