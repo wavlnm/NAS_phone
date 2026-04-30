@@ -431,43 +431,15 @@ class _NasHomePageState extends State<NasHomePage> {
       return;
     }
 
-    final controller = TextEditingController(text: _parentDirectoryPath(entry.path));
-    final targetDirectoryInput = await showDialog<String>(
+    final targetDirectory = await showDialog<String>(
       context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('移动到目录'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          decoration: const InputDecoration(
-            border: OutlineInputBorder(),
-            hintText: '输入目标目录，例如 /照片/',
-          ),
-          onSubmitted: (value) => Navigator.of(dialogContext).pop(value.trim()),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(dialogContext).pop(),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.of(dialogContext).pop(controller.text.trim()),
-            child: const Text('移动'),
-          ),
-        ],
+      builder: (dialogContext) => RemoteDirectoryPickerDialog(
+        initialDirectory: _parentDirectoryPath(entry.path),
+        fetchDirectory: (path) => _fetchDirectory(baseUri, token, path),
       ),
     );
-    controller.dispose();
 
-    if (!mounted || targetDirectoryInput == null) {
-      return;
-    }
-
-    final targetDirectory = _normalizeAbsoluteDirectoryInput(targetDirectoryInput);
-    if (targetDirectory == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('目标目录必须是以 / 开头的绝对路径。')),
-      );
+    if (!mounted || targetDirectory == null) {
       return;
     }
 
@@ -1495,6 +1467,159 @@ class ImagePreviewPage extends StatelessWidget {
   }
 }
 
+class RemoteDirectoryPickerDialog extends StatefulWidget {
+  const RemoteDirectoryPickerDialog({
+    required this.initialDirectory,
+    required this.fetchDirectory,
+    super.key,
+  });
+
+  final String initialDirectory;
+  final Future<FileBrowserDirectory> Function(String path) fetchDirectory;
+
+  @override
+  State<RemoteDirectoryPickerDialog> createState() => _RemoteDirectoryPickerDialogState();
+}
+
+class _RemoteDirectoryPickerDialogState extends State<RemoteDirectoryPickerDialog> {
+  late String _currentDirectory;
+  List<FileBrowserEntry> _directories = const [];
+  bool _isLoading = true;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _currentDirectory = _normalizeDirectoryPath(widget.initialDirectory);
+    unawaited(_loadDirectory(_currentDirectory));
+  }
+
+  Future<void> _loadDirectory(String path) async {
+    setState(() {
+      _isLoading = true;
+      _error = null;
+    });
+
+    try {
+      final directory = await widget.fetchDirectory(path);
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _currentDirectory = directory.path;
+        _directories = directory.items.where((item) => item.isDir).toList();
+      });
+    } on NasApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _error = error.message;
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('选择目标目录'),
+      content: SizedBox(
+        width: 420,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('当前目录: $_currentDirectory'),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                FilledButton.tonalIcon(
+                  onPressed: _isLoading || _currentDirectory == '/'
+                      ? null
+                      : () => _loadDirectory(_parentDirectoryPath(_currentDirectory)),
+                  icon: const Icon(Icons.arrow_upward),
+                  label: const Text('上级目录'),
+                ),
+                FilledButton.tonalIcon(
+                  onPressed: _isLoading ? null : () => _loadDirectory(_currentDirectory),
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('刷新'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              height: 280,
+              child: _isLoading
+                  ? const Center(child: CircularProgressIndicator())
+                  : _error != null
+                      ? Center(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Text(
+                                _error!,
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(color: Color(0xFFB42318)),
+                              ),
+                              const SizedBox(height: 12),
+                              FilledButton.tonal(
+                                onPressed: () => _loadDirectory(_currentDirectory),
+                                child: const Text('重试'),
+                              ),
+                            ],
+                          ),
+                        )
+                      : _directories.isEmpty
+                          ? const Center(child: Text('这个目录下没有子目录。'))
+                          : ListView.separated(
+                              itemCount: _directories.length,
+                              separatorBuilder: (_, _) => const Divider(height: 1),
+                              itemBuilder: (context, index) {
+                                final directory = _directories[index];
+                                return ListTile(
+                                  contentPadding: EdgeInsets.zero,
+                                  leading: const CircleAvatar(
+                                    backgroundColor: Color(0xFFD1FAE5),
+                                    child: Icon(
+                                      Icons.folder_outlined,
+                                      color: Color(0xFF0F766E),
+                                    ),
+                                  ),
+                                  title: Text(directory.name),
+                                  trailing: const Icon(Icons.chevron_right),
+                                  onTap: () => _loadDirectory(directory.path),
+                                );
+                              },
+                            ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: _isLoading ? null : () => Navigator.of(context).pop(_currentDirectory),
+          child: const Text('移动到当前目录'),
+        ),
+      ],
+    );
+  }
+}
+
 class SimpleHttpResponse {
   const SimpleHttpResponse(this.statusCode, this.body);
 
@@ -1581,15 +1706,6 @@ String? _validateEntryName(String value) {
   }
 
   return null;
-}
-
-String? _normalizeAbsoluteDirectoryInput(String value) {
-  final trimmed = value.trim();
-  if (trimmed.isEmpty || !trimmed.startsWith('/')) {
-    return null;
-  }
-
-  return _normalizeDirectoryPath(trimmed);
 }
 
 String _parentDirectoryPath(String currentDirectory) {
