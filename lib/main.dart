@@ -18,6 +18,72 @@ enum EntryMenuAction {
   download,
 }
 
+enum MainTab {
+  home,
+  recent,
+  tools,
+  mine,
+}
+
+enum SpaceScope {
+  personal,
+  family,
+}
+
+enum FileCategoryFilter {
+  image,
+  video,
+  audio,
+  document,
+}
+
+class FileCategoryShortcut {
+  const FileCategoryShortcut({
+    required this.filter,
+    required this.label,
+    required this.icon,
+    required this.backgroundColor,
+    required this.foregroundColor,
+  });
+
+  final FileCategoryFilter filter;
+  final String label;
+  final IconData icon;
+  final Color backgroundColor;
+  final Color foregroundColor;
+}
+
+const List<FileCategoryShortcut> _fileCategoryShortcuts = [
+  FileCategoryShortcut(
+    filter: FileCategoryFilter.image,
+    label: '图片',
+    icon: Icons.image_outlined,
+    backgroundColor: Color(0xFFE0F2FE),
+    foregroundColor: Color(0xFF0369A1),
+  ),
+  FileCategoryShortcut(
+    filter: FileCategoryFilter.video,
+    label: '视频',
+    icon: Icons.play_circle_outline,
+    backgroundColor: Color(0xFFFFEDD5),
+    foregroundColor: Color(0xFFEA580C),
+  ),
+  FileCategoryShortcut(
+    filter: FileCategoryFilter.audio,
+    label: '音乐',
+    icon: Icons.music_note_outlined,
+    backgroundColor: Color(0xFFEEE7FF),
+    foregroundColor: Color(0xFF6D28D9),
+  ),
+  FileCategoryShortcut(
+    filter: FileCategoryFilter.document,
+    label: '文档',
+    icon: Icons.description_outlined,
+    backgroundColor: Color(0xFFDCFCE7),
+    foregroundColor: Color(0xFF15803D),
+  ),
+];
+
 class NasPhoneApp extends StatelessWidget {
   const NasPhoneApp({super.key});
 
@@ -65,6 +131,9 @@ class _NasHomePageState extends State<NasHomePage> {
   List<FileBrowserEntry> _entries = const [];
   String? _fileError;
   String? _busyEntryPath;
+  bool _showMainShell = false;
+  MainTab _selectedTab = MainTab.home;
+  SpaceScope _selectedSpace = SpaceScope.personal;
 
   bool get _hasFileSession => _baseUri != null && _authToken != null;
   bool get _canGoUp => _hasFileSession && _currentDirectory != '/';
@@ -116,6 +185,9 @@ class _NasHomePageState extends State<NasHomePage> {
         _currentDirectory = directory?.path ?? '/';
         _entries = directory?.items ?? const [];
         _fileError = fileError;
+        _showMainShell = token != null && directory != null;
+        _selectedTab = MainTab.home;
+        _selectedSpace = SpaceScope.personal;
         _probeState = ProbeState.success(
           endpoint: baseUri.origin,
           hostName: status.hostName,
@@ -129,6 +201,7 @@ class _NasHomePageState extends State<NasHomePage> {
 
       _resetFileSession();
       setState(() {
+        _showMainShell = false;
         _probeState = ProbeState.error(error.message);
       });
     } finally {
@@ -1149,6 +1222,644 @@ class _NasHomePageState extends State<NasHomePage> {
     _entries = const [];
     _fileError = null;
     _busyEntryPath = null;
+    _showMainShell = false;
+    _selectedTab = MainTab.home;
+    _selectedSpace = SpaceScope.personal;
+  }
+
+  void _returnToConnectionPage() {
+    setState(() {
+      _showMainShell = false;
+    });
+  }
+
+  void _changeSpaceScope(SpaceScope? nextScope) {
+    if (nextScope == null || nextScope == _selectedSpace) {
+      return;
+    }
+
+    setState(() {
+      _selectedSpace = nextScope;
+    });
+
+    if (nextScope == SpaceScope.family) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('家庭空间还没接入，当前先保留占位。')),
+      );
+    }
+  }
+
+  List<FileBrowserEntry> _entriesForCategory(FileCategoryFilter filter) {
+    return _entries.where((entry) {
+      switch (filter) {
+        case FileCategoryFilter.image:
+          return entry.isPreviewableImage;
+        case FileCategoryFilter.video:
+          return entry.isPreviewableVideo;
+        case FileCategoryFilter.audio:
+          return entry.isPreviewableAudio;
+        case FileCategoryFilter.document:
+          return !entry.isDir &&
+              !entry.isPreviewableImage &&
+              !entry.isPreviewableAudio &&
+              !entry.isPreviewableVideo;
+      }
+    }).toList(growable: false);
+  }
+
+  String _buildEntrySubtitle(FileBrowserEntry entry) {
+    if (entry.isDir) {
+      return '目录';
+    }
+
+    if (entry.isPreviewableImage) {
+      return '图片 · ${_formatFileSize(entry.size)}';
+    }
+
+    if (entry.isPreviewableAudio) {
+      return '音频 · ${_formatFileSize(entry.size)}';
+    }
+
+    if (entry.isPreviewableVideo) {
+      return '视频 · ${_formatFileSize(entry.size)}';
+    }
+
+    return '文档 · ${_formatFileSize(entry.size)}';
+  }
+
+  Future<void> _openCategoryPage(FileCategoryShortcut shortcut) async {
+    if (_selectedSpace != SpaceScope.personal) {
+      return;
+    }
+
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => CategoryEntriesPage(
+          title: shortcut.label,
+          directoryPath: _currentDirectory,
+          entries: _entriesForCategory(shortcut.filter),
+          buildLeading: _buildEntryLeading,
+          buildSubtitle: _buildEntrySubtitle,
+          onOpenEntry: _openEntry,
+          onHandleEntryAction: _handleEntryAction,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSectionCard({required Widget child}) {
+    return Container(
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(28),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x0F0F172A),
+            blurRadius: 24,
+            offset: Offset(0, 10),
+          ),
+        ],
+      ),
+      child: child,
+    );
+  }
+
+  Widget _buildConnectionPage(ThemeData theme) {
+    return Scaffold(
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(20, 20, 20, 28),
+          children: [
+            Container(
+              padding: const EdgeInsets.all(24),
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(
+                  colors: [Color(0xFF134E4A), Color(0xFF0F766E)],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                borderRadius: BorderRadius.circular(32),
+              ),
+              child: const Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '连接你的 loal_NAS 宿主',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 28,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  SizedBox(height: 12),
+                  Text(
+                    '先连上宿主，再进入首页。连接成功后会自动跳转，并继续复用现在这套 FileBrowser 接口。',
+                    style: TextStyle(
+                      color: Color(0xFFD1FAE5),
+                      height: 1.5,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 20),
+            _buildSectionCard(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('宿主地址', style: theme.textTheme.titleMedium),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _hostController,
+                    keyboardType: TextInputType.url,
+                    decoration: const InputDecoration(
+                      border: OutlineInputBorder(),
+                      hintText: 'http://192.168.1.10:5034 或 http://[IPv6]:5034',
+                    ),
+                    onSubmitted: (_) {
+                      if (!_isProbing) {
+                        _probeHost();
+                      }
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    child: FilledButton.icon(
+                      onPressed: _isProbing ? null : _probeHost,
+                      icon: _isProbing
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.wifi_tethering),
+                      label: Text(_isProbing ? '连接中...' : '连接并加载文件'),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    '提示：IPv6 地址必须带中括号，例如 http://[fc00::55:ca]:5034。',
+                    style: theme.textTheme.bodySmall,
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            _buildSectionCard(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('探测结果', style: theme.textTheme.titleMedium),
+                  const SizedBox(height: 12),
+                  Text(
+                    _probeState.headline,
+                    style: theme.textTheme.titleLarge?.copyWith(
+                      color: _probeState.color,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(_probeState.detail),
+                  if (_probeState.endpoint != null) ...[
+                    const SizedBox(height: 12),
+                    Text('目标宿主: ${_probeState.endpoint}'),
+                  ],
+                  if (_probeState.hostName != null) ...[
+                    const SizedBox(height: 8),
+                    Text('宿主名称: ${_probeState.hostName}'),
+                  ],
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHomeHeader(ThemeData theme) {
+    return Container(
+      padding: const EdgeInsets.all(22),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [Color(0xFFFFFFFF), Color(0xFFF5FBFA)],
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+        ),
+        borderRadius: BorderRadius.circular(30),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x120F172A),
+            blurRadius: 28,
+            offset: Offset(0, 10),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '我的 NAS',
+                  style: theme.textTheme.headlineSmall?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFF1F5F9),
+                    borderRadius: BorderRadius.circular(18),
+                  ),
+                  child: DropdownButtonHideUnderline(
+                    child: DropdownButton<SpaceScope>(
+                      value: _selectedSpace,
+                      isDense: true,
+                      items: const [
+                        DropdownMenuItem(
+                          value: SpaceScope.personal,
+                          child: Text('个人空间'),
+                        ),
+                        DropdownMenuItem(
+                          value: SpaceScope.family,
+                          child: Text('家庭空间'),
+                        ),
+                      ],
+                      onChanged: _changeSpaceScope,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  _probeState.hostName ?? 'loal_NAS 宿主',
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: const Color(0xFF475569),
+                  ),
+                ),
+                if (_baseUri != null) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    _baseUri!.origin,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: const Color(0xFF64748B),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          Container(
+            width: 52,
+            height: 52,
+            decoration: const BoxDecoration(
+              color: Color(0xFFDCFCE7),
+              shape: BoxShape.circle,
+            ),
+            child: const Icon(Icons.cloud_done_outlined, color: Color(0xFF15803D)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCategorySection(ThemeData theme) {
+    return _buildSectionCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('常用分类', style: theme.textTheme.titleMedium),
+          const SizedBox(height: 16),
+          Row(
+            children: [
+              for (var index = 0; index < _fileCategoryShortcuts.length; index++) ...[
+                if (index > 0) const SizedBox(width: 10),
+                Expanded(
+                  child: _CategoryShortcutButton(
+                    shortcut: _fileCategoryShortcuts[index],
+                    onTap: () => _openCategoryPage(_fileCategoryShortcuts[index]),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDirectorySection(ThemeData theme) {
+    return _buildSectionCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('当前目录', style: theme.textTheme.titleMedium),
+                    const SizedBox(height: 6),
+                    Text(
+                      _currentDirectory,
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: const Color(0xFF475569),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              FilledButton.tonalIcon(
+                onPressed: _hasFileSession && !_isLoadingFiles ? () => _refreshFiles() : null,
+                icon: const Icon(Icons.refresh),
+                label: const Text('刷新'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              FilledButton.tonalIcon(
+                onPressed: _canGoUp && !_isLoadingFiles
+                    ? () => _refreshFiles(path: _parentDirectoryPath(_currentDirectory))
+                    : null,
+                icon: const Icon(Icons.arrow_upward),
+                label: const Text('上级目录'),
+              ),
+              FilledButton.icon(
+                onPressed: _hasFileSession && !_isUploading ? _pickAndUploadFiles : null,
+                icon: _isUploading
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.upload_file),
+                label: Text(_isUploading ? '上传中...' : '上传文件'),
+              ),
+              FilledButton.tonalIcon(
+                onPressed: _hasFileSession && !_isCreatingFolder ? _createFolder : null,
+                icon: _isCreatingFolder
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.create_new_folder_outlined),
+                label: Text(_isCreatingFolder ? '创建中...' : '新建文件夹'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          if (_isLoadingFiles) ...[
+            const LinearProgressIndicator(),
+            const SizedBox(height: 12),
+          ],
+          if (_fileError != null) ...[
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFFFEE4E2),
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: Text(
+                _fileError!,
+                style: const TextStyle(color: Color(0xFFB42318)),
+              ),
+            ),
+          ] else if (_entries.isEmpty) ...[
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 16),
+              child: Text('当前目录为空。'),
+            ),
+          ] else ...[
+            ListView.separated(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              itemCount: _entries.length,
+              separatorBuilder: (_, _) => const Divider(height: 1),
+              itemBuilder: (context, index) {
+                final entry = _entries[index];
+                final isBusy = _busyEntryPath == entry.path;
+
+                return ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: _buildEntryLeading(entry),
+                  title: Text(entry.name),
+                  subtitle: Text(_buildEntrySubtitle(entry)),
+                  onTap: () => _openEntry(entry),
+                  trailing: isBusy
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : PopupMenuButton<EntryMenuAction>(
+                          tooltip: '更多操作',
+                          onSelected: (action) => _handleEntryAction(entry, action),
+                          itemBuilder: (context) => const [
+                            PopupMenuItem<EntryMenuAction>(
+                              value: EntryMenuAction.delete,
+                              child: Text('删除'),
+                            ),
+                            PopupMenuItem<EntryMenuAction>(
+                              value: EntryMenuAction.move,
+                              child: Text('移动'),
+                            ),
+                            PopupMenuItem<EntryMenuAction>(
+                              value: EntryMenuAction.rename,
+                              child: Text('重命名'),
+                            ),
+                            PopupMenuItem<EntryMenuAction>(
+                              value: EntryMenuAction.download,
+                              child: Text('下载'),
+                            ),
+                          ],
+                          icon: const Icon(Icons.more_horiz),
+                        ),
+                );
+              },
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFamilyPlaceholder(ThemeData theme) {
+    return _buildSectionCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('家庭空间', style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700)),
+          const SizedBox(height: 10),
+          const Text('入口先保留，但文件列表、成员和共享规则这一阶段还没接进来。'),
+          const SizedBox(height: 16),
+          FilledButton.tonal(
+            onPressed: () => _changeSpaceScope(SpaceScope.personal),
+            child: const Text('返回个人空间'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHomeTab(ThemeData theme) {
+    return SafeArea(
+      child: ListView(
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+        children: [
+          _buildHomeHeader(theme),
+          const SizedBox(height: 16),
+          if (_selectedSpace == SpaceScope.personal) ...[
+            _buildCategorySection(theme),
+            const SizedBox(height: 16),
+            _buildDirectorySection(theme),
+          ] else ...[
+            _buildFamilyPlaceholder(theme),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSimpleTab({
+    required ThemeData theme,
+    required String title,
+    required String description,
+    IconData icon = Icons.hourglass_bottom_outlined,
+    List<Widget> extraChildren = const [],
+  }) {
+    return SafeArea(
+      child: ListView(
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+        children: [
+          _buildSectionCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                CircleAvatar(
+                  radius: 24,
+                  backgroundColor: const Color(0xFFE2E8F0),
+                  child: Icon(icon, color: const Color(0xFF334155)),
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  title,
+                  style: theme.textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 10),
+                Text(description, style: theme.textTheme.bodyLarge),
+                for (final child in extraChildren) ...[
+                  const SizedBox(height: 16),
+                  child,
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildToolsTab(ThemeData theme) {
+    return _buildSimpleTab(
+      theme: theme,
+      title: '工具',
+      description: '这里先放当前阶段最常用的操作入口，后面再往这个页签继续扩。',
+      icon: Icons.grid_view_rounded,
+      extraChildren: [
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            FilledButton.tonalIcon(
+              onPressed: _hasFileSession && !_isLoadingFiles ? () => _refreshFiles() : null,
+              icon: const Icon(Icons.refresh),
+              label: const Text('刷新文件'),
+            ),
+            FilledButton.icon(
+              onPressed: _hasFileSession && !_isUploading ? _pickAndUploadFiles : null,
+              icon: const Icon(Icons.upload_file),
+              label: const Text('上传文件'),
+            ),
+            FilledButton.tonalIcon(
+              onPressed: _hasFileSession && !_isCreatingFolder ? _createFolder : null,
+              icon: const Icon(Icons.create_new_folder_outlined),
+              label: const Text('新建文件夹'),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildMineTab(ThemeData theme) {
+    return _buildSimpleTab(
+      theme: theme,
+      title: '我的',
+      description: '这里先保留当前连接信息和返回连接页入口，后面再接账户、空间和设置。',
+      icon: Icons.person_outline,
+      extraChildren: [
+        Text('宿主名称: ${_probeState.hostName ?? '未连接'}'),
+        Text('连接地址: ${_baseUri?.origin ?? '未连接'}'),
+        FilledButton.tonalIcon(
+          onPressed: _returnToConnectionPage,
+          icon: const Icon(Icons.settings_ethernet),
+          label: const Text('返回连接页'),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildMainShell(ThemeData theme) {
+    Widget body;
+    switch (_selectedTab) {
+      case MainTab.home:
+        body = _buildHomeTab(theme);
+        break;
+      case MainTab.recent:
+        body = _buildSimpleTab(
+          theme: theme,
+          title: '最近',
+          description: '最近访问和下载任务下一阶段再接。先把导航位置留出来，首页文件浏览优先完成。',
+          icon: Icons.history,
+        );
+        break;
+      case MainTab.tools:
+        body = _buildToolsTab(theme);
+        break;
+      case MainTab.mine:
+        body = _buildMineTab(theme);
+        break;
+    }
+
+    return Scaffold(
+      body: body,
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _selectedTab.index,
+        onDestinationSelected: (index) {
+          setState(() {
+            _selectedTab = MainTab.values[index];
+          });
+        },
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.home_outlined), selectedIcon: Icon(Icons.home), label: '首页'),
+          NavigationDestination(icon: Icon(Icons.access_time_outlined), selectedIcon: Icon(Icons.access_time_filled), label: '最近'),
+          NavigationDestination(icon: Icon(Icons.grid_view_outlined), selectedIcon: Icon(Icons.grid_view_rounded), label: '工具'),
+          NavigationDestination(icon: Icon(Icons.person_outline), selectedIcon: Icon(Icons.person), label: '我的'),
+        ],
+      ),
+    );
   }
 
   String _compactBody(String body) {
@@ -1163,257 +1874,177 @@ class _NasHomePageState extends State<NasHomePage> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    if (!_showMainShell) {
+      return _buildConnectionPage(theme);
+    }
 
-    return Scaffold(
-      appBar: AppBar(
-        backgroundColor: theme.scaffoldBackgroundColor,
-        title: const Text('NAS Phone'),
+    return _buildMainShell(theme);
+  }
+}
+
+class _CategoryShortcutButton extends StatelessWidget {
+  const _CategoryShortcutButton({
+    required this.shortcut,
+    required this.onTap,
+  });
+
+  final FileCategoryShortcut shortcut;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: shortcut.backgroundColor,
+      borderRadius: BorderRadius.circular(22),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(22),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 10),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(shortcut.icon, color: shortcut.foregroundColor),
+              const SizedBox(height: 10),
+              Text(
+                shortcut.label,
+                style: TextStyle(
+                  color: shortcut.foregroundColor,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
+    );
+  }
+}
+
+class CategoryEntriesPage extends StatefulWidget {
+  const CategoryEntriesPage({
+    required this.title,
+    required this.directoryPath,
+    required this.entries,
+    required this.buildLeading,
+    required this.buildSubtitle,
+    required this.onOpenEntry,
+    required this.onHandleEntryAction,
+    super.key,
+  });
+
+  final String title;
+  final String directoryPath;
+  final List<FileBrowserEntry> entries;
+  final Widget Function(FileBrowserEntry entry) buildLeading;
+  final String Function(FileBrowserEntry entry) buildSubtitle;
+  final Future<void> Function(FileBrowserEntry entry) onOpenEntry;
+  final Future<void> Function(FileBrowserEntry entry, EntryMenuAction action) onHandleEntryAction;
+
+  @override
+  State<CategoryEntriesPage> createState() => _CategoryEntriesPageState();
+}
+
+class _CategoryEntriesPageState extends State<CategoryEntriesPage> {
+  String? _busyEntryPath;
+
+  Future<void> _runEntryAction(FileBrowserEntry entry, EntryMenuAction action) async {
+    setState(() {
+      _busyEntryPath = entry.path;
+    });
+
+    try {
+      await widget.onHandleEntryAction(entry, action);
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busyEntryPath = null;
+        });
+      }
+    }
+  }
+
+  Future<void> _runOpenEntry(FileBrowserEntry entry) async {
+    await widget.onOpenEntry(entry);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text(widget.title)),
       body: SafeArea(
         child: ListView(
-          padding: const EdgeInsets.all(20),
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
           children: [
-            Container(
-              padding: const EdgeInsets.all(20),
-              decoration: BoxDecoration(
-                gradient: const LinearGradient(
-                  colors: [Color(0xFF134E4A), Color(0xFF0F766E)],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                ),
-                borderRadius: BorderRadius.circular(24),
-              ),
-              child: const Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    '连接你的 loal_NAS 宿主',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 24,
-                      fontWeight: FontWeight.w700,
-                    ),
-                  ),
-                  SizedBox(height: 12),
-                  Text(
-                    '连接成功后直接复用 FileBrowser 原生接口，展示文件列表，并支持上传、下载和常用管理操作。',
-                    style: TextStyle(
-                      color: Color(0xFFD1FAE5),
-                      height: 1.5,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 20),
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('宿主地址', style: theme.textTheme.titleMedium),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: _hostController,
-                      keyboardType: TextInputType.url,
-                      decoration: const InputDecoration(
-                        border: OutlineInputBorder(),
-                        hintText: 'http://192.168.1.10:5034 或 http://[IPv6]:5034',
-                      ),
-                      onSubmitted: (_) {
-                        if (!_isProbing) {
-                          _probeHost();
-                        }
-                      },
-                    ),
-                    const SizedBox(height: 12),
-                    SizedBox(
-                      width: double.infinity,
-                      child: FilledButton.icon(
-                        onPressed: _isProbing ? null : _probeHost,
-                        icon: _isProbing
-                            ? const SizedBox(
-                                width: 18,
-                                height: 18,
-                                child: CircularProgressIndicator(strokeWidth: 2),
-                              )
-                            : const Icon(Icons.wifi_tethering),
-                        label: Text(_isProbing ? '连接中...' : '连接并加载文件'),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    const Text('提示：IPv6 地址必须带中括号，例如 http://[fc00::55:ca]:5034。'),
-                  ],
-                ),
-              ),
+            Text(
+              '当前目录: ${widget.directoryPath}',
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: const Color(0xFF475569)),
             ),
             const SizedBox(height: 16),
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('探测结果', style: theme.textTheme.titleMedium),
-                    const SizedBox(height: 12),
-                    Text(
-                      _probeState.headline,
-                      style: theme.textTheme.titleLarge?.copyWith(
-                        color: _probeState.color,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(_probeState.detail),
-                    if (_probeState.endpoint != null) ...[
-                      const SizedBox(height: 12),
-                      Text('目标宿主: ${_probeState.endpoint}'),
-                    ],
-                    if (_probeState.hostName != null) ...[
-                      const SizedBox(height: 8),
-                      Text('宿主名称: ${_probeState.hostName}'),
-                    ],
-                  ],
+            if (widget.entries.isEmpty)
+              Container(
+                padding: const EdgeInsets.all(20),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(24),
                 ),
-              ),
-            ),
-            const SizedBox(height: 16),
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('文件列表', style: theme.textTheme.titleMedium),
-                    const SizedBox(height: 12),
-                    Text('当前目录: $_currentDirectory'),
-                    const SizedBox(height: 12),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        FilledButton.tonalIcon(
-                          onPressed: _hasFileSession && !_isLoadingFiles ? () => _refreshFiles() : null,
-                          icon: const Icon(Icons.refresh),
-                          label: const Text('刷新'),
-                        ),
-                        FilledButton.tonalIcon(
-                          onPressed: _canGoUp && !_isLoadingFiles
-                              ? () => _refreshFiles(path: _parentDirectoryPath(_currentDirectory))
-                              : null,
-                          icon: const Icon(Icons.arrow_upward),
-                          label: const Text('上级目录'),
-                        ),
-                        FilledButton.icon(
-                          onPressed: _hasFileSession && !_isUploading ? _pickAndUploadFiles : null,
-                          icon: _isUploading
-                              ? const SizedBox(
-                                  width: 18,
-                                  height: 18,
-                                  child: CircularProgressIndicator(strokeWidth: 2),
-                                )
-                              : const Icon(Icons.upload_file),
-                          label: Text(_isUploading ? '上传中...' : '上传文件'),
-                        ),
-                        FilledButton.tonalIcon(
-                          onPressed: _hasFileSession && !_isCreatingFolder ? _createFolder : null,
-                          icon: _isCreatingFolder
-                              ? const SizedBox(
-                                  width: 18,
-                                  height: 18,
-                                  child: CircularProgressIndicator(strokeWidth: 2),
-                                )
-                              : const Icon(Icons.create_new_folder_outlined),
-                          label: Text(_isCreatingFolder ? '创建中...' : '新建文件夹'),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 16),
-                    if (_isLoadingFiles) ...[
-                      const LinearProgressIndicator(),
-                      const SizedBox(height: 12),
-                    ],
-                    if (_fileError != null) ...[
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFFFEE4E2),
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: Text(
-                          _fileError!,
-                          style: const TextStyle(color: Color(0xFFB42318)),
-                        ),
-                      ),
-                    ] else if (!_hasFileSession) ...[
-                      const Text('先连接宿主后加载文件列表。'),
-                    ] else if (_entries.isEmpty) ...[
-                      const Text('当前目录为空。'),
-                    ] else ...[
-                      ListView.separated(
-                        shrinkWrap: true,
-                        physics: const NeverScrollableScrollPhysics(),
-                        itemCount: _entries.length,
-                        separatorBuilder: (_, _) => const Divider(height: 1),
-                        itemBuilder: (context, index) {
-                          final entry = _entries[index];
-                          final isBusy = _busyEntryPath == entry.path;
+                child: const Text('当前目录下没有符合这个分类的文件。'),
+              )
+            else
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: ListView.separated(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: widget.entries.length,
+                  separatorBuilder: (_, _) => const Divider(height: 1),
+                  itemBuilder: (context, index) {
+                    final entry = widget.entries[index];
+                    final isBusy = _busyEntryPath == entry.path;
 
-                          return ListTile(
-                            contentPadding: EdgeInsets.zero,
-                            leading: _buildEntryLeading(entry),
-                            title: Text(entry.name),
-                            subtitle: Text(
-                              entry.isDir
-                                  ? '目录'
-                                  : entry.isPreviewableImage
-                                      ? '图片 · ${_formatFileSize(entry.size)}'
-                                  : entry.isPreviewableAudio
-                                    ? '音频 · ${_formatFileSize(entry.size)}'
-                                      : entry.isPreviewableVideo
-                                        ? '视频 · ${_formatFileSize(entry.size)}'
-                                      : _formatFileSize(entry.size),
+                    return ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: widget.buildLeading(entry),
+                      title: Text(entry.name),
+                      subtitle: Text(widget.buildSubtitle(entry)),
+                      onTap: () => _runOpenEntry(entry),
+                      trailing: isBusy
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : PopupMenuButton<EntryMenuAction>(
+                              tooltip: '更多操作',
+                              onSelected: (action) => _runEntryAction(entry, action),
+                              itemBuilder: (context) => const [
+                                PopupMenuItem<EntryMenuAction>(
+                                  value: EntryMenuAction.delete,
+                                  child: Text('删除'),
+                                ),
+                                PopupMenuItem<EntryMenuAction>(
+                                  value: EntryMenuAction.move,
+                                  child: Text('移动'),
+                                ),
+                                PopupMenuItem<EntryMenuAction>(
+                                  value: EntryMenuAction.rename,
+                                  child: Text('重命名'),
+                                ),
+                                PopupMenuItem<EntryMenuAction>(
+                                  value: EntryMenuAction.download,
+                                  child: Text('下载'),
+                                ),
+                              ],
+                              icon: const Icon(Icons.more_horiz),
                             ),
-                            onTap: () => _openEntry(entry),
-                            trailing: isBusy
-                                ? const SizedBox(
-                                    width: 18,
-                                    height: 18,
-                                    child: CircularProgressIndicator(strokeWidth: 2),
-                                  )
-                                : PopupMenuButton<EntryMenuAction>(
-                                    tooltip: '更多操作',
-                                    onSelected: (action) => _handleEntryAction(entry, action),
-                                    itemBuilder: (context) => const [
-                                      PopupMenuItem<EntryMenuAction>(
-                                        value: EntryMenuAction.delete,
-                                        child: Text('删除'),
-                                      ),
-                                      PopupMenuItem<EntryMenuAction>(
-                                        value: EntryMenuAction.move,
-                                        child: Text('移动'),
-                                      ),
-                                      PopupMenuItem<EntryMenuAction>(
-                                        value: EntryMenuAction.rename,
-                                        child: Text('重命名'),
-                                      ),
-                                      PopupMenuItem<EntryMenuAction>(
-                                        value: EntryMenuAction.download,
-                                        child: Text('下载'),
-                                      ),
-                                    ],
-                                    icon: const Icon(Icons.more_vert),
-                                  ),
-                          );
-                        },
-                      ),
-                    ],
-                  ],
+                    );
+                  },
                 ),
               ),
-            ),
           ],
         ),
       ),
