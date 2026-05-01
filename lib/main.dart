@@ -478,7 +478,9 @@ class _NasHomePageState extends State<NasHomePage> {
         ],
       ),
     );
-    controller.dispose();
+    // dialog 关闭动画仍在播放时 TextField 还持有 controller 引用，
+    // 延迟到下一帧再 dispose，避免 _dependents.isEmpty 断言失败。
+    WidgetsBinding.instance.addPostFrameCallback((_) => controller.dispose());
 
     if (!mounted) {
       return;
@@ -581,7 +583,7 @@ class _NasHomePageState extends State<NasHomePage> {
         ],
       ),
     );
-    controller.dispose();
+    WidgetsBinding.instance.addPostFrameCallback((_) => controller.dispose());
 
     if (!mounted || nextName == null) {
       return;

@@ -12,7 +12,7 @@ loal_NAS 的 Flutter 手机端仓库。
 - 可进入目录、返回上级目录
 - 可点击图片文件进行在线预览
 - 可点击音频文件在线播放，支持播放、暂停和拖动进度
-- 可点击视频文件，向宿主申请短时中转链接后交给系统外部播放器打开
+- 可点击视频文件，向宿主申请短时中转链接后在浏览器中播放
 - 可上传文件
 - 可新建文件夹
 - 可重命名文件或目录
@@ -58,7 +58,34 @@ Set-Location "C:\Users\Administrator\Documents\wfm\NAS_phone"
 - http://127.0.0.1:5034
 
 这样可以直接在本机预览“连接宿主、文件列表、上传、下载、移动、重命名、删除”的效果。
+## 构建 Android APK
 
+**环境要求：**
+
+- Flutter SDK（已加到 PATH，或使用绝对路径调用）
+- JDK 17（设置 `JAVA_HOME`）
+- Android SDK（设置 `ANDROID_HOME`，包含 `build-tools` 和 `platform-tools`）
+
+**构建 release APK：**
+
+```powershell
+$env:JAVA_HOME = "C:\Users\windy\jdk-17"
+$env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
+cd "C:\Users\windy\Desktop\github_project\NAS_phone"
+flutter build apk --release
+```
+
+输出文件：`build\app\outputs\flutter-apk\app-release.apk`
+
+**构建 debug APK（不混淆，便于排查问题）：**
+
+```powershell
+flutter build apk --debug
+```
+
+输出文件：`build\app\outputs\flutter-apk\app-debug.apk`
+
+构建完成后，将 APK 文件传到手机直接安装即可（需在手机设置中允许安装未知来源应用）。
 ## 安卓真机怎么运行
 
 如果要在真实手机上运行，目前还不能只靠仓库代码本身，前提是这台电脑已经装好 Android SDK。
