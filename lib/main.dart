@@ -2,10 +2,11 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:file_selector/file_selector.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 void main() {
   runApp(const NasPhoneApp());
@@ -206,8 +207,6 @@ class NasHomePage extends StatefulWidget {
 }
 
 class _NasHomePageState extends State<NasHomePage> {
-  static const MethodChannel _systemOpenChannel = MethodChannel('nas_phone/system_open');
-
   final TextEditingController _hostController = TextEditingController();
 
   ProbeState _probeState = const ProbeState.idle();
@@ -361,8 +360,22 @@ class _NasHomePageState extends State<NasHomePage> {
       return;
     }
 
-    final files = await openFiles();
-    if (files.isEmpty) {
+    FilePickerResult? pickerResult;
+    try {
+      pickerResult = await FilePicker.platform.pickFiles(
+        allowMultiple: true,
+        withData: false,
+        withReadStream: true,
+      );
+    } catch (error) {
+      if (!mounted) return;
+      const msg = '无法打开文件选择器，请检查应用权限。';
+      setState(() { _fileError = msg; });
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text(msg)));
+      return;
+    }
+
+    if (pickerResult == null || pickerResult.files.isEmpty) {
       return;
     }
 
@@ -372,12 +385,12 @@ class _NasHomePageState extends State<NasHomePage> {
     });
 
     try {
-      for (final file in files) {
+      for (final file in pickerResult.files) {
         final uploadEntry = FileBrowserEntry(
           name: file.name,
           path: _joinResourcePath(_currentDirectory, file.name),
           isDir: false,
-          size: await file.length(),
+          size: 0,
         );
         final taskId = _startTransferTask(
           kind: TransferTaskKind.upload,
@@ -397,7 +410,7 @@ class _NasHomePageState extends State<NasHomePage> {
       }
 
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('已上传 ${files.length} 个文件。')),
+        SnackBar(content: Text('已上传 ${pickerResult.files.length} 个文件。')),
       );
       await _refreshFiles(showLoading: false);
     } on NasApiException catch (error) {
@@ -410,6 +423,18 @@ class _NasHomePageState extends State<NasHomePage> {
       });
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(error.message)),
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      const fallbackMessage = '读取所选文件失败，请先重试；如果仍然闪退，请使用 adb 抓取崩溃日志。';
+      setState(() {
+        _fileError = fallbackMessage;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text(fallbackMessage)),
       );
     } finally {
       if (mounted) {
@@ -687,7 +712,7 @@ class _NasHomePageState extends State<NasHomePage> {
       return;
     }
 
-    final selectedDirectory = await getDirectoryPath();
+    final selectedDirectory = await FilePicker.platform.getDirectoryPath();
     if (!mounted || selectedDirectory == null || selectedDirectory.isEmpty) {
       return;
     }
@@ -861,7 +886,7 @@ class _NasHomePageState extends State<NasHomePage> {
     }
 
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('当前支持图片、音频和视频。视频会调用系统播放器打开。')),
+      const SnackBar(content: Text('当前支持图片、音频和视频。视频会在浏览器中打开播放。')),
     );
   }
 
@@ -879,20 +904,18 @@ class _NasHomePageState extends State<NasHomePage> {
 
     try {
       final relayUri = await _createMediaRelayUri(baseUri, token, entry.path);
-      final launched = await _systemOpenChannel.invokeMethod<bool>('openVideoUrl', {
-        'url': relayUri.toString(),
-      });
       if (!mounted) {
         return;
       }
 
-      if (launched != true) {
-        throw const NasApiException('系统没有可用的外部播放器来打开这个视频。');
+      final launched = await launchUrl(relayUri, mode: LaunchMode.externalApplication);
+      if (!mounted) {
+        return;
       }
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('已交给系统播放器打开 ${entry.name}。')),
-      );
+      if (!launched) {
+        throw const NasApiException('无法打开浏览器，请检查设备是否安装了浏览器。');
+      }
     } on NasApiException catch (error) {
       if (!mounted) {
         return;
@@ -909,25 +932,13 @@ class _NasHomePageState extends State<NasHomePage> {
         return;
       }
 
-      final message = error.message?.trim();
-      final detail = message == null || message.isEmpty ? '调用系统播放器失败。' : message;
+      final msg = error.message?.trim();
+      final detail = (msg == null || msg.isEmpty) ? '打开浏览器失败。' : msg;
       setState(() {
         _fileError = detail;
       });
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(detail)),
-      );
-    } on MissingPluginException {
-      if (!mounted) {
-        return;
-      }
-
-      const detail = '当前平台暂未接入外部视频打开能力。';
-      setState(() {
-        _fileError = detail;
-      });
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text(detail)),
       );
     } finally {
       if (mounted) {
@@ -1011,29 +1022,45 @@ class _NasHomePageState extends State<NasHomePage> {
     }
   }
 
-  Future<void> _uploadFile(Uri baseUri, String token, String directoryPath, XFile file) async {
+  Future<void> _uploadFile(Uri baseUri, String token, String directoryPath, PlatformFile file) async {
     final targetPath = _joinResourcePath(directoryPath, file.name);
     final uri = _buildResourceUri(baseUri, targetPath, queryParameters: const {'override': 'true'});
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
+    final uploadTimeout = const Duration(minutes: 10);
+    final responseTimeout = const Duration(minutes: 2);
 
     try {
       final request = await client.postUrl(uri).timeout(const Duration(seconds: 15));
+      request.bufferOutput = false;
       request.headers.set('X-Auth', token);
       request.headers.contentType = ContentType.binary;
-      request.contentLength = await file.length();
-      await request.addStream(file.openRead()).timeout(const Duration(seconds: 30));
+      // file.size is metadata-only (no file read), safe for any file size
+      if (file.size >= 0) {
+        request.contentLength = file.size;
+      }
+      // readStream is a lazy stream backed by ContentResolver — no file copy, no OOM
+      final readStream = file.readStream;
+      if (readStream != null) {
+        await request.addStream(readStream).timeout(uploadTimeout);
+      } else if (file.path != null) {
+        await request.addStream(File(file.path!).openRead()).timeout(uploadTimeout);
+      } else {
+        throw const NasApiException('无法读取文件内容，请重试。');
+      }
 
-      final response = await request.close().timeout(const Duration(seconds: 30));
-      final body = await utf8.decodeStream(response).timeout(const Duration(seconds: 30));
+      final response = await request.close().timeout(responseTimeout);
+      final body = await utf8.decodeStream(response).timeout(responseTimeout);
       if (response.statusCode < 200 || response.statusCode >= 300) {
         throw NasApiException('上传 ${file.name} 失败：${response.statusCode}。${_compactBody(body)}');
       }
     } on TimeoutException {
-      throw NasApiException('上传 ${file.name} 超时。');
+      throw NasApiException('上传 ${file.name} 超时，请保持应用停留在前台后重试。');
     } on SocketException catch (error) {
       throw NasApiException('上传 ${file.name} 失败：${error.message}');
     } on HttpException catch (error) {
       throw NasApiException('上传 ${file.name} 失败：${error.message}');
+    } catch (error) {
+      throw NasApiException('上传 ${file.name} 失败：$error');
     } finally {
       client.close(force: true);
     }
