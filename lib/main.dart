@@ -6,6 +6,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 void main() {
@@ -1044,68 +1045,114 @@ class _NasHomePageState extends State<NasHomePage> {
   Future<void> _downloadEntry(FileBrowserEntry entry) async {
     final baseUri = _baseUri;
     final token = _authToken;
-    if (baseUri == null || token == null) {
-      return;
-    }
+    if (baseUri == null || token == null) return;
+    await _downloadEntryViaMediaStore(entry, baseUri, token);
+  }
 
-    final selectedDirectory = await FilePicker.platform.getDirectoryPath();
-    if (!mounted || selectedDirectory == null || selectedDirectory.isEmpty) {
-      return;
-    }
-
+  /// 默认路径：下载到临时目录，逐文件通过 MediaStore API 写入系统下载目录。
+  /// 这样文件可以在文件管理器"下载"和"最近"中找到，适用于所有 Android 版本。
+  Future<void> _downloadEntryViaMediaStore(
+      FileBrowserEntry entry, Uri baseUri, String token) async {
     setState(() {
       _busyEntryPath = entry.path;
       _fileError = null;
     });
-
-    final downloadTaskId = _startTransferTask(
+    final taskId = _startTransferTask(
       kind: TransferTaskKind.download,
       entry: entry,
-      targetLocation: selectedDirectory,
+      targetLocation: '下载/NAS_Downloads',
     );
-    var downloadedFileCount = 0;
+    var count = 0;
 
+    // 临时目录用于中转
+    final tempDir = await getTemporaryDirectory();
+    final tempBase =
+        '${tempDir.path}/nas_dl_${DateTime.now().millisecondsSinceEpoch}';
     try {
-      final downloadedFiles = await _downloadEntryToLocal(
+      await _downloadEntryToLocal(
         baseUri,
         token,
         entry,
-        selectedDirectory,
+        tempBase,
         onFileDownloaded: () {
-          downloadedFileCount += 1;
-          _updateTransferTaskProgress(downloadTaskId, downloadedFileCount);
+          count++;
+          _updateTransferTaskProgress(taskId, count);
         },
       );
-      if (!mounted) {
-        return;
-      }
 
-      final message = entry.isDir
-          ? '${entry.name} 已下载到本地，共 $downloadedFiles 个文件。'
-          : '${entry.name} 已下载到本地。';
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(message)));
-    } on NasApiException catch (error) {
-      if (!mounted) {
-        return;
-      }
+      // 将 tempBase 下所有文件复制到 MediaStore Downloads
+      await _copyTempDirToMediaStore(
+          Directory(tempBase), Directory(tempBase), 'NAS_Downloads');
 
-      setState(() {
-        _fileError = error.message;
-      });
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.message)));
+      if (!mounted) return;
+      final msg = entry.isDir
+          ? '${entry.name} 已下载，共 $count 个文件。\n可在文件管理器"下载/NAS_Downloads"中找到。'
+          : '${entry.name} 已下载。\n可在文件管理器"下载/NAS_Downloads"中找到。';
+      ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(msg), duration: const Duration(seconds: 6)));
+    } catch (e) {
+      if (!mounted) return;
+      final msg = e is NasApiException ? e.message : '下载失败：$e';
+      setState(() => _fileError = msg);
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(msg)));
     } finally {
-      if (mounted) {
-        setState(() {
-          _busyEntryPath = null;
-        });
-      }
-
-      _finishTransferTask(downloadTaskId);
+      try {
+        await Directory(tempBase).delete(recursive: true);
+      } catch (_) {}
+      if (mounted) setState(() => _busyEntryPath = null);
+      _finishTransferTask(taskId);
     }
+  }
+
+  /// 递归遍历 [dir]，将每个文件通过 MediaStore 平台通道写入 Downloads。
+  /// [root] 为临时根目录，用于计算相对路径以还原子目录结构。
+  static Future<void> _copyTempDirToMediaStore(
+      Directory dir, Directory root, String mediaStoreBase) async {
+    await for (final entity in dir.list()) {
+      if (entity is File) {
+        // 计算相对于 root 的子目录路径，例如 "Photos" 或 ""
+        final rel = entity.path.substring(root.path.length + 1);
+        final segments = rel.split('/');
+        final fileName = segments.last;
+        final subFolder = segments.length > 1
+            ? '$mediaStoreBase/${segments.sublist(0, segments.length - 1).join('/')}'
+            : mediaStoreBase;
+        final mimeType = _guessMimeType(fileName);
+        await _NasMediaChannel.copyToMediaStoreDownloads(
+          sourcePath: entity.path,
+          fileName: fileName,
+          mimeType: mimeType,
+          subFolder: subFolder,
+        );
+      } else if (entity is Directory) {
+        await _copyTempDirToMediaStore(entity, root, mediaStoreBase);
+      }
+    }
+  }
+
+  /// 根据文件扩展名猜测 MIME 类型（供 MediaStore 使用）。
+  static String _guessMimeType(String fileName) {
+    final ext = fileName.contains('.')
+        ? fileName.split('.').last.toLowerCase()
+        : '';
+    const map = {
+      'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
+      'gif': 'image/gif',  'webp': 'image/webp', 'bmp': 'image/bmp',
+      'mp4': 'video/mp4',  'mkv': 'video/x-matroska', 'mov': 'video/quicktime',
+      'avi': 'video/x-msvideo', 'flv': 'video/x-flv', 'wmv': 'video/x-ms-wmv',
+      'mp3': 'audio/mpeg', 'aac': 'audio/aac',   'flac': 'audio/flac',
+      'ogg': 'audio/ogg',  'wav': 'audio/wav',   'm4a': 'audio/mp4',
+      'pdf': 'application/pdf',
+      'zip': 'application/zip', 'rar': 'application/x-rar-compressed',
+      '7z':  'application/x-7z-compressed',
+      'txt': 'text/plain', 'md': 'text/markdown',
+      'doc': 'application/msword',
+      'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'xls': 'application/vnd.ms-excel',
+      'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    };
+    return map[ext] ?? 'application/octet-stream';
   }
 
   Future<void> _deleteEntry(FileBrowserEntry entry) async {
@@ -2453,7 +2500,7 @@ class _NasHomePageState extends State<NasHomePage> {
               children: [
                 Text(
                   '扫码绑定设备',
-                  style: theme.textTheme.titleLarge?.copyWith(
+                  style: theme.textTheme.titleMedium?.copyWith(
                     fontWeight: FontWeight.w700,
                   ),
                 ),
@@ -2523,7 +2570,7 @@ class _NasHomePageState extends State<NasHomePage> {
                 children: [
                   Text(
                     '正在准备自动发现',
-                    style: theme.textTheme.titleMedium?.copyWith(
+                    style: theme.textTheme.titleSmall?.copyWith(
                       fontWeight: FontWeight.w700,
                     ),
                   ),
@@ -2575,14 +2622,14 @@ class _NasHomePageState extends State<NasHomePage> {
                   children: [
                     Text(
                       hostStatus.hostName,
-                      style: theme.textTheme.titleMedium?.copyWith(
+                      style: theme.textTheme.titleSmall?.copyWith(
                         fontWeight: FontWeight.w700,
                       ),
                     ),
                     const SizedBox(height: 4),
                     Text(
                       '$host:5034',
-                      style: theme.textTheme.bodyMedium?.copyWith(
+                      style: theme.textTheme.bodySmall?.copyWith(
                         color: const Color(0xFF64748B),
                       ),
                     ),
@@ -2624,7 +2671,7 @@ class _NasHomePageState extends State<NasHomePage> {
               Expanded(
                 child: Text(
                   '自动发现设备',
-                  style: theme.textTheme.titleLarge?.copyWith(
+                  style: theme.textTheme.titleMedium?.copyWith(
                     fontWeight: FontWeight.w700,
                   ),
                 ),
@@ -2640,7 +2687,7 @@ class _NasHomePageState extends State<NasHomePage> {
           SizedBox(height: metrics.inlineSpacing * 0.45),
           Text(
             _hostStatus == null ? '正在搜索同一局域网内的设备...' : '最近一次成功连接的设备会显示在这里。',
-            style: theme.textTheme.bodyMedium?.copyWith(
+            style: theme.textTheme.bodySmall?.copyWith(
               color: const Color(0xFF64748B),
               height: 1.5,
             ),
@@ -2730,14 +2777,14 @@ class _NasHomePageState extends State<NasHomePage> {
         children: [
           Text(
             '手动输入地址',
-            style: theme.textTheme.titleLarge?.copyWith(
+            style: theme.textTheme.titleMedium?.copyWith(
               fontWeight: FontWeight.w700,
             ),
           ),
           const SizedBox(height: 6),
           Text(
             '输入设备的 IP 地址或域名进行连接',
-            style: theme.textTheme.bodyMedium?.copyWith(
+            style: theme.textTheme.bodySmall?.copyWith(
               color: const Color(0xFF64748B),
               height: 1.5,
             ),
@@ -4859,8 +4906,8 @@ class _ConnectionPageMetrics {
           ? (cardPadding * 0.8).clamp(10.0, 14.0).toDouble()
           : (cardPadding * 0.9).clamp(14.0, 20.0).toDouble(),
       titleFontSize: isNarrow
-          ? (screenWidth * 0.072).clamp(24.0, 30.0).toDouble()
-          : (screenWidth * 0.088).clamp(30.0, 40.0).toDouble(),
+          ? (screenWidth * 0.065).clamp(20.0, 26.0).toDouble()
+          : (screenWidth * 0.078).clamp(26.0, 34.0).toDouble(),
       iconBoxSize: iconBoxSize,
       iconBoxRadius: (iconBoxSize * 0.32).clamp(13.0, 20.0).toDouble(),
       iconSize: (iconBoxSize * 0.48).clamp(20.0, 30.0).toDouble(),
@@ -5675,6 +5722,37 @@ class SimpleHttpResponse {
 
   final int statusCode;
   final String body;
+}
+
+/// 平台通道工具类：负责调用 Android 原生 MediaStore Downloads API。
+class _NasMediaChannel {
+  static const _channel = MethodChannel('nas_phone/system_open');
+
+  /// 将临时文件 [sourcePath] 写入系统下载目录（MediaStore.Downloads）。
+  ///
+  /// [fileName]   最终显示的文件名（如 "photo.jpg"）。
+  /// [mimeType]   MIME 类型（如 "image/jpeg"）。
+  /// [subFolder]  在 Download/ 下的子目录路径（如 "NAS_Downloads" 或 "NAS_Downloads/Photos"）。
+  ///
+  /// 成功返回相对路径字符串，如 "Download/NAS_Downloads/photo.jpg"。
+  /// 失败抛出 [PlatformException]。
+  static Future<String> copyToMediaStoreDownloads({
+    required String sourcePath,
+    required String fileName,
+    required String mimeType,
+    required String subFolder,
+  }) async {
+    final result = await _channel.invokeMethod<String>(
+      'copyToMediaStoreDownloads',
+      {
+        'sourcePath': sourcePath,
+        'fileName': fileName,
+        'mimeType': mimeType,
+        'subFolder': subFolder,
+      },
+    );
+    return result ?? 'Download/$subFolder/$fileName';
+  }
 }
 
 class NasApiException implements Exception {
