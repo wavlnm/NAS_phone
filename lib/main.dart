@@ -217,9 +217,41 @@ class _NasHomePageState extends State<NasHomePage> {
   bool get _canGoUp => _hasFileSession && _currentDirectory != '/';
 
   @override
+  void initState() {
+    super.initState();
+    // 异步恢复上次的登录/连接状态
+    WidgetsBinding.instance.addPostFrameCallback((_) => _restoreAndAutoConnect());
+  }
+
+  @override
   void dispose() {
     _hostController.dispose();
     super.dispose();
+  }
+
+  /// 启动时恢复持久化状态并尝试自动连接。
+  /// 策略：
+  ///   1. 有有效 session → 走 _onCloudLoginSuccess（从云端取最新地址自动连接）
+  ///   2. 无 session 但有保存的 host → 直接 _probeHost
+  ///   3. 两者都没有 → 不做任何操作，显示连接页
+  Future<void> _restoreAndAutoConnect() async {
+    final session = await _loadSavedSession();
+    if (!mounted) return;
+
+    if (session != null) {
+      // 有登录态：云端取最新地址自动连接（含重试逻辑）
+      await _onCloudLoginSuccess(session);
+      return;
+    }
+
+    final host = await _loadSavedHost();
+    if (!mounted) return;
+
+    if (host != null && host.isNotEmpty) {
+      // 无登录态但有上次地址：直接尝试局域网连接
+      _hostController.text = host;
+      await _probeHost();
+    }
   }
 
   Future<void> _probeHost() async {
@@ -277,6 +309,11 @@ class _NasHomePageState extends State<NasHomePage> {
           detail: _buildProbeDetail(status, fileError: fileError),
         );
       });
+
+      // 连接成功时持久化本次地址，供下次启动直接重连
+      if (token != null && directory != null) {
+        await _saveLastHost(_hostController.text);
+      }
     } on NasApiException catch (error) {
       if (!mounted) {
         return;
@@ -460,13 +497,141 @@ class _NasHomePageState extends State<NasHomePage> {
       return;
     }
 
-    setState(() {
-      _cloudSession = result;
-    });
+    await _onCloudLoginSuccess(result);
+  }
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('云账号 ${result.user.username} 登录成功。')),
+  // ── 登录后自动连接 ─────────────────────────────────────────────────────────
+
+  /// 云账号登录成功后的统一处理：保存 session，并尝试从云端获取 IPv6 地址自动连接设备。
+  /// 若首次 ipv6Address 为空，每隔 1 秒轮询 /users/me，最多重试 2 次（共 3 次检查）。
+  Future<void> _onCloudLoginSuccess(CloudSession session) async {
+    if (!mounted) return;
+    setState(() => _cloudSession = session);
+    await _saveSession(session); // 持久化登录态
+
+    // 最多检查 3 次（首次 + 2 次重试）
+    String? ipv6 = session.user.ipv6Address;
+    for (var attempt = 1; attempt <= 2 && (ipv6 == null || ipv6.isEmpty); attempt++) {
+      await Future<void>.delayed(const Duration(seconds: 1));
+      if (!mounted) return;
+      try {
+        final user = await _fetchCloudUserInfo(session.accessToken);
+        ipv6 = user.ipv6Address;
+      } catch (_) {
+        // 网络失败则直接跳出，稍后提示
+        break;
+      }
+    }
+
+    if (!mounted) return;
+
+    if (ipv6 != null && ipv6.isNotEmpty) {
+      // 填入地址栏并自动发起探测连接
+      _hostController.text = ipv6;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('已登录 ${session.user.username}，正在自动连接设备…'),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+      await _probeHost();
+    } else {
+      // 3 次均未获取到地址
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '已登录 ${session.user.username}，但未能获取到电脑端地址。\n'
+            '请确认电脑端网络已就绪，或在局域网内手动输入地址连接。',
+          ),
+          duration: const Duration(seconds: 6),
+        ),
+      );
+    }
+  }
+
+  /// 使用 Bearer Token 查询自己的最新用户信息（主要用于获取 ipv6Address）。
+  Future<CloudUser> _fetchCloudUserInfo(String accessToken) async {
+    final response = await _sendCloudTextRequest(
+      Uri.parse('https://reportzs.me/nas-api/users/me'),
+      headers: {
+        HttpHeaders.acceptHeader: 'application/json',
+        HttpHeaders.authorizationHeader: 'Bearer $accessToken',
+      },
     );
+    late final Map<String, dynamic> decoded;
+    try {
+      decoded = _decodeJsonObject(response.body, invalidMessage: '用户信息接口返回了无法解析的内容。');
+    } on NasApiException {
+      throw NasApiException('获取用户信息失败：${response.statusCode}。');
+    }
+    if (decoded['success'] != true) {
+      final err = decoded['error']?.toString();
+      throw NasApiException(err?.isNotEmpty == true ? err! : '获取用户信息失败。');
+    }
+    final userRaw = decoded['user'];
+    if (userRaw is! Map) throw const NasApiException('用户信息字段缺失。');
+    return CloudUser.fromJson(Map<String, dynamic>.from(userRaw));
+  }
+
+  // ── 状态持久化 ─────────────────────────────────────────────────────────────
+
+  static const _kSessionKey = 'cloud_session_v1';
+  static const _kLastHostKey = 'last_connected_host';
+
+  /// 将 CloudSession 序列化后存入 SharedPreferences。
+  Future<void> _saveSession(CloudSession session) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_kSessionKey, jsonEncode(session.toJson()));
+    } catch (_) {}
+  }
+
+  /// 清除持久化的 session（退出登录时调用）。
+  Future<void> _clearSession() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_kSessionKey);
+    } catch (_) {}
+  }
+
+  /// 保存最近一次成功连接的设备地址。
+  Future<void> _saveLastHost(String host) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_kLastHostKey, host);
+    } catch (_) {}
+  }
+
+  /// 从本地加载已保存的 CloudSession；若过期或不存在则返回 null。
+  Future<CloudSession?> _loadSavedSession() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_kSessionKey);
+      if (raw == null || raw.isEmpty) return null;
+      final json = _decodeJsonObject(raw, invalidMessage: '');
+      final session = CloudSession.fromJson(json);
+      if (session.accessToken.isEmpty) return null;
+      // 已过期则丢弃（提前 30 分钟视为过期）
+      final expires = session.expiresAt;
+      if (expires != null &&
+          expires.isBefore(DateTime.now().add(const Duration(minutes: 30)))) {
+        await _clearSession();
+        return null;
+      }
+      return session;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 从本地加载上次连接的设备地址。
+  Future<String?> _loadSavedHost() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getString(_kLastHostKey);
+    } catch (_) {
+      return null;
+    }
   }
 
   // ── 扫码注册流程 ──────────────────────────────────────────────────────────
@@ -647,12 +812,24 @@ class _NasHomePageState extends State<NasHomePage> {
     });
 
     if (!mounted || registered != true) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('注册成功！请在"我的"页面登录云账号，即可自动获取设备地址。'),
-        duration: Duration(seconds: 5),
-      ),
-    );
+
+    // 注册成功 → 用刚填写的账号密码自动登录
+    final username = usernameCtrl.text.trim();
+    final password = passwordCtrl.text;
+    try {
+      final session = await _loginToCloudAccount(username, password);
+      if (!mounted) return;
+      await _onCloudLoginSuccess(session);
+    } catch (_) {
+      // 自动登录失败时给一个提示，用户可手动登录
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('注册成功！自动登录失败，请在"我的"页面手动登录云账号。'),
+          duration: Duration(seconds: 5),
+        ),
+      );
+    }
   }
 
   /// 调用云服务注册接口。
@@ -5194,6 +5371,21 @@ class CloudSession {
   final String accessToken;
   final CloudUser user;
   final DateTime? expiresAt;
+
+  Map<String, dynamic> toJson() => {
+        'accessToken': accessToken,
+        'expiresAt': expiresAt?.toIso8601String(),
+        'user': user.toJson(),
+      };
+
+  factory CloudSession.fromJson(Map<String, dynamic> json) {
+    return CloudSession(
+      accessToken: json['accessToken']?.toString() ?? '',
+      expiresAt: DateTime.tryParse(json['expiresAt']?.toString() ?? ''),
+      user: CloudUser.fromJson(
+          Map<String, dynamic>.from(json['user'] as Map? ?? {})),
+    );
+  }
 }
 
 class CloudUser {
@@ -5216,6 +5408,15 @@ class CloudUser {
       updatedAt: DateTime.tryParse(json['updatedAt']?.toString() ?? ''),
     );
   }
+
+  Map<String, dynamic> toJson() => {
+        'username': username,
+        'deviceId': deviceId,
+        'deviceName': deviceName,
+        'ipv6Address': ipv6Address,
+        'isActive': isActive,
+        'updatedAt': updatedAt?.toIso8601String(),
+      };
 
   final String username;
   final String? deviceId;
