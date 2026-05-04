@@ -6,7 +6,9 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 void main() {
@@ -465,6 +467,232 @@ class _NasHomePageState extends State<NasHomePage> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text('云账号 ${result.user.username} 登录成功。')),
     );
+  }
+
+  // ── 扫码注册流程 ──────────────────────────────────────────────────────────
+
+  /// 打开二维码扫描页。扫到合法设备 QR 后保存 secret，进入注册对话框。
+  Future<void> _openQrScanner() async {
+    final result = await Navigator.of(context).push<Map<String, dynamic>?>(
+      MaterialPageRoute<Map<String, dynamic>?>(
+        builder: (_) => const _QrScanPage(),
+      ),
+    );
+    if (!mounted || result == null) return;
+
+    final deviceId = result['deviceId']?.toString();
+    final deviceName = result['deviceName']?.toString();
+    final secret = result['secret']?.toString();
+
+    if (deviceId == null || deviceName == null || secret == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('二维码内容不是有效的设备信息，请重新扫描。')),
+      );
+      return;
+    }
+
+    // 持久化保存 secret 和 deviceId，供后续安全通信使用
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('bound_device_secret', secret);
+    await prefs.setString('bound_device_id', deviceId);
+
+    if (!mounted) return;
+    await _showRegisterDialog(deviceId: deviceId, deviceName: deviceName);
+  }
+
+  /// 注册对话框：输入账号和密码，调用注册接口。
+  Future<void> _showRegisterDialog({
+    required String deviceId,
+    required String deviceName,
+  }) async {
+    final usernameCtrl = TextEditingController();
+    final passwordCtrl = TextEditingController();
+    var obscure = true;
+    var submitting = false;
+    String? inlineError;
+
+    final registered = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            Future<void> submit() async {
+              final username = usernameCtrl.text.trim();
+              final password = passwordCtrl.text;
+              if (username.isEmpty || password.isEmpty) {
+                setDialogState(() => inlineError = '请输入账号和密码。');
+                return;
+              }
+              setDialogState(() {
+                submitting = true;
+                inlineError = null;
+              });
+              try {
+                await _registerToCloud(
+                  username: username,
+                  password: password,
+                  deviceId: deviceId,
+                );
+                if (!dialogContext.mounted) return;
+                Navigator.of(dialogContext).pop(true);
+              } on NasApiException catch (e) {
+                if (!dialogContext.mounted) return;
+                setDialogState(() {
+                  inlineError = e.message;
+                  submitting = false;
+                });
+              }
+            }
+
+            return AlertDialog(
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(28)),
+              titlePadding: const EdgeInsets.fromLTRB(24, 24, 24, 12),
+              contentPadding: const EdgeInsets.fromLTRB(24, 0, 24, 0),
+              actionsPadding: const EdgeInsets.fromLTRB(24, 16, 24, 24),
+              title: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text('注册云账号'),
+                  const SizedBox(height: 8),
+                  Text(
+                    '绑定设备：$deviceName\n设置账号和密码后，即可在手机和电脑之间同步访问。',
+                    style: const TextStyle(
+                      fontSize: 13,
+                      color: Color(0xFF64748B),
+                      height: 1.5,
+                    ),
+                  ),
+                ],
+              ),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: usernameCtrl,
+                    autofocus: true,
+                    decoration: const InputDecoration(
+                      labelText: '账号（用户名）',
+                      border: OutlineInputBorder(),
+                      prefixIcon: Icon(Icons.person_outline_rounded),
+                    ),
+                    textInputAction: TextInputAction.next,
+                    onSubmitted: (_) =>
+                        FocusScope.of(dialogContext).nextFocus(),
+                  ),
+                  const SizedBox(height: 12),
+                  StatefulBuilder(
+                    builder: (_, setObscure) => TextField(
+                      controller: passwordCtrl,
+                      obscureText: obscure,
+                      decoration: InputDecoration(
+                        labelText: '密码',
+                        border: const OutlineInputBorder(),
+                        prefixIcon: const Icon(Icons.lock_outline_rounded),
+                        suffixIcon: IconButton(
+                          onPressed: () =>
+                              setObscure(() => obscure = !obscure),
+                          icon: Icon(obscure
+                              ? Icons.visibility_outlined
+                              : Icons.visibility_off_outlined),
+                        ),
+                      ),
+                      textInputAction: TextInputAction.done,
+                      onSubmitted: (_) {
+                        if (!submitting) submit();
+                      },
+                    ),
+                  ),
+                  if (inlineError != null) ...[
+                    const SizedBox(height: 12),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        inlineError!,
+                        style: const TextStyle(
+                            color: Color(0xFFB42318), height: 1.4),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed:
+                      submitting ? null : () => Navigator.of(dialogContext).pop(),
+                  child: const Text('取消'),
+                ),
+                FilledButton(
+                  onPressed: submitting ? null : submit,
+                  child: submitting
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('注册'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      usernameCtrl.dispose();
+      passwordCtrl.dispose();
+    });
+
+    if (!mounted || registered != true) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('注册成功！请在"我的"页面登录云账号，即可自动获取设备地址。'),
+        duration: Duration(seconds: 5),
+      ),
+    );
+  }
+
+  /// 调用云服务注册接口。
+  Future<void> _registerToCloud({
+    required String username,
+    required String password,
+    required String deviceId,
+  }) async {
+    final response = await _sendCloudTextRequest(
+      Uri.parse('https://reportzs.me/nas-api/register'),
+      method: 'POST',
+      headers: const {
+        HttpHeaders.acceptHeader: 'application/json',
+        HttpHeaders.contentTypeHeader: 'application/json; charset=utf-8',
+      },
+      requestBody: jsonEncode({
+        'username': username,
+        'password': password,
+        'deviceId': deviceId,
+      }),
+    );
+
+    late final Map<String, dynamic> decoded;
+    try {
+      decoded = _decodeJsonObject(
+        response.body,
+        invalidMessage: '注册接口返回了无法解析的内容。',
+      );
+    } on NasApiException {
+      throw NasApiException(
+        '注册失败：${response.statusCode}。${_compactBody(response.body)}',
+      );
+    }
+
+    final success = decoded['success'] == true;
+    if (!success || response.statusCode < 200 || response.statusCode >= 300) {
+      final err = decoded['error']?.toString();
+      if (err != null && err.isNotEmpty) throw NasApiException(err);
+      throw NasApiException('注册失败：${response.statusCode}。');
+    }
   }
 
   Future<CloudSession> _loginToCloudAccount(
@@ -2514,8 +2742,7 @@ class _NasHomePageState extends State<NasHomePage> {
                 ),
                 SizedBox(height: metrics.sectionSpacing),
                 OutlinedButton.icon(
-                  onPressed: () =>
-                      _showPendingFeatureMessage('扫码绑定功能还在接入，请稍后。'),
+                  onPressed: () => _openQrScanner(),
                   icon: const Icon(Icons.crop_free_rounded, size: 17),
                   label: const Text('扫一扫'),
                   style: OutlinedButton.styleFrom(
@@ -5722,6 +5949,81 @@ class SimpleHttpResponse {
 
   final int statusCode;
   final String body;
+}
+
+/// 二维码扫描页。仅处理包含 deviceId / deviceName / secret 三个字段的 JSON 格式 QR。
+class _QrScanPage extends StatefulWidget {
+  const _QrScanPage();
+
+  @override
+  State<_QrScanPage> createState() => _QrScanPageState();
+}
+
+class _QrScanPageState extends State<_QrScanPage> {
+  bool _handled = false;
+
+  void _onDetect(BarcodeCapture capture) {
+    if (_handled) return;
+    for (final barcode in capture.barcodes) {
+      final raw = barcode.rawValue;
+      if (raw == null || raw.isEmpty) continue;
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is! Map) continue;
+        final deviceId = decoded['deviceId']?.toString();
+        final deviceName = decoded['deviceName']?.toString();
+        final secret = decoded['secret']?.toString();
+        if (deviceId == null || deviceName == null || secret == null) continue;
+        _handled = true;
+        Navigator.of(context).pop(<String, dynamic>{
+          'deviceId': deviceId,
+          'deviceName': deviceName,
+          'secret': secret,
+        });
+        return;
+      } catch (_) {
+        // 不是有效 JSON，继续扫
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        title: const Text('扫描设备二维码'),
+        backgroundColor: Colors.black,
+        foregroundColor: Colors.white,
+        iconTheme: const IconThemeData(color: Colors.white),
+      ),
+      body: Stack(
+        children: [
+          MobileScanner(onDetect: _onDetect),
+          Center(
+            child: Container(
+              width: 220,
+              height: 220,
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.white, width: 2.5),
+                borderRadius: BorderRadius.circular(16),
+              ),
+            ),
+          ),
+          const Positioned(
+            bottom: 48,
+            left: 24,
+            right: 24,
+            child: Text(
+              '将电脑端显示的二维码对准方框',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.white70, fontSize: 14),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 /// 平台通道工具类：负责调用 Android 原生 MediaStore Downloads API。
