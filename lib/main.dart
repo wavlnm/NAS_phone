@@ -12,31 +12,13 @@ void main() {
   runApp(const NasPhoneApp());
 }
 
-enum EntryMenuAction {
-  delete,
-  move,
-  rename,
-  download,
-}
+enum EntryMenuAction { delete, move, rename, download }
 
-enum MainTab {
-  home,
-  recent,
-  tools,
-  mine,
-}
+enum MainTab { home, recent, tools, mine }
 
-enum SpaceScope {
-  personal,
-  family,
-}
+enum SpaceScope { personal, family }
 
-enum FileCategoryFilter {
-  image,
-  video,
-  audio,
-  document,
-}
+enum FileCategoryFilter { image, video, audio, document }
 
 class FileCategoryShortcut {
   const FileCategoryShortcut({
@@ -55,19 +37,13 @@ class FileCategoryShortcut {
 }
 
 class RecentFileVisit {
-  const RecentFileVisit({
-    required this.entry,
-    required this.visitedAt,
-  });
+  const RecentFileVisit({required this.entry, required this.visitedAt});
 
   final FileBrowserEntry entry;
   final DateTime visitedAt;
 }
 
-enum TransferTaskKind {
-  download,
-  upload,
-}
+enum TransferTaskKind { download, upload }
 
 class ActiveTransferTask {
   const ActiveTransferTask({
@@ -86,9 +62,7 @@ class ActiveTransferTask {
   final String targetLocation;
   final int processedFiles;
 
-  ActiveTransferTask copyWith({
-    int? processedFiles,
-  }) {
+  ActiveTransferTask copyWith({int? processedFiles}) {
     return ActiveTransferTask(
       id: id,
       kind: kind,
@@ -109,9 +83,13 @@ class LocalNote {
   });
 
   factory LocalNote.fromJson(Map<String, dynamic> json) {
-    final parsedUpdatedAt = DateTime.tryParse(json['updatedAt']?.toString() ?? '');
+    final parsedUpdatedAt = DateTime.tryParse(
+      json['updatedAt']?.toString() ?? '',
+    );
     return LocalNote(
-      id: json['id']?.toString() ?? DateTime.now().microsecondsSinceEpoch.toString(),
+      id:
+          json['id']?.toString() ??
+          DateTime.now().microsecondsSinceEpoch.toString(),
       title: json['title']?.toString() ?? '未命名笔记',
       content: json['content']?.toString() ?? '',
       updatedAt: parsedUpdatedAt ?? DateTime.now(),
@@ -138,7 +116,9 @@ class LocalNote {
       return '空白笔记';
     }
 
-    return normalized.length <= 56 ? normalized : '${normalized.substring(0, 56)}...';
+    return normalized.length <= 56
+        ? normalized
+        : '${normalized.substring(0, 56)}...';
   }
 }
 
@@ -209,6 +189,7 @@ class NasHomePage extends StatefulWidget {
 class _NasHomePageState extends State<NasHomePage> {
   final TextEditingController _hostController = TextEditingController();
 
+  CloudSession? _cloudSession;
   ProbeState _probeState = const ProbeState.idle();
   bool _isProbing = false;
   bool _isLoadingFiles = false;
@@ -243,7 +224,9 @@ class _NasHomePageState extends State<NasHomePage> {
     if (baseUri == null) {
       _resetFileSession();
       setState(() {
-        _probeState = const ProbeState.error('请输入可访问的宿主地址，例如 http://192.168.1.10:5034。');
+        _probeState = const ProbeState.error(
+          '请输入设备地址，例如 192.168.1.10 或 mynas.example.com。',
+        );
       });
       return;
     }
@@ -311,6 +294,340 @@ class _NasHomePageState extends State<NasHomePage> {
     }
   }
 
+  Future<void> _showCloudLoginDialog() async {
+    final usernameController = TextEditingController(
+      text: _cloudSession?.user.username ?? '',
+    );
+    final passwordController = TextEditingController();
+    var obscurePassword = true;
+    var isSubmitting = false;
+    String? inlineError;
+
+    final result = await showDialog<CloudSession>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            Future<void> submitLogin() async {
+              final username = usernameController.text.trim();
+              final password = passwordController.text;
+
+              if (username.isEmpty || password.isEmpty) {
+                setDialogState(() {
+                  inlineError = '请输入账号和密码。';
+                });
+                return;
+              }
+
+              setDialogState(() {
+                isSubmitting = true;
+                inlineError = null;
+              });
+
+              try {
+                final session = await _loginToCloudAccount(username, password);
+                if (!dialogContext.mounted) {
+                  return;
+                }
+
+                Navigator.of(dialogContext).pop(session);
+              } on NasApiException catch (error) {
+                if (!dialogContext.mounted) {
+                  return;
+                }
+
+                setDialogState(() {
+                  inlineError = error.message;
+                  isSubmitting = false;
+                });
+              }
+            }
+
+            return AlertDialog(
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(28),
+              ),
+              titlePadding: const EdgeInsets.fromLTRB(24, 24, 24, 12),
+              contentPadding: const EdgeInsets.fromLTRB(24, 0, 24, 0),
+              actionsPadding: const EdgeInsets.fromLTRB(24, 16, 24, 24),
+              title: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: const [
+                  Text('登录云账号'),
+                  SizedBox(height: 8),
+                  Text(
+                    '输入账号和密码进行登录。没有账号时，请使用下方扫码注册卡片。',
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: Color(0xFF64748B),
+                      height: 1.5,
+                    ),
+                  ),
+                ],
+              ),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: usernameController,
+                    autofocus: true,
+                    decoration: const InputDecoration(
+                      labelText: '账号 / 邮箱 / 手机号',
+                      border: OutlineInputBorder(),
+                      prefixIcon: Icon(Icons.person_outline_rounded),
+                    ),
+                    textInputAction: TextInputAction.next,
+                    onSubmitted: (_) =>
+                        FocusScope.of(dialogContext).nextFocus(),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: passwordController,
+                    obscureText: obscurePassword,
+                    decoration: InputDecoration(
+                      labelText: '密码',
+                      border: const OutlineInputBorder(),
+                      prefixIcon: const Icon(Icons.lock_outline_rounded),
+                      suffixIcon: IconButton(
+                        onPressed: () {
+                          setDialogState(() {
+                            obscurePassword = !obscurePassword;
+                          });
+                        },
+                        icon: Icon(
+                          obscurePassword
+                              ? Icons.visibility_outlined
+                              : Icons.visibility_off_outlined,
+                        ),
+                      ),
+                    ),
+                    textInputAction: TextInputAction.done,
+                    onSubmitted: (_) {
+                      if (!isSubmitting) {
+                        submitLogin();
+                      }
+                    },
+                  ),
+                  if (inlineError != null) ...[
+                    const SizedBox(height: 12),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        inlineError!,
+                        style: const TextStyle(
+                          color: Color(0xFFB42318),
+                          height: 1.4,
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: isSubmitting
+                      ? null
+                      : () => Navigator.of(dialogContext).pop(),
+                  child: const Text('取消'),
+                ),
+                FilledButton(
+                  onPressed: isSubmitting ? null : submitLogin,
+                  child: isSubmitting
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('登录'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      usernameController.dispose();
+      passwordController.dispose();
+    });
+
+    if (!mounted || result == null) {
+      return;
+    }
+
+    setState(() {
+      _cloudSession = result;
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('云账号 ${result.user.username} 登录成功。')),
+    );
+  }
+
+  Future<CloudSession> _loginToCloudAccount(
+    String username,
+    String password,
+  ) async {
+    final response = await _sendCloudTextRequest(
+      Uri.parse('https://reportzs.me/nas-api/login'),
+      method: 'POST',
+      headers: const {
+        HttpHeaders.acceptHeader: 'application/json',
+        HttpHeaders.contentTypeHeader: 'application/json; charset=utf-8',
+      },
+      requestBody: jsonEncode({'username': username, 'password': password}),
+    );
+
+    late final Map<String, dynamic> decoded;
+    try {
+      decoded = _decodeJsonObject(
+        response.body,
+        invalidMessage: '云登录接口返回了无法解析的内容。',
+      );
+    } on NasApiException {
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        rethrow;
+      }
+
+      throw NasApiException(
+        '云账号登录失败：${response.statusCode}。${_compactBody(response.body)}',
+      );
+    }
+
+    final success = decoded['success'] == true;
+    if (!success || response.statusCode < 200 || response.statusCode >= 300) {
+      final error = decoded['error']?.toString();
+      if (error != null && error.isNotEmpty) {
+        throw NasApiException(error);
+      }
+
+      throw NasApiException('云账号登录失败：${response.statusCode}。');
+    }
+
+    final accessToken = decoded['accessToken']?.toString();
+    if (accessToken == null || accessToken.isEmpty) {
+      throw const NasApiException('云账号登录成功，但 accessToken 为空。');
+    }
+
+    final userRaw = decoded['user'];
+    if (userRaw is! Map) {
+      throw const NasApiException('云账号登录成功，但用户信息缺失。');
+    }
+
+    return CloudSession(
+      accessToken: accessToken,
+      expiresAt: DateTime.tryParse(decoded['expiresAt']?.toString() ?? ''),
+      user: CloudUser.fromJson(Map<String, dynamic>.from(userRaw)),
+    );
+  }
+
+  Future<SimpleHttpResponse> _sendCloudTextRequest(
+    Uri uri, {
+    String method = 'GET',
+    Map<String, String>? headers,
+    String? requestBody,
+  }) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+
+    try {
+      late HttpClientRequest request;
+      switch (method) {
+        case 'DELETE':
+          request = await client
+              .deleteUrl(uri)
+              .timeout(const Duration(seconds: 8));
+          break;
+        case 'GET':
+          request = await client
+              .getUrl(uri)
+              .timeout(const Duration(seconds: 8));
+          break;
+        default:
+          request = await client
+              .openUrl(method, uri)
+              .timeout(const Duration(seconds: 8));
+      }
+
+      headers?.forEach(request.headers.set);
+      if (requestBody != null) {
+        final bytes = utf8.encode(requestBody);
+        request.contentLength = bytes.length;
+        request.add(bytes);
+      }
+
+      final response = await request.close().timeout(
+        const Duration(seconds: 8),
+      );
+      final responseBody = await utf8
+          .decodeStream(response)
+          .timeout(const Duration(seconds: 8));
+      return SimpleHttpResponse(response.statusCode, responseBody);
+    } on TimeoutException {
+      throw const NasApiException('请求云服务超时，请稍后重试。');
+    } on SocketException catch (error) {
+      throw NasApiException('无法连接云服务：${error.message}');
+    } on HttpException catch (error) {
+      throw NasApiException('云服务请求失败：${error.message}');
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Map<String, dynamic> _decodeJsonObject(
+    String body, {
+    required String invalidMessage,
+  }) {
+    late final Object decoded;
+    try {
+      decoded = jsonDecode(body);
+    } on FormatException {
+      throw NasApiException(invalidMessage);
+    }
+
+    if (decoded is Map<String, dynamic>) {
+      return decoded;
+    }
+    if (decoded is Map) {
+      return Map<String, dynamic>.from(decoded);
+    }
+
+    throw NasApiException(invalidMessage);
+  }
+
+  void _showPendingFeatureMessage(String message) {
+    if (!mounted) {
+      return;
+    }
+
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  void _showConnectionHelp() {
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('连接说明'),
+        content: const Text(
+          '1. 云账号登录只用于账号体系。\n'
+          '2. 扫码卡片只负责注册云账号。\n'
+          '3. 当前手动连接固定使用 5034 端口。\n'
+          '4. 自动发现界面已预留，后续再接入局域网扫描。',
+          style: TextStyle(height: 1.6),
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('知道了'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _refreshFiles({String? path, bool showLoading = true}) async {
     final baseUri = _baseUri;
     final token = _authToken;
@@ -326,7 +643,11 @@ class _NasHomePageState extends State<NasHomePage> {
     }
 
     try {
-      final directory = await _fetchDirectory(baseUri, token, path ?? _currentDirectory);
+      final directory = await _fetchDirectory(
+        baseUri,
+        token,
+        path ?? _currentDirectory,
+      );
       if (!mounted) {
         return;
       }
@@ -370,8 +691,12 @@ class _NasHomePageState extends State<NasHomePage> {
     } catch (error) {
       if (!mounted) return;
       const msg = '无法打开文件选择器，请检查应用权限。';
-      setState(() { _fileError = msg; });
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text(msg)));
+      setState(() {
+        _fileError = msg;
+      });
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text(msg)));
       return;
     }
 
@@ -421,9 +746,9 @@ class _NasHomePageState extends State<NasHomePage> {
       setState(() {
         _fileError = error.message;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error.message)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message)));
     } catch (error) {
       if (!mounted) {
         return;
@@ -433,9 +758,9 @@ class _NasHomePageState extends State<NasHomePage> {
       setState(() {
         _fileError = fallbackMessage;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text(fallbackMessage)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text(fallbackMessage)));
     } finally {
       if (mounted) {
         setState(() {
@@ -472,7 +797,8 @@ class _NasHomePageState extends State<NasHomePage> {
             child: const Text('取消'),
           ),
           FilledButton(
-            onPressed: () => Navigator.of(dialogContext).pop(controller.text.trim()),
+            onPressed: () =>
+                Navigator.of(dialogContext).pop(controller.text.trim()),
             child: const Text('创建'),
           ),
         ],
@@ -492,9 +818,9 @@ class _NasHomePageState extends State<NasHomePage> {
 
     final validationError = _validateEntryName(folderName);
     if (validationError != null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(validationError)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(validationError)));
       return;
     }
 
@@ -504,14 +830,18 @@ class _NasHomePageState extends State<NasHomePage> {
     });
 
     try {
-      await _createDirectory(baseUri, token, _joinDirectoryPath(_currentDirectory, folderName));
+      await _createDirectory(
+        baseUri,
+        token,
+        _joinDirectoryPath(_currentDirectory, folderName),
+      );
       if (!mounted) {
         return;
       }
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('文件夹“$folderName”已创建。')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('文件夹“$folderName”已创建。')));
       await _refreshFiles(showLoading: false);
     } on NasApiException catch (error) {
       if (!mounted) {
@@ -521,9 +851,9 @@ class _NasHomePageState extends State<NasHomePage> {
       setState(() {
         _fileError = error.message;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error.message)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message)));
     } finally {
       if (mounted) {
         setState(() {
@@ -533,7 +863,10 @@ class _NasHomePageState extends State<NasHomePage> {
     }
   }
 
-  Future<void> _handleEntryAction(FileBrowserEntry entry, EntryMenuAction action) async {
+  Future<void> _handleEntryAction(
+    FileBrowserEntry entry,
+    EntryMenuAction action,
+  ) async {
     if (_busyEntryPath != null) {
       return;
     }
@@ -577,7 +910,8 @@ class _NasHomePageState extends State<NasHomePage> {
             child: const Text('取消'),
           ),
           FilledButton(
-            onPressed: () => Navigator.of(dialogContext).pop(controller.text.trim()),
+            onPressed: () =>
+                Navigator.of(dialogContext).pop(controller.text.trim()),
             child: const Text('保存'),
           ),
         ],
@@ -591,9 +925,9 @@ class _NasHomePageState extends State<NasHomePage> {
 
     final validationError = _validateEntryName(nextName);
     if (validationError != null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(validationError)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(validationError)));
       return;
     }
 
@@ -602,9 +936,9 @@ class _NasHomePageState extends State<NasHomePage> {
         ? _joinDirectoryPath(parentDirectory, nextName)
         : _joinResourcePath(parentDirectory, nextName);
     if (destinationPath == entry.path) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('名称未变化。')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('名称未变化。')));
       return;
     }
 
@@ -619,9 +953,9 @@ class _NasHomePageState extends State<NasHomePage> {
         return;
       }
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('${entry.name} 已重命名为 $nextName。')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('${entry.name} 已重命名为 $nextName。')));
       await _refreshFiles(showLoading: false);
     } on NasApiException catch (error) {
       if (!mounted) {
@@ -631,9 +965,9 @@ class _NasHomePageState extends State<NasHomePage> {
       setState(() {
         _fileError = error.message;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error.message)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message)));
     } finally {
       if (mounted) {
         setState(() {
@@ -666,9 +1000,9 @@ class _NasHomePageState extends State<NasHomePage> {
         ? _joinDirectoryPath(targetDirectory, entry.name)
         : _joinResourcePath(targetDirectory, entry.name);
     if (destinationPath == entry.path) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('目标目录未变化。')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('目标目录未变化。')));
       return;
     }
 
@@ -695,9 +1029,9 @@ class _NasHomePageState extends State<NasHomePage> {
       setState(() {
         _fileError = error.message;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error.message)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message)));
     } finally {
       if (mounted) {
         setState(() {
@@ -749,9 +1083,9 @@ class _NasHomePageState extends State<NasHomePage> {
       final message = entry.isDir
           ? '${entry.name} 已下载到本地，共 $downloadedFiles 个文件。'
           : '${entry.name} 已下载到本地。';
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(message)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
     } on NasApiException catch (error) {
       if (!mounted) {
         return;
@@ -760,9 +1094,9 @@ class _NasHomePageState extends State<NasHomePage> {
       setState(() {
         _fileError = error.message;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error.message)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message)));
     } finally {
       if (mounted) {
         setState(() {
@@ -814,9 +1148,9 @@ class _NasHomePageState extends State<NasHomePage> {
         return;
       }
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('${entry.name} 已删除。')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('${entry.name} 已删除。')));
       await _refreshFiles(showLoading: false);
     } on NasApiException catch (error) {
       if (!mounted) {
@@ -826,9 +1160,9 @@ class _NasHomePageState extends State<NasHomePage> {
       setState(() {
         _fileError = error.message;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error.message)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message)));
     } finally {
       if (mounted) {
         setState(() {
@@ -887,9 +1221,9 @@ class _NasHomePageState extends State<NasHomePage> {
       return;
     }
 
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('当前支持图片、音频和视频。视频会在浏览器中打开播放。')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('当前支持图片、音频和视频。视频会在浏览器中打开播放。')));
   }
 
   Future<void> _openVideoExternally(FileBrowserEntry entry) async {
@@ -910,7 +1244,10 @@ class _NasHomePageState extends State<NasHomePage> {
         return;
       }
 
-      final launched = await launchUrl(relayUri, mode: LaunchMode.externalApplication);
+      final launched = await launchUrl(
+        relayUri,
+        mode: LaunchMode.externalApplication,
+      );
       if (!mounted) {
         return;
       }
@@ -926,9 +1263,9 @@ class _NasHomePageState extends State<NasHomePage> {
       setState(() {
         _fileError = error.message;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error.message)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message)));
     } on PlatformException catch (error) {
       if (!mounted) {
         return;
@@ -939,9 +1276,9 @@ class _NasHomePageState extends State<NasHomePage> {
       setState(() {
         _fileError = detail;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(detail)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(detail)));
     } finally {
       if (mounted) {
         setState(() {
@@ -957,13 +1294,30 @@ class _NasHomePageState extends State<NasHomePage> {
       return null;
     }
 
-    final normalized = trimmed.contains('://') ? trimmed : 'http://$trimmed';
+    final needsIpv6Brackets =
+        !trimmed.contains('://') &&
+        trimmed.contains(':') &&
+        !trimmed.startsWith('[') &&
+        !trimmed.endsWith(']');
+    final normalizedHost = needsIpv6Brackets ? '[$trimmed]' : trimmed;
+    final normalized = trimmed.contains('://')
+        ? trimmed
+        : 'http://$normalizedHost';
     final uri = Uri.tryParse(normalized);
     if (uri == null || uri.host.isEmpty) {
       return null;
     }
 
-    return Uri.parse(uri.origin);
+    final fixedPortUri = uri.replace(
+      scheme: uri.scheme.isEmpty ? 'http' : uri.scheme,
+      port: 5034,
+      path: '',
+      query: null,
+      fragment: null,
+      userInfo: '',
+    );
+
+    return Uri.parse(fixedPortUri.origin);
   }
 
   Future<NasHostStatus> _fetchHostStatus(Uri baseUri) async {
@@ -973,7 +1327,9 @@ class _NasHomePageState extends State<NasHomePage> {
     );
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw NasApiException('宿主返回了 ${response.statusCode}。${_compactBody(response.body)}');
+      throw NasApiException(
+        '宿主返回了 ${response.statusCode}。${_compactBody(response.body)}',
+      );
     }
 
     try {
@@ -989,9 +1345,13 @@ class _NasHomePageState extends State<NasHomePage> {
   }
 
   Future<String> _loginToFileBrowser(Uri baseUri) async {
-    final response = await _sendTextRequest(baseUri.replace(path: '/api/filebrowser/login'));
+    final response = await _sendTextRequest(
+      baseUri.replace(path: '/api/filebrowser/login'),
+    );
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw NasApiException('FileBrowser 登录失败：${response.statusCode}。${_compactBody(response.body)}');
+      throw NasApiException(
+        'FileBrowser 登录失败：${response.statusCode}。${_compactBody(response.body)}',
+      );
     }
 
     final token = response.body.trim();
@@ -1002,14 +1362,20 @@ class _NasHomePageState extends State<NasHomePage> {
     return token;
   }
 
-  Future<FileBrowserDirectory> _fetchDirectory(Uri baseUri, String token, String resourcePath) async {
+  Future<FileBrowserDirectory> _fetchDirectory(
+    Uri baseUri,
+    String token,
+    String resourcePath,
+  ) async {
     final response = await _sendTextRequest(
       _buildResourceUri(baseUri, resourcePath),
       headers: {'X-Auth': token, HttpHeaders.acceptHeader: 'application/json'},
     );
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw NasApiException('读取文件列表失败：${response.statusCode}。${_compactBody(response.body)}');
+      throw NasApiException(
+        '读取文件列表失败：${response.statusCode}。${_compactBody(response.body)}',
+      );
     }
 
     try {
@@ -1024,15 +1390,27 @@ class _NasHomePageState extends State<NasHomePage> {
     }
   }
 
-  Future<void> _uploadFile(Uri baseUri, String token, String directoryPath, PlatformFile file) async {
+  Future<void> _uploadFile(
+    Uri baseUri,
+    String token,
+    String directoryPath,
+    PlatformFile file,
+  ) async {
     final targetPath = _joinResourcePath(directoryPath, file.name);
-    final uri = _buildResourceUri(baseUri, targetPath, queryParameters: const {'override': 'true'});
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
+    final uri = _buildResourceUri(
+      baseUri,
+      targetPath,
+      queryParameters: const {'override': 'true'},
+    );
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 15);
     final uploadTimeout = const Duration(minutes: 10);
     final responseTimeout = const Duration(minutes: 2);
 
     try {
-      final request = await client.postUrl(uri).timeout(const Duration(seconds: 15));
+      final request = await client
+          .postUrl(uri)
+          .timeout(const Duration(seconds: 15));
       request.bufferOutput = false;
       request.headers.set('X-Auth', token);
       request.headers.contentType = ContentType.binary;
@@ -1045,7 +1423,9 @@ class _NasHomePageState extends State<NasHomePage> {
       if (readStream != null) {
         await request.addStream(readStream).timeout(uploadTimeout);
       } else if (file.path != null) {
-        await request.addStream(File(file.path!).openRead()).timeout(uploadTimeout);
+        await request
+            .addStream(File(file.path!).openRead())
+            .timeout(uploadTimeout);
       } else {
         throw const NasApiException('无法读取文件内容，请重试。');
       }
@@ -1053,7 +1433,9 @@ class _NasHomePageState extends State<NasHomePage> {
       final response = await request.close().timeout(responseTimeout);
       final body = await utf8.decodeStream(response).timeout(responseTimeout);
       if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw NasApiException('上传 ${file.name} 失败：${response.statusCode}。${_compactBody(body)}');
+        throw NasApiException(
+          '上传 ${file.name} 失败：${response.statusCode}。${_compactBody(body)}',
+        );
       }
     } on TimeoutException {
       throw NasApiException('上传 ${file.name} 超时，请保持应用停留在前台后重试。');
@@ -1075,21 +1457,34 @@ class _NasHomePageState extends State<NasHomePage> {
     String content, {
     String contentType = 'text/plain; charset=utf-8',
   }) async {
-    final uri = _buildResourceUri(baseUri, resourcePath, queryParameters: const {'override': 'true'});
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
+    final uri = _buildResourceUri(
+      baseUri,
+      resourcePath,
+      queryParameters: const {'override': 'true'},
+    );
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 15);
 
     try {
-      final request = await client.postUrl(uri).timeout(const Duration(seconds: 15));
+      final request = await client
+          .postUrl(uri)
+          .timeout(const Duration(seconds: 15));
       final bytes = utf8.encode(content);
       request.headers.set('X-Auth', token);
       request.headers.set(HttpHeaders.contentTypeHeader, contentType);
       request.contentLength = bytes.length;
       request.add(bytes);
 
-      final response = await request.close().timeout(const Duration(seconds: 30));
-      final body = await utf8.decodeStream(response).timeout(const Duration(seconds: 30));
+      final response = await request.close().timeout(
+        const Duration(seconds: 30),
+      );
+      final body = await utf8
+          .decodeStream(response)
+          .timeout(const Duration(seconds: 30));
       if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw NasApiException('保存笔记失败：${response.statusCode}。${_compactBody(body)}');
+        throw NasApiException(
+          '保存笔记失败：${response.statusCode}。${_compactBody(body)}',
+        );
       }
     } on TimeoutException {
       throw const NasApiException('保存笔记超时。');
@@ -1102,7 +1497,11 @@ class _NasHomePageState extends State<NasHomePage> {
     }
   }
 
-  Future<void> _createDirectory(Uri baseUri, String token, String directoryPath) async {
+  Future<void> _createDirectory(
+    Uri baseUri,
+    String token,
+    String directoryPath,
+  ) async {
     final response = await _sendTextRequest(
       _buildResourceUri(baseUri, directoryPath),
       method: 'POST',
@@ -1110,11 +1509,17 @@ class _NasHomePageState extends State<NasHomePage> {
     );
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw NasApiException('创建文件夹失败：${response.statusCode}。${_compactBody(response.body)}');
+      throw NasApiException(
+        '创建文件夹失败：${response.statusCode}。${_compactBody(response.body)}',
+      );
     }
   }
 
-  Future<void> _deleteResource(Uri baseUri, String token, String resourcePath) async {
+  Future<void> _deleteResource(
+    Uri baseUri,
+    String token,
+    String resourcePath,
+  ) async {
     final response = await _sendTextRequest(
       _buildResourceUri(baseUri, resourcePath),
       method: 'DELETE',
@@ -1122,7 +1527,9 @@ class _NasHomePageState extends State<NasHomePage> {
     );
 
     if (response.statusCode != 204 && response.statusCode != 200) {
-      throw NasApiException('删除失败：${response.statusCode}。${_compactBody(response.body)}');
+      throw NasApiException(
+        '删除失败：${response.statusCode}。${_compactBody(response.body)}',
+      );
     }
   }
 
@@ -1136,10 +1543,7 @@ class _NasHomePageState extends State<NasHomePage> {
       _buildResourceUri(
         baseUri,
         sourcePath,
-        queryParameters: {
-          'action': 'rename',
-          'destination': destinationPath,
-        },
+        queryParameters: {'action': 'rename', 'destination': destinationPath},
       ),
       method: 'PATCH',
       headers: {'X-Auth': token},
@@ -1153,18 +1557,23 @@ class _NasHomePageState extends State<NasHomePage> {
       throw const NasApiException('目标位置已存在同名文件或目录。');
     }
 
-    throw NasApiException('移动或重命名失败：${response.statusCode}。${_compactBody(response.body)}');
+    throw NasApiException(
+      '移动或重命名失败：${response.statusCode}。${_compactBody(response.body)}',
+    );
   }
 
   Future<int> _downloadEntryToLocal(
     Uri baseUri,
     String token,
     FileBrowserEntry entry,
-    String localParentDirectory,
-    {void Function()? onFileDownloaded,}
-  ) async {
+    String localParentDirectory, {
+    void Function()? onFileDownloaded,
+  }) async {
     if (entry.isDir) {
-      final localDirectoryPath = _joinLocalPath(localParentDirectory, entry.name);
+      final localDirectoryPath = _joinLocalPath(
+        localParentDirectory,
+        entry.name,
+      );
       await Directory(localDirectoryPath).create(recursive: true);
 
       final directory = await _fetchDirectory(baseUri, token, entry.path);
@@ -1194,23 +1603,32 @@ class _NasHomePageState extends State<NasHomePage> {
     String resourcePath,
     String localFilePath,
   ) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 15);
 
     try {
-      final request = await client.getUrl(_buildRawDownloadUri(baseUri, resourcePath)).timeout(
-        const Duration(seconds: 15),
-      );
+      final request = await client
+          .getUrl(_buildRawDownloadUri(baseUri, resourcePath))
+          .timeout(const Duration(seconds: 15));
       request.headers.set('X-Auth', token);
 
-      final response = await request.close().timeout(const Duration(seconds: 30));
+      final response = await request.close().timeout(
+        const Duration(seconds: 30),
+      );
       if (response.statusCode < 200 || response.statusCode >= 300) {
-        final body = await utf8.decodeStream(response).timeout(const Duration(seconds: 30));
-        throw NasApiException('下载失败：${response.statusCode}。${_compactBody(body)}');
+        final body = await utf8
+            .decodeStream(response)
+            .timeout(const Duration(seconds: 30));
+        throw NasApiException(
+          '下载失败：${response.statusCode}。${_compactBody(body)}',
+        );
       }
 
       final outputFile = File(localFilePath);
       await outputFile.parent.create(recursive: true);
-      await response.pipe(outputFile.openWrite()).timeout(const Duration(seconds: 2 * 60));
+      await response
+          .pipe(outputFile.openWrite())
+          .timeout(const Duration(seconds: 2 * 60));
     } on TimeoutException {
       throw const NasApiException('下载超时，请稍后重试。');
     } on SocketException catch (error) {
@@ -1234,13 +1652,19 @@ class _NasHomePageState extends State<NasHomePage> {
       late HttpClientRequest request;
       switch (method) {
         case 'DELETE':
-          request = await client.deleteUrl(uri).timeout(const Duration(seconds: 8));
+          request = await client
+              .deleteUrl(uri)
+              .timeout(const Duration(seconds: 8));
           break;
         case 'GET':
-          request = await client.getUrl(uri).timeout(const Duration(seconds: 8));
+          request = await client
+              .getUrl(uri)
+              .timeout(const Duration(seconds: 8));
           break;
         default:
-          request = await client.openUrl(method, uri).timeout(const Duration(seconds: 8));
+          request = await client
+              .openUrl(method, uri)
+              .timeout(const Duration(seconds: 8));
       }
 
       headers?.forEach(request.headers.set);
@@ -1249,8 +1673,12 @@ class _NasHomePageState extends State<NasHomePage> {
         request.contentLength = bytes.length;
         request.add(bytes);
       }
-      final response = await request.close().timeout(const Duration(seconds: 8));
-      final responseBody = await utf8.decodeStream(response).timeout(const Duration(seconds: 8));
+      final response = await request.close().timeout(
+        const Duration(seconds: 8),
+      );
+      final responseBody = await utf8
+          .decodeStream(response)
+          .timeout(const Duration(seconds: 8));
       return SimpleHttpResponse(response.statusCode, responseBody);
     } on TimeoutException {
       throw const NasApiException('请求超时，请确认宿主仍然在线。');
@@ -1263,7 +1691,11 @@ class _NasHomePageState extends State<NasHomePage> {
     }
   }
 
-  Uri _buildResourceUri(Uri baseUri, String resourcePath, {Map<String, String>? queryParameters}) {
+  Uri _buildResourceUri(
+    Uri baseUri,
+    String resourcePath, {
+    Map<String, String>? queryParameters,
+  }) {
     final encodedPath = _encodeResourcePath(resourcePath);
     return baseUri.replace(
       path: '/api/filebrowser/resources$encodedPath',
@@ -1289,7 +1721,11 @@ class _NasHomePageState extends State<NasHomePage> {
     return baseUri.replace(path: '/api/filebrowser/preview/thumb$encodedPath');
   }
 
-  Future<Uri> _createMediaRelayUri(Uri baseUri, String token, String resourcePath) async {
+  Future<Uri> _createMediaRelayUri(
+    Uri baseUri,
+    String token,
+    String resourcePath,
+  ) async {
     final response = await _sendTextRequest(
       baseUri.replace(path: '/api/system/media-tickets'),
       method: 'POST',
@@ -1302,7 +1738,9 @@ class _NasHomePageState extends State<NasHomePage> {
     );
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw NasApiException('创建视频播放链接失败：${response.statusCode}。${_compactBody(response.body)}');
+      throw NasApiException(
+        '创建视频播放链接失败：${response.statusCode}。${_compactBody(response.body)}',
+      );
     }
 
     try {
@@ -1333,31 +1771,31 @@ class _NasHomePageState extends State<NasHomePage> {
         backgroundColor: entry.isDir
             ? const Color(0xFFD1FAE5)
             : entry.isPreviewableImage
-                ? const Color(0xFFFFEDD5)
-                : entry.isPreviewableAudio
-                    ? const Color(0xFFEEE7FF)
+            ? const Color(0xFFFFEDD5)
+            : entry.isPreviewableAudio
+            ? const Color(0xFFEEE7FF)
             : entry.isPreviewableVideo
-              ? const Color(0xFFE0E7FF)
-                : const Color(0xFFE0F2FE),
+            ? const Color(0xFFE0E7FF)
+            : const Color(0xFFE0F2FE),
         child: Icon(
           entry.isDir
               ? Icons.folder_outlined
               : entry.isPreviewableImage
-                  ? Icons.image_outlined
-                  : entry.isPreviewableAudio
-                      ? Icons.music_note_outlined
+              ? Icons.image_outlined
+              : entry.isPreviewableAudio
+              ? Icons.music_note_outlined
               : entry.isPreviewableVideo
-                ? Icons.movie_outlined
-                  : Icons.description_outlined,
+              ? Icons.movie_outlined
+              : Icons.description_outlined,
           color: entry.isDir
               ? const Color(0xFF0F766E)
               : entry.isPreviewableImage
-                  ? const Color(0xFFEA580C)
-                  : entry.isPreviewableAudio
-                      ? const Color(0xFF6D28D9)
+              ? const Color(0xFFEA580C)
+              : entry.isPreviewableAudio
+              ? const Color(0xFF6D28D9)
               : entry.isPreviewableVideo
-                ? const Color(0xFF3730A3)
-                  : const Color(0xFF0369A1),
+              ? const Color(0xFF3730A3)
+              : const Color(0xFF0369A1),
         ),
       );
     }
@@ -1403,7 +1841,8 @@ class _NasHomePageState extends State<NasHomePage> {
       '状态接口可达。',
       if (status.fileBrowserRunning != null)
         'FileBrowser: ${status.fileBrowserRunning! ? '运行中' : '未运行'}',
-      if (status.fileBrowserBaseUrl != null && status.fileBrowserBaseUrl!.isNotEmpty)
+      if (status.fileBrowserBaseUrl != null &&
+          status.fileBrowserBaseUrl!.isNotEmpty)
         '内部地址: ${status.fileBrowserBaseUrl}',
       if (status.sharedRoot != null && status.sharedRoot!.isNotEmpty)
         '共享目录: ${status.sharedRoot}',
@@ -1447,9 +1886,9 @@ class _NasHomePageState extends State<NasHomePage> {
     });
 
     if (nextScope == SpaceScope.family) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('家庭空间还没接入，当前先保留占位。')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('家庭空间还没接入，当前先保留占位。')));
     }
   }
 
@@ -1470,7 +1909,9 @@ class _NasHomePageState extends State<NasHomePage> {
     }
   }
 
-  Future<List<FileBrowserEntry>> _loadCategoryEntries(FileCategoryFilter filter) async {
+  Future<List<FileBrowserEntry>> _loadCategoryEntries(
+    FileCategoryFilter filter,
+  ) async {
     final baseUri = _baseUri;
     final token = _authToken;
     if (baseUri == null || token == null) {
@@ -1602,7 +2043,9 @@ class _NasHomePageState extends State<NasHomePage> {
     setState(() {
       _activeTransferTasks = _activeTransferTasks
           .map(
-            (task) => task.id == taskId ? task.copyWith(processedFiles: processedFiles) : task,
+            (task) => task.id == taskId
+                ? task.copyWith(processedFiles: processedFiles)
+                : task,
           )
           .toList(growable: false);
     });
@@ -1646,7 +2089,9 @@ class _NasHomePageState extends State<NasHomePage> {
       return;
     }
 
-    throw NasApiException('读取笔记目录失败：${response.statusCode}。${_compactBody(response.body)}');
+    throw NasApiException(
+      '读取笔记目录失败：${response.statusCode}。${_compactBody(response.body)}',
+    );
   }
 
   Future<List<LocalNote>> _loadNotesFromCloud() async {
@@ -1665,7 +2110,9 @@ class _NasHomePageState extends State<NasHomePage> {
       return const [];
     }
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw NasApiException('读取云端笔记失败：${response.statusCode}。${_compactBody(response.body)}');
+      throw NasApiException(
+        '读取云端笔记失败：${response.statusCode}。${_compactBody(response.body)}',
+      );
     }
 
     final trimmedBody = response.body.trim();
@@ -1697,7 +2144,9 @@ class _NasHomePageState extends State<NasHomePage> {
     }
 
     await _ensureNotesDirectoryExists();
-    final requestBody = jsonEncode(notes.map((note) => note.toJson()).toList(growable: false));
+    final requestBody = jsonEncode(
+      notes.map((note) => note.toJson()).toList(growable: false),
+    );
     await _uploadTextFile(
       baseUri,
       token,
@@ -1721,27 +2170,27 @@ class _NasHomePageState extends State<NasHomePage> {
   }
 
   Future<void> _openChatToolPage() async {
-    await Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (context) => const ChatToolPage(),
-      ),
-    );
+    await Navigator.of(
+      context,
+    ).push(MaterialPageRoute<void>(builder: (context) => const ChatToolPage()));
   }
 
   Future<void> _openRecycleBinToolPage() async {
     await Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (context) => const RecycleBinToolPage(),
-      ),
+      MaterialPageRoute<void>(builder: (context) => const RecycleBinToolPage()),
     );
   }
 
-  Widget _buildSectionCard({required Widget child}) {
+  Widget _buildSectionCard({
+    BuildContext? contextOverride,
+    required Widget child,
+  }) {
+    final metrics = _ConnectionPageMetrics.of(contextOverride ?? context);
     return Container(
-      padding: const EdgeInsets.all(18),
+      padding: EdgeInsets.all(metrics.cardPadding),
       decoration: BoxDecoration(
         color: Colors.white,
-        borderRadius: BorderRadius.circular(28),
+        borderRadius: BorderRadius.circular(metrics.cardRadius),
         boxShadow: const [
           BoxShadow(
             color: Color(0x0F0F172A),
@@ -1754,114 +2203,670 @@ class _NasHomePageState extends State<NasHomePage> {
     );
   }
 
-  Widget _buildConnectionPage(ThemeData theme) {
-    return Scaffold(
-      body: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.fromLTRB(20, 20, 20, 28),
-          children: [
-            Container(
-              padding: const EdgeInsets.all(24),
+  Widget _buildAccentIconBox(
+    BuildContext context, {
+    required IconData icon,
+    required Color backgroundColor,
+    required Color foregroundColor,
+  }) {
+    final metrics = _ConnectionPageMetrics.of(context);
+    return Container(
+      width: metrics.iconBoxSize,
+      height: metrics.iconBoxSize,
+      decoration: BoxDecoration(
+        color: backgroundColor,
+        borderRadius: BorderRadius.circular(metrics.iconBoxRadius),
+      ),
+      alignment: Alignment.center,
+      child: Icon(icon, color: foregroundColor, size: metrics.iconSize),
+    );
+  }
+
+  String _buildCloudSummary() {
+    final session = _cloudSession;
+    if (session == null) {
+      return '查看并连接你的设备';
+    }
+
+    final expiresAt = session.expiresAt?.toLocal();
+    if (expiresAt == null) {
+      return '已登录 ${session.user.username}';
+    }
+
+    final month = expiresAt.month.toString().padLeft(2, '0');
+    final day = expiresAt.day.toString().padLeft(2, '0');
+    final hour = expiresAt.hour.toString().padLeft(2, '0');
+    final minute = expiresAt.minute.toString().padLeft(2, '0');
+    return '已登录 ${session.user.username} · 有效至 $month-$day $hour:$minute';
+  }
+
+  Widget _buildCloudAccountCard(BuildContext context, ThemeData theme) {
+    final metrics = _ConnectionPageMetrics.of(context);
+    final session = _cloudSession;
+    final actionLabel = session == null ? '登录 / 注册' : '切换账号';
+
+    return _buildSectionCard(
+      contextOverride: context,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              _buildAccentIconBox(
+                context,
+                icon: Icons.lock_rounded,
+                backgroundColor: const Color(0xFF3B82F6),
+                foregroundColor: Colors.white,
+              ),
+              SizedBox(width: metrics.inlineSpacing),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '登录云账号',
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    Text(
+                      _buildCloudSummary(),
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: const Color(0xFF64748B),
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ],
+                ),
+              ),
+              SizedBox(width: metrics.inlineSpacing * 0.5),
+              FilledButton(
+                onPressed: _showCloudLoginDialog,
+                style: FilledButton.styleFrom(
+                  padding: EdgeInsets.symmetric(
+                    horizontal: metrics.inlineSpacing,
+                    vertical: metrics.badgeVerticalPadding + 2,
+                  ),
+                  backgroundColor: const Color(0xFF2563EB),
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                ),
+                child: Text(
+                  actionLabel,
+                  style: const TextStyle(
+                      fontSize: 13, fontWeight: FontWeight.w600),
+                ),
+              ),
+            ],
+          ),
+          SizedBox(height: metrics.sectionSpacing),
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.shield_outlined,
+                    size: 14, color: const Color(0xFF3B82F6)),
+                const SizedBox(width: 4),
+                Text('端到端加密',
+                    style: TextStyle(
+                        color: const Color(0xFF64748B), fontSize: 13)),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  child: Text('|',
+                      style: TextStyle(
+                          color: const Color(0xFFCBD5E1), fontSize: 13)),
+                ),
+                Icon(Icons.sync_rounded,
+                    size: 14, color: const Color(0xFF3B82F6)),
+                const SizedBox(width: 4),
+                Text('设备间同步地址',
+                    style: TextStyle(
+                        color: const Color(0xFF64748B), fontSize: 13)),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  child: Text('|',
+                      style: TextStyle(
+                          color: const Color(0xFFCBD5E1), fontSize: 13)),
+                ),
+                Icon(Icons.devices_outlined,
+                    size: 14, color: const Color(0xFF3B82F6)),
+                const SizedBox(width: 4),
+                Text('多端访问',
+                    style: TextStyle(
+                        color: const Color(0xFF64748B), fontSize: 13)),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDeviceScanIllustration(
+    BuildContext context, {
+    double? maxWidth,
+  }) {
+    final metrics = _ConnectionPageMetrics.of(context);
+    final availableWidth = maxWidth ?? metrics.screenWidth;
+    final layoutWidth = metrics.illustrationWidthFor(availableWidth);
+    final layoutHeight = metrics.illustrationHeightFor(availableWidth);
+    final monitorHeight = layoutHeight * 0.68;
+    final phoneWidth = layoutWidth * 0.31;
+    final phoneHeight = layoutHeight * 0.8;
+    final qrBoxSize = monitorHeight * 0.5;
+    return SizedBox(
+      width: layoutWidth,
+      height: layoutHeight,
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          Positioned(
+            left: layoutWidth * 0.07,
+            right: layoutWidth * 0.19,
+            top: layoutHeight * 0.15,
+            child: Container(
+              height: monitorHeight,
+              decoration: BoxDecoration(
+                color: const Color(0xFF0F172A),
+                borderRadius: BorderRadius.circular(layoutWidth * 0.1),
+                boxShadow: const [
+                  BoxShadow(
+                    color: Color(0x140F172A),
+                    blurRadius: 18,
+                    offset: Offset(0, 10),
+                  ),
+                ],
+              ),
+              child: Center(
+                child: Container(
+                  width: qrBoxSize,
+                  height: qrBoxSize,
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(layoutWidth * 0.06),
+                  ),
+                  child: Icon(
+                    Icons.qr_code_2_rounded,
+                    color: Color(0xFF111827),
+                    size: qrBoxSize * 0.6,
+                  ),
+                ),
+              ),
+            ),
+          ),
+          Positioned(
+            left: layoutWidth * 0.24,
+            right: layoutWidth * 0.36,
+            bottom: layoutHeight * 0.04,
+            child: Container(
+              height: layoutHeight * 0.08,
+              decoration: BoxDecoration(
+                color: const Color(0xFFD6DAE1),
+                borderRadius: BorderRadius.circular(999),
+              ),
+            ),
+          ),
+          Positioned(
+            right: 0,
+            bottom: 0,
+            child: Container(
+              width: phoneWidth,
+              height: phoneHeight,
               decoration: BoxDecoration(
                 gradient: const LinearGradient(
-                  colors: [Color(0xFF134E4A), Color(0xFF0F766E)],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
+                  colors: [Color(0xFF1E293B), Color(0xFF334155)],
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
                 ),
-                borderRadius: BorderRadius.circular(32),
+                borderRadius: BorderRadius.circular(layoutWidth * 0.11),
+                border: Border.all(color: const Color(0xFF475569)),
               ),
-              child: const Column(
+              child: Center(
+                child: Icon(
+                  Icons.qr_code_scanner_rounded,
+                  color: Color(0xFF60A5FA),
+                  size: phoneWidth * 0.5,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildScanRegisterCard(BuildContext context, ThemeData theme) {
+    final metrics = _ConnectionPageMetrics.of(context);
+    return _buildSectionCard(
+      contextOverride: context,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '扫码绑定设备',
+                  style: theme.textTheme.titleLarge?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '扫描电脑端二维码，\n快速绑定设备',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: const Color(0xFF64748B),
+                    height: 1.5,
+                  ),
+                ),
+                SizedBox(height: metrics.sectionSpacing),
+                OutlinedButton.icon(
+                  onPressed: () =>
+                      _showPendingFeatureMessage('扫码绑定功能还在接入，请稍后。'),
+                  icon: const Icon(Icons.crop_free_rounded, size: 17),
+                  label: const Text('扫一扫'),
+                  style: OutlinedButton.styleFrom(
+                    padding: EdgeInsets.symmetric(
+                      horizontal: metrics.inlineSpacing,
+                      vertical: metrics.badgeVerticalPadding + 2,
+                    ),
+                    side: const BorderSide(color: Color(0xFFCBD5E1)),
+                    foregroundColor: const Color(0xFF334155),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          SizedBox(width: metrics.inlineSpacing),
+          _buildDeviceScanIllustration(
+            context,
+            maxWidth: metrics.screenWidth * 0.36,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDiscoveryHostTile(BuildContext context, ThemeData theme) {
+    final metrics = _ConnectionPageMetrics.of(context);
+    final hostStatus = _hostStatus;
+    final baseUri = _baseUri;
+    if (hostStatus == null || baseUri == null) {
+      return Container(
+        width: double.infinity,
+        padding: EdgeInsets.all(metrics.cardPadding * 0.85),
+        decoration: BoxDecoration(
+          color: const Color(0xFFF8FAFC),
+          borderRadius: BorderRadius.circular(metrics.inputRadius),
+        ),
+        child: Row(
+          children: [
+            _buildAccentIconBox(
+              context,
+              icon: Icons.radar_rounded,
+              backgroundColor: const Color(0xFFEFF6FF),
+              foregroundColor: const Color(0xFF2563EB),
+            ),
+            SizedBox(width: metrics.inlineSpacing),
+            Expanded(
+              child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    '连接你的 loal_NAS 宿主',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 28,
+                    '正在准备自动发现',
+                    style: theme.textTheme.titleMedium?.copyWith(
                       fontWeight: FontWeight.w700,
                     ),
                   ),
-                  SizedBox(height: 12),
+                  const SizedBox(height: 6),
                   Text(
-                    '先连上宿主，再进入首页。连接成功后会自动跳转，并继续复用现在这套 FileBrowser 接口。',
-                    style: TextStyle(
-                      color: Color(0xFFD1FAE5),
+                    '当前先保留界面，后续会接入同一局域网扫描。你也可以先使用下方手动输入地址。',
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: const Color(0xFF64748B),
                       height: 1.5,
                     ),
                   ),
                 ],
               ),
             ),
-            const SizedBox(height: 20),
-            _buildSectionCard(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text('宿主地址', style: theme.textTheme.titleMedium),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: _hostController,
-                    keyboardType: TextInputType.url,
-                    decoration: const InputDecoration(
-                      border: OutlineInputBorder(),
-                      hintText: 'http://192.168.1.10:5034 或 http://[IPv6]:5034',
-                    ),
-                    onSubmitted: (_) {
-                      if (!_isProbing) {
-                        _probeHost();
-                      }
-                    },
-                  ),
-                  const SizedBox(height: 12),
-                  SizedBox(
-                    width: double.infinity,
-                    child: FilledButton.icon(
-                      onPressed: _isProbing ? null : _probeHost,
-                      icon: _isProbing
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.wifi_tethering),
-                      label: Text(_isProbing ? '连接中...' : '连接并加载文件'),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    '提示：IPv6 地址必须带中括号，例如 http://[fc00::55:ca]:5034。',
-                    style: theme.textTheme.bodySmall,
-                  ),
-                ],
+          ],
+        ),
+      );
+    }
+
+    final host = baseUri.host;
+
+    return Material(
+      color: const Color(0xFFF8FAFC),
+      borderRadius: BorderRadius.circular(metrics.inputRadius),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(metrics.inputRadius),
+        onTap: _isProbing
+            ? null
+            : () {
+                setState(() {
+                  _hostController.text = host;
+                });
+                _probeHost();
+              },
+        child: Padding(
+          padding: EdgeInsets.all(metrics.cardPadding * 0.85),
+          child: Row(
+            children: [
+              _buildAccentIconBox(
+                context,
+                icon: Icons.desktop_windows_outlined,
+                backgroundColor: const Color(0xFFEFF6FF),
+                foregroundColor: const Color(0xFF2563EB),
               ),
-            ),
-            const SizedBox(height: 16),
-            _buildSectionCard(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+              SizedBox(width: metrics.inlineSpacing),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      hostStatus.hostName,
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '$host:5034',
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: const Color(0xFF64748B),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              SizedBox(width: metrics.inlineSpacing * 0.85),
+              const Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
-                  Text('探测结果', style: theme.textTheme.titleMedium),
-                  const SizedBox(height: 12),
                   Text(
-                    _probeState.headline,
-                    style: theme.textTheme.titleLarge?.copyWith(
-                      color: _probeState.color,
+                    '在线',
+                    style: TextStyle(
+                      color: Color(0xFF16A34A),
                       fontWeight: FontWeight.w700,
                     ),
                   ),
-                  const SizedBox(height: 8),
-                  Text(_probeState.detail),
-                  if (_probeState.endpoint != null) ...[
-                    const SizedBox(height: 12),
-                    Text('目标宿主: ${_probeState.endpoint}'),
-                  ],
-                  if (_probeState.hostName != null) ...[
-                    const SizedBox(height: 8),
-                    Text('宿主名称: ${_probeState.hostName}'),
-                  ],
+                  SizedBox(height: 4),
+                  Icon(Icons.wifi_rounded, color: Color(0xFF22C55E), size: 18),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAutoDiscoveryCard(BuildContext context, ThemeData theme) {
+    final metrics = _ConnectionPageMetrics.of(context);
+    return _buildSectionCard(
+      contextOverride: context,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  '自动发现设备',
+                  style: theme.textTheme.titleLarge?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              TextButton.icon(
+                onPressed: () =>
+                    _showPendingFeatureMessage('自动发现功能还在接入，当前先使用手动输入地址。'),
+                icon: const Icon(Icons.refresh_rounded),
+                label: const Text('刷新'),
+              ),
+            ],
+          ),
+          SizedBox(height: metrics.inlineSpacing * 0.45),
+          Text(
+            _hostStatus == null ? '正在搜索同一局域网内的设备...' : '最近一次成功连接的设备会显示在这里。',
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: const Color(0xFF64748B),
+              height: 1.5,
+            ),
+          ),
+          SizedBox(height: metrics.sectionSpacing),
+          _buildDiscoveryHostTile(context, theme),
+          SizedBox(height: metrics.inlineSpacing * 0.8),
+          Align(
+            alignment: Alignment.center,
+            child: TextButton(
+              onPressed: () =>
+                  _showPendingFeatureMessage('未发现设备时，请先使用手动输入地址连接。'),
+              child: const Text('未发现设备？'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildProbeStatePanel(BuildContext context, ThemeData theme) {
+    final metrics = _ConnectionPageMetrics.of(context);
+    return Container(
+      width: double.infinity,
+      padding: EdgeInsets.all(metrics.cardPadding * 0.78),
+      decoration: BoxDecoration(
+        color: _probeState.backgroundColor,
+        borderRadius: BorderRadius.circular(metrics.inputRadius),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                _probeState.icon,
+                color: _probeState.color,
+                size: (metrics.iconSize * 0.72).clamp(18.0, 22.0).toDouble(),
+              ),
+              SizedBox(width: metrics.inlineSpacing * 0.55),
+              Text(
+                _probeState.headline,
+                style: theme.textTheme.titleSmall?.copyWith(
+                  color: _probeState.color,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+          ),
+          SizedBox(height: metrics.inlineSpacing * 0.55),
+          Text(
+            _probeState.detail,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: const Color(0xFF475569),
+              height: 1.5,
+            ),
+          ),
+          if (_probeState.endpoint != null) ...[
+            SizedBox(height: metrics.inlineSpacing * 0.65),
+            Text(
+              '连接地址: ${_probeState.endpoint}',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: const Color(0xFF0F172A),
+              ),
+            ),
+          ],
+          if (_probeState.hostName != null) ...[
+            SizedBox(height: metrics.inlineSpacing * 0.3),
+            Text(
+              '设备名称: ${_probeState.hostName}',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: const Color(0xFF0F172A),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildManualAddressCard(BuildContext context, ThemeData theme) {
+    final metrics = _ConnectionPageMetrics.of(context);
+    return _buildSectionCard(
+      contextOverride: context,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '手动输入地址',
+            style: theme.textTheme.titleLarge?.copyWith(
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            '输入设备的 IP 地址或域名进行连接',
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: const Color(0xFF64748B),
+              height: 1.5,
+            ),
+          ),
+          SizedBox(height: metrics.sectionSpacing),
+          TextField(
+            controller: _hostController,
+            keyboardType: TextInputType.url,
+            textInputAction: TextInputAction.go,
+            decoration: InputDecoration(
+              hintText: '例如：192.168.1.10 或 mynas.example.com',
+              prefixIcon: const Icon(Icons.link_rounded),
+              filled: true,
+              fillColor: const Color(0xFFF8FAFC),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(metrics.inputRadius),
+                borderSide: const BorderSide(color: Color(0xFFE2E8F0)),
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(metrics.inputRadius),
+                borderSide: const BorderSide(color: Color(0xFFE2E8F0)),
+              ),
+            ),
+            onSubmitted: (_) {
+              if (!_isProbing) {
+                _probeHost();
+              }
+            },
+          ),
+          SizedBox(height: metrics.sectionSpacing),
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton(
+              onPressed: _isProbing ? null : _probeHost,
+              style: FilledButton.styleFrom(
+                padding: EdgeInsets.symmetric(
+                  vertical: metrics.primaryButtonVerticalPadding,
+                ),
+                backgroundColor: const Color(0xFF93C5FD),
+                foregroundColor: const Color(0xFF0F172A),
+              ),
+              child: _isProbing
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Text('连接'),
+            ),
+          ),
+          SizedBox(height: metrics.inlineSpacing * 0.6),
+          InkWell(
+            onTap: _showConnectionHelp,
+            borderRadius: BorderRadius.circular(metrics.inputRadius),
+            child: Padding(
+              padding:
+                  EdgeInsets.symmetric(vertical: metrics.badgeVerticalPadding),
+              child: Row(
+                children: [
+                  const Icon(Icons.lightbulb_outline_rounded,
+                      size: 17, color: Color(0xFF64748B)),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      '如何获取设备地址？',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: const Color(0xFF64748B),
+                      ),
+                    ),
+                  ),
+                  const Icon(Icons.chevron_right_rounded,
+                      size: 18, color: Color(0xFF94A3B8)),
                 ],
               ),
             ),
+          ),
+          SizedBox(height: metrics.sectionSpacing),
+          _buildProbeStatePanel(context, theme),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildConnectionPage(ThemeData theme) {
+    final metrics = _ConnectionPageMetrics.of(context);
+    return Scaffold(
+      backgroundColor: const Color(0xFFF1F5F9),
+      body: SafeArea(
+        child: ListView(
+          padding: EdgeInsets.fromLTRB(
+            metrics.horizontalPadding,
+            metrics.horizontalPadding,
+            metrics.horizontalPadding,
+            metrics.listBottomPadding,
+          ),
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Expanded(
+                  child: Text(
+                    '连接到你的设备',
+                    style: theme.textTheme.headlineMedium?.copyWith(
+                      fontSize: metrics.titleFontSize,
+                      fontWeight: FontWeight.w800,
+                      color: const Color(0xFF0F172A),
+                    ),
+                  ),
+                ),
+                IconButton(
+                  onPressed: _showConnectionHelp,
+                  style: IconButton.styleFrom(
+                    fixedSize: Size.square(metrics.helpButtonSize),
+                    backgroundColor: Colors.white,
+                    foregroundColor: const Color(0xFF64748B),
+                    shape: const CircleBorder(),
+                  ),
+                  icon: const Icon(Icons.help_outline_rounded),
+                ),
+              ],
+            ),
+            SizedBox(height: metrics.sectionSpacing),
+            _buildCloudAccountCard(context, theme),
+            SizedBox(height: metrics.sectionSpacing),
+            _buildScanRegisterCard(context, theme),
+            SizedBox(height: metrics.sectionSpacing),
+            _buildAutoDiscoveryCard(context, theme),
+            SizedBox(height: metrics.sectionSpacing),
+            _buildManualAddressCard(context, theme),
           ],
         ),
       ),
@@ -1949,7 +2954,10 @@ class _NasHomePageState extends State<NasHomePage> {
               color: Color(0xFFDCFCE7),
               shape: BoxShape.circle,
             ),
-            child: const Icon(Icons.cloud_done_outlined, color: Color(0xFF15803D)),
+            child: const Icon(
+              Icons.cloud_done_outlined,
+              color: Color(0xFF15803D),
+            ),
           ),
         ],
       ),
@@ -1965,12 +2973,17 @@ class _NasHomePageState extends State<NasHomePage> {
           const SizedBox(height: 16),
           Row(
             children: [
-              for (var index = 0; index < _fileCategoryShortcuts.length; index++) ...[
+              for (
+                var index = 0;
+                index < _fileCategoryShortcuts.length;
+                index++
+              ) ...[
                 if (index > 0) const SizedBox(width: 10),
                 Expanded(
                   child: _CategoryShortcutButton(
                     shortcut: _fileCategoryShortcuts[index],
-                    onTap: () => _openCategoryPage(_fileCategoryShortcuts[index]),
+                    onTap: () =>
+                        _openCategoryPage(_fileCategoryShortcuts[index]),
                   ),
                 ),
               ],
@@ -2005,7 +3018,9 @@ class _NasHomePageState extends State<NasHomePage> {
                 ),
               ),
               FilledButton.tonalIcon(
-                onPressed: _hasFileSession && !_isLoadingFiles ? () => _refreshFiles() : null,
+                onPressed: _hasFileSession && !_isLoadingFiles
+                    ? () => _refreshFiles()
+                    : null,
                 icon: const Icon(Icons.refresh),
                 label: const Text('刷新'),
               ),
@@ -2018,13 +3033,17 @@ class _NasHomePageState extends State<NasHomePage> {
             children: [
               FilledButton.tonalIcon(
                 onPressed: _canGoUp && !_isLoadingFiles
-                    ? () => _refreshFiles(path: _parentDirectoryPath(_currentDirectory))
+                    ? () => _refreshFiles(
+                        path: _parentDirectoryPath(_currentDirectory),
+                      )
                     : null,
                 icon: const Icon(Icons.arrow_upward),
                 label: const Text('上级目录'),
               ),
               FilledButton.icon(
-                onPressed: _hasFileSession && !_isUploading ? _pickAndUploadFiles : null,
+                onPressed: _hasFileSession && !_isUploading
+                    ? _pickAndUploadFiles
+                    : null,
                 icon: _isUploading
                     ? const SizedBox(
                         width: 18,
@@ -2035,7 +3054,9 @@ class _NasHomePageState extends State<NasHomePage> {
                 label: Text(_isUploading ? '上传中...' : '上传文件'),
               ),
               FilledButton.tonalIcon(
-                onPressed: _hasFileSession && !_isCreatingFolder ? _createFolder : null,
+                onPressed: _hasFileSession && !_isCreatingFolder
+                    ? _createFolder
+                    : null,
                 icon: _isCreatingFolder
                     ? const SizedBox(
                         width: 18,
@@ -2094,7 +3115,8 @@ class _NasHomePageState extends State<NasHomePage> {
                         )
                       : PopupMenuButton<EntryMenuAction>(
                           tooltip: '更多操作',
-                          onSelected: (action) => _handleEntryAction(entry, action),
+                          onSelected: (action) =>
+                              _handleEntryAction(entry, action),
                           itemBuilder: (context) => const [
                             PopupMenuItem<EntryMenuAction>(
                               value: EntryMenuAction.delete,
@@ -2129,7 +3151,12 @@ class _NasHomePageState extends State<NasHomePage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('家庭空间', style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700)),
+          Text(
+            '家庭空间',
+            style: theme.textTheme.titleLarge?.copyWith(
+              fontWeight: FontWeight.w700,
+            ),
+          ),
           const SizedBox(height: 10),
           const Text('入口先保留，但文件列表、成员和共享规则这一阶段还没接进来。'),
           const SizedBox(height: 16),
@@ -2175,12 +3202,18 @@ class _NasHomePageState extends State<NasHomePage> {
                     Expanded(
                       child: Text(
                         '进行中的任务',
-                        style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+                        style: theme.textTheme.titleLarge?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
                     ),
                     Text(
-                      _activeTransferTasks.isEmpty ? '空闲中' : '${_activeTransferTasks.length} 个进行中',
-                      style: theme.textTheme.bodySmall?.copyWith(color: const Color(0xFF64748B)),
+                      _activeTransferTasks.isEmpty
+                          ? '空闲中'
+                          : '${_activeTransferTasks.length} 个进行中',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: const Color(0xFF64748B),
+                      ),
                     ),
                   ],
                 ),
@@ -2195,7 +3228,9 @@ class _NasHomePageState extends State<NasHomePage> {
                     separatorBuilder: (_, _) => const SizedBox(height: 12),
                     itemBuilder: (context, index) {
                       final task = _activeTransferTasks[index];
-                      final actionText = task.kind == TransferTaskKind.download ? '下载中' : '上传中';
+                      final actionText = task.kind == TransferTaskKind.download
+                          ? '下载中'
+                          : '上传中';
                       final subtitle = task.entry.isDir
                           ? '目录$actionText · 已处理 ${task.processedFiles} 个文件'
                           : '文件$actionText · 正在传输';
@@ -2215,22 +3250,32 @@ class _NasHomePageState extends State<NasHomePage> {
                                 const SizedBox(width: 12),
                                 Expanded(
                                   child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
                                     children: [
                                       Text(
                                         task.entry.name,
                                         maxLines: 1,
                                         overflow: TextOverflow.ellipsis,
-                                        style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600),
+                                        style: theme.textTheme.titleMedium
+                                            ?.copyWith(
+                                              fontWeight: FontWeight.w600,
+                                            ),
                                       ),
                                       const SizedBox(height: 4),
-                                      Text(subtitle, style: theme.textTheme.bodySmall),
+                                      Text(
+                                        subtitle,
+                                        style: theme.textTheme.bodySmall,
+                                      ),
                                       const SizedBox(height: 4),
                                       Text(
                                         '目标位置: ${task.targetLocation}',
                                         maxLines: 1,
                                         overflow: TextOverflow.ellipsis,
-                                        style: theme.textTheme.bodySmall?.copyWith(color: const Color(0xFF64748B)),
+                                        style: theme.textTheme.bodySmall
+                                            ?.copyWith(
+                                              color: const Color(0xFF64748B),
+                                            ),
                                       ),
                                     ],
                                   ),
@@ -2242,7 +3287,9 @@ class _NasHomePageState extends State<NasHomePage> {
                             const SizedBox(height: 8),
                             Text(
                               '开始于 ${_formatRelativeTime(task.startedAt)}',
-                              style: theme.textTheme.bodySmall?.copyWith(color: const Color(0xFF64748B)),
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: const Color(0xFF64748B),
+                              ),
                             ),
                           ],
                         ),
@@ -2259,12 +3306,16 @@ class _NasHomePageState extends State<NasHomePage> {
               children: [
                 Text(
                   '最近',
-                  style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+                  style: theme.textTheme.titleLarge?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
                 const SizedBox(height: 8),
                 Text(
                   '这里展示当前会话里真实访问过的文件。',
-                  style: theme.textTheme.bodyMedium?.copyWith(color: const Color(0xFF64748B)),
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: const Color(0xFF64748B),
+                  ),
                 ),
                 const SizedBox(height: 14),
                 if (_recentFileVisits.isEmpty)
@@ -2307,12 +3358,16 @@ class _NasHomePageState extends State<NasHomePage> {
         children: [
           Text(
             '工具',
-            style: theme.textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w700),
+            style: theme.textTheme.headlineSmall?.copyWith(
+              fontWeight: FontWeight.w700,
+            ),
           ),
           const SizedBox(height: 8),
           Text(
             '先把独立工具入口收进来，每个工具单独进入自己的极简页面。',
-            style: theme.textTheme.bodyMedium?.copyWith(color: const Color(0xFF64748B)),
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: const Color(0xFF64748B),
+            ),
           ),
           const SizedBox(height: 18),
           _ToolLauncherButton(
@@ -2415,7 +3470,11 @@ class _NasHomePageState extends State<NasHomePage> {
                 const CircleAvatar(
                   radius: 30,
                   backgroundColor: Color(0xFFE0F2FE),
-                  child: Icon(Icons.person_outline, color: Color(0xFF0369A1), size: 28),
+                  child: Icon(
+                    Icons.person_outline,
+                    color: Color(0xFF0369A1),
+                    size: 28,
+                  ),
                 ),
                 const SizedBox(width: 16),
                 Expanded(
@@ -2424,19 +3483,25 @@ class _NasHomePageState extends State<NasHomePage> {
                     children: [
                       Text(
                         _mineDisplayName(),
-                        style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+                        style: theme.textTheme.titleLarge?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
                       const SizedBox(height: 4),
                       Text(
                         '个人空间',
-                        style: theme.textTheme.bodyMedium?.copyWith(color: const Color(0xFF64748B)),
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: const Color(0xFF64748B),
+                        ),
                       ),
                       const SizedBox(height: 6),
                       Text(
                         _baseUri?.origin ?? '未连接宿主',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: theme.textTheme.bodySmall?.copyWith(color: const Color(0xFF94A3B8)),
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: const Color(0xFF94A3B8),
+                        ),
                       ),
                     ],
                   ),
@@ -2449,12 +3514,19 @@ class _NasHomePageState extends State<NasHomePage> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('存储空间', style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700)),
+                Text(
+                  '存储空间',
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
                 const SizedBox(height: 14),
                 if (storage == null)
                   Text(
                     '暂时无法读取共享目录所在硬盘的空间信息。',
-                    style: theme.textTheme.bodyMedium?.copyWith(color: const Color(0xFF64748B)),
+                    style: theme.textTheme.bodyMedium?.copyWith(
+                      color: const Color(0xFF64748B),
+                    ),
                   )
                 else ...[
                   Row(
@@ -2487,13 +3559,17 @@ class _NasHomePageState extends State<NasHomePage> {
                       value: usedRatio,
                       minHeight: 8,
                       backgroundColor: const Color(0xFFE2E8F0),
-                      valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF3B82F6)),
+                      valueColor: const AlwaysStoppedAnimation<Color>(
+                        Color(0xFF3B82F6),
+                      ),
                     ),
                   ),
                   const SizedBox(height: 10),
                   Text(
                     '磁盘: ${storage.driveName.isEmpty ? '当前共享目录所在硬盘' : storage.driveName}',
-                    style: theme.textTheme.bodySmall?.copyWith(color: const Color(0xFF64748B)),
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: const Color(0xFF64748B),
+                    ),
                   ),
                 ],
                 const SizedBox(height: 12),
@@ -2508,7 +3584,11 @@ class _NasHomePageState extends State<NasHomePage> {
                     children: [
                       const Padding(
                         padding: EdgeInsets.only(top: 2),
-                        child: Icon(Icons.info_outline, size: 18, color: Color(0xFFB45309)),
+                        child: Icon(
+                          Icons.info_outline,
+                          size: 18,
+                          color: Color(0xFFB45309),
+                        ),
                       ),
                       const SizedBox(width: 8),
                       Expanded(
@@ -2583,10 +3663,26 @@ class _NasHomePageState extends State<NasHomePage> {
           });
         },
         destinations: const [
-          NavigationDestination(icon: Icon(Icons.home_outlined), selectedIcon: Icon(Icons.home), label: '首页'),
-          NavigationDestination(icon: Icon(Icons.access_time_outlined), selectedIcon: Icon(Icons.access_time_filled), label: '最近'),
-          NavigationDestination(icon: Icon(Icons.grid_view_outlined), selectedIcon: Icon(Icons.grid_view_rounded), label: '工具'),
-          NavigationDestination(icon: Icon(Icons.person_outline), selectedIcon: Icon(Icons.person), label: '我的'),
+          NavigationDestination(
+            icon: Icon(Icons.home_outlined),
+            selectedIcon: Icon(Icons.home),
+            label: '首页',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.access_time_outlined),
+            selectedIcon: Icon(Icons.access_time_filled),
+            label: '最近',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.grid_view_outlined),
+            selectedIcon: Icon(Icons.grid_view_rounded),
+            label: '工具',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.person_outline),
+            selectedIcon: Icon(Icons.person),
+            label: '我的',
+          ),
         ],
       ),
     );
@@ -2598,7 +3694,9 @@ class _NasHomePageState extends State<NasHomePage> {
       return '';
     }
 
-    return singleLine.length <= 120 ? singleLine : '${singleLine.substring(0, 120)}...';
+    return singleLine.length <= 120
+        ? singleLine
+        : '${singleLine.substring(0, 120)}...';
   }
 
   @override
@@ -2613,10 +3711,7 @@ class _NasHomePageState extends State<NasHomePage> {
 }
 
 class _CategoryShortcutButton extends StatelessWidget {
-  const _CategoryShortcutButton({
-    required this.shortcut,
-    required this.onTap,
-  });
+  const _CategoryShortcutButton({required this.shortcut, required this.onTap});
 
   final FileCategoryShortcut shortcut;
   final VoidCallback onTap;
@@ -2739,12 +3834,16 @@ class _StorageMetric extends StatelessWidget {
       children: [
         Text(
           label,
-          style: Theme.of(context).textTheme.bodySmall?.copyWith(color: const Color(0xFF64748B)),
+          style: Theme.of(
+            context,
+          ).textTheme.bodySmall?.copyWith(color: const Color(0xFF64748B)),
         ),
         const SizedBox(height: 6),
         Text(
           value,
-          style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+          style: Theme.of(
+            context,
+          ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
         ),
       ],
     );
@@ -2775,11 +3874,7 @@ class _MineOptionTile extends StatelessWidget {
       title: Text(title),
       subtitle: trailingText == null
           ? null
-          : Text(
-              trailingText!,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
+          : Text(trailingText!, maxLines: 1, overflow: TextOverflow.ellipsis),
       trailing: const Icon(Icons.chevron_right),
       onTap: onTap,
     );
@@ -2854,7 +3949,10 @@ class _NotesToolPageState extends State<NotesToolPage> {
     }
   }
 
-  Future<void> _persistNotes(List<LocalNote> nextNotes, {required List<LocalNote> previousNotes}) async {
+  Future<void> _persistNotes(
+    List<LocalNote> nextNotes, {
+    required List<LocalNote> previousNotes,
+  }) async {
     setState(() {
       _isSaving = true;
       _loadError = null;
@@ -2871,9 +3969,9 @@ class _NotesToolPageState extends State<NotesToolPage> {
       setState(() {
         _notes = previousNotes;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error.message)),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message)));
     } finally {
       if (mounted) {
         setState(() {
@@ -2885,7 +3983,9 @@ class _NotesToolPageState extends State<NotesToolPage> {
 
   Future<void> _editNote([LocalNote? existing]) async {
     final titleController = TextEditingController(text: existing?.title ?? '');
-    final contentController = TextEditingController(text: existing?.content ?? '');
+    final contentController = TextEditingController(
+      text: existing?.content ?? '',
+    );
 
     final result = await showDialog<LocalNote>(
       context: context,
@@ -2929,11 +4029,13 @@ class _NotesToolPageState extends State<NotesToolPage> {
               final derivedTitle = rawTitle.isNotEmpty
                   ? rawTitle
                   : rawContent.isNotEmpty
-                      ? rawContent.split('\n').first.trim()
-                      : '未命名笔记';
+                  ? rawContent.split('\n').first.trim()
+                  : '未命名笔记';
               Navigator.of(dialogContext).pop(
                 LocalNote(
-                  id: existing?.id ?? DateTime.now().microsecondsSinceEpoch.toString(),
+                  id:
+                      existing?.id ??
+                      DateTime.now().microsecondsSinceEpoch.toString(),
                   title: derivedTitle,
                   content: rawContent,
                   updatedAt: DateTime.now(),
@@ -2954,20 +4056,23 @@ class _NotesToolPageState extends State<NotesToolPage> {
     }
 
     final previousNotes = List<LocalNote>.from(_notes);
-    final nextNotes = [
-      result,
-      ..._notes.where((note) => note.id != result.id),
-    ]..sort(_compareNotes);
+    final nextNotes = [result, ..._notes.where((note) => note.id != result.id)]
+      ..sort(_compareNotes);
 
     setState(() {
       _notes = nextNotes;
     });
-    await _persistNotes(List<LocalNote>.from(nextNotes), previousNotes: previousNotes);
+    await _persistNotes(
+      List<LocalNote>.from(nextNotes),
+      previousNotes: previousNotes,
+    );
   }
 
   Future<void> _deleteNote(LocalNote note) async {
     final previousNotes = List<LocalNote>.from(_notes);
-    final nextNotes = _notes.where((item) => item.id != note.id).toList(growable: false);
+    final nextNotes = _notes
+        .where((item) => item.id != note.id)
+        .toList(growable: false);
 
     setState(() {
       _notes = nextNotes;
@@ -2992,43 +4097,55 @@ class _NotesToolPageState extends State<NotesToolPage> {
         child: _isLoading
             ? const Center(child: CircularProgressIndicator())
             : _loadError != null
-                ? Center(
-                    child: Padding(
-                      padding: const EdgeInsets.all(24),
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          const Icon(Icons.cloud_off_outlined, size: 48, color: Color(0xFF94A3B8)),
-                          const SizedBox(height: 14),
-                          Text(
-                            _loadError!,
-                            textAlign: TextAlign.center,
-                            style: Theme.of(context).textTheme.bodyLarge,
-                          ),
-                          const SizedBox(height: 14),
-                          FilledButton.tonal(
-                            onPressed: _loadNotes,
-                            child: const Text('重试'),
-                          ),
-                        ],
+            ? Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Icon(
+                        Icons.cloud_off_outlined,
+                        size: 48,
+                        color: Color(0xFF94A3B8),
                       ),
-                    ),
-                  )
+                      const SizedBox(height: 14),
+                      Text(
+                        _loadError!,
+                        textAlign: TextAlign.center,
+                        style: Theme.of(context).textTheme.bodyLarge,
+                      ),
+                      const SizedBox(height: 14),
+                      FilledButton.tonal(
+                        onPressed: _loadNotes,
+                        child: const Text('重试'),
+                      ),
+                    ],
+                  ),
+                ),
+              )
             : _notes.isEmpty
             ? Center(
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    const Icon(Icons.note_alt_outlined, size: 48, color: Color(0xFF94A3B8)),
+                    const Icon(
+                      Icons.note_alt_outlined,
+                      size: 48,
+                      color: Color(0xFF94A3B8),
+                    ),
                     const SizedBox(height: 14),
                     Text(
                       '还没有笔记',
-                      style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+                      style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
                     const SizedBox(height: 8),
                     Text(
                       '云端笔记保存在根目录的 /.note 文件夹下，点右上角加号先记下一条。',
-                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: const Color(0xFF64748B)),
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                        color: const Color(0xFF64748B),
+                      ),
                       textAlign: TextAlign.center,
                     ),
                   ],
@@ -3051,7 +4168,10 @@ class _NotesToolPageState extends State<NotesToolPage> {
                         child: Row(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            const Icon(Icons.sticky_note_2_outlined, color: Color(0xFF0F766E)),
+                            const Icon(
+                              Icons.sticky_note_2_outlined,
+                              color: Color(0xFF0F766E),
+                            ),
                             const SizedBox(width: 14),
                             Expanded(
                               child: Column(
@@ -3061,28 +4181,39 @@ class _NotesToolPageState extends State<NotesToolPage> {
                                     note.title,
                                     maxLines: 1,
                                     overflow: TextOverflow.ellipsis,
-                                    style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .titleMedium
+                                        ?.copyWith(fontWeight: FontWeight.w700),
                                   ),
                                   const SizedBox(height: 6),
                                   Text(
                                     note.preview,
                                     maxLines: 2,
                                     overflow: TextOverflow.ellipsis,
-                                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                                      color: const Color(0xFF475569),
-                                      height: 1.4,
-                                    ),
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .bodyMedium
+                                        ?.copyWith(
+                                          color: const Color(0xFF475569),
+                                          height: 1.4,
+                                        ),
                                   ),
                                   const SizedBox(height: 10),
                                   Text(
                                     _formatRelativeTime(note.updatedAt),
-                                    style: Theme.of(context).textTheme.bodySmall?.copyWith(color: const Color(0xFF94A3B8)),
+                                    style: Theme.of(context).textTheme.bodySmall
+                                        ?.copyWith(
+                                          color: const Color(0xFF94A3B8),
+                                        ),
                                   ),
                                 ],
                               ),
                             ),
                             IconButton(
-                              onPressed: _isSaving ? null : () => _deleteNote(note),
+                              onPressed: _isSaving
+                                  ? null
+                                  : () => _deleteNote(note),
                               icon: const Icon(Icons.delete_outline),
                               tooltip: '删除笔记',
                             ),
@@ -3134,17 +4265,26 @@ class RecycleBinToolPage extends StatelessWidget {
             child: Column(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                const Icon(Icons.delete_outline, size: 52, color: Color(0xFFB91C1C)),
+                const Icon(
+                  Icons.delete_outline,
+                  size: 52,
+                  color: Color(0xFFB91C1C),
+                ),
                 const SizedBox(height: 16),
                 Text(
                   '当前还没有接入回收站',
-                  style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+                  style: Theme.of(
+                    context,
+                  ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
                   textAlign: TextAlign.center,
                 ),
                 const SizedBox(height: 10),
                 Text(
                   '现在的删除操作会直接调用 FileBrowser 的删除接口，不会先进入回收站。后续如果改成软删除，这里会显示可恢复的项目。',
-                  style: Theme.of(context).textTheme.bodyLarge?.copyWith(color: const Color(0xFF475569), height: 1.5),
+                  style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                    color: const Color(0xFF475569),
+                    height: 1.5,
+                  ),
                   textAlign: TextAlign.center,
                 ),
               ],
@@ -3186,7 +4326,8 @@ class AccountSecurityPage extends StatelessWidget {
                 '显示名称: $displayName',
                 '宿主名称: $hostName',
                 '连接地址: $connectionAddress',
-                if (sharedRoot != null && sharedRoot!.isNotEmpty) '共享目录: $sharedRoot',
+                if (sharedRoot != null && sharedRoot!.isNotEmpty)
+                  '共享目录: $sharedRoot',
               ],
             ),
             const SizedBox(height: 16),
@@ -3217,7 +4358,8 @@ class NotificationSettingsPage extends StatefulWidget {
   const NotificationSettingsPage({super.key});
 
   @override
-  State<NotificationSettingsPage> createState() => _NotificationSettingsPageState();
+  State<NotificationSettingsPage> createState() =>
+      _NotificationSettingsPageState();
 }
 
 class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
@@ -3239,14 +4381,16 @@ class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
                 children: [
                   SwitchListTile(
                     value: _taskNotifications,
-                    onChanged: (value) => setState(() => _taskNotifications = value),
+                    onChanged: (value) =>
+                        setState(() => _taskNotifications = value),
                     title: const Text('任务完成提醒'),
                     subtitle: const Text('上传、下载结束后在应用内提醒。'),
                   ),
                   const Divider(height: 1),
                   SwitchListTile(
                     value: _connectionNotifications,
-                    onChanged: (value) => setState(() => _connectionNotifications = value),
+                    onChanged: (value) =>
+                        setState(() => _connectionNotifications = value),
                     title: const Text('连接异常提醒'),
                     subtitle: const Text('宿主无法访问时给出明显提示。'),
                   ),
@@ -3256,7 +4400,9 @@ class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
             const SizedBox(height: 12),
             Text(
               '这些设置当前只在本次运行中生效，后续再接持久化。',
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(color: const Color(0xFF64748B)),
+              style: Theme.of(
+                context,
+              ).textTheme.bodySmall?.copyWith(color: const Color(0xFF64748B)),
             ),
           ],
         ),
@@ -3290,7 +4436,8 @@ class ContactDeveloperPage extends StatelessWidget {
                     children: [
                       Text(
                         '邮箱地址',
-                        style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+                        style: Theme.of(context).textTheme.titleMedium
+                            ?.copyWith(fontWeight: FontWeight.w700),
                       ),
                       const SizedBox(height: 10),
                       SelectableText(
@@ -3321,10 +4468,7 @@ class ContactDeveloperPage extends StatelessWidget {
 }
 
 class _PlainInfoCard extends StatelessWidget {
-  const _PlainInfoCard({
-    required this.title,
-    required this.lines,
-  });
+  const _PlainInfoCard({required this.title, required this.lines});
 
   final String title;
   final List<String> lines;
@@ -3341,14 +4485,19 @@ class _PlainInfoCard extends StatelessWidget {
           children: [
             Text(
               title,
-              style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+              style: Theme.of(
+                context,
+              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
             ),
             const SizedBox(height: 12),
             for (var index = 0; index < lines.length; index++) ...[
               if (index > 0) const SizedBox(height: 8),
               Text(
                 lines[index],
-                style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: const Color(0xFF475569), height: 1.5),
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  color: const Color(0xFF475569),
+                  height: 1.5,
+                ),
               ),
             ],
           ],
@@ -3378,7 +4527,8 @@ class CategoryEntriesPage extends StatefulWidget {
   final Widget Function(FileBrowserEntry entry) buildLeading;
   final String Function(FileBrowserEntry entry) buildSubtitle;
   final Future<void> Function(FileBrowserEntry entry) onOpenEntry;
-  final Future<void> Function(FileBrowserEntry entry, EntryMenuAction action) onHandleEntryAction;
+  final Future<void> Function(FileBrowserEntry entry, EntryMenuAction action)
+  onHandleEntryAction;
 
   @override
   State<CategoryEntriesPage> createState() => _CategoryEntriesPageState();
@@ -3431,7 +4581,10 @@ class _CategoryEntriesPageState extends State<CategoryEntriesPage> {
     }
   }
 
-  Future<void> _runEntryAction(FileBrowserEntry entry, EntryMenuAction action) async {
+  Future<void> _runEntryAction(
+    FileBrowserEntry entry,
+    EntryMenuAction action,
+  ) async {
     setState(() {
       _busyEntryPath = entry.path;
     });
@@ -3466,7 +4619,9 @@ class _CategoryEntriesPageState extends State<CategoryEntriesPage> {
                 Expanded(
                   child: Text(
                     '范围: ${widget.scopeLabel}',
-                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: const Color(0xFF475569)),
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      color: const Color(0xFF475569),
+                    ),
                   ),
                 ),
                 FilledButton.tonalIcon(
@@ -3525,7 +4680,10 @@ class _CategoryEntriesPageState extends State<CategoryEntriesPage> {
               )
             else
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 18,
+                  vertical: 8,
+                ),
                 decoration: BoxDecoration(
                   color: Colors.white,
                   borderRadius: BorderRadius.circular(24),
@@ -3543,7 +4701,9 @@ class _CategoryEntriesPageState extends State<CategoryEntriesPage> {
                       contentPadding: EdgeInsets.zero,
                       leading: widget.buildLeading(entry),
                       title: Text(entry.name),
-                      subtitle: Text('${widget.buildSubtitle(entry)}\n位置: ${_parentDirectoryPath(entry.path)}'),
+                      subtitle: Text(
+                        '${widget.buildSubtitle(entry)}\n位置: ${_parentDirectoryPath(entry.path)}',
+                      ),
                       onTap: () => _runOpenEntry(entry),
                       trailing: isBusy
                           ? const SizedBox(
@@ -3553,7 +4713,8 @@ class _CategoryEntriesPageState extends State<CategoryEntriesPage> {
                             )
                           : PopupMenuButton<EntryMenuAction>(
                               tooltip: '更多操作',
-                              onSelected: (action) => _runEntryAction(entry, action),
+                              onSelected: (action) =>
+                                  _runEntryAction(entry, action),
                               itemBuilder: (context) => const [
                                 PopupMenuItem<EntryMenuAction>(
                                   value: EntryMenuAction.delete,
@@ -3590,48 +4751,204 @@ class ProbeState {
     required this.headline,
     required this.detail,
     required this.color,
+    required this.backgroundColor,
+    required this.icon,
     this.endpoint,
     this.hostName,
   });
 
   const ProbeState.idle()
-      : this._(
-          headline: '尚未探测',
-          detail: '输入宿主地址后点击“连接并加载文件”，先确认手机和 NAS 宿主之间的基础联通。',
-          color: const Color(0xFF475569),
-        );
+    : this._(
+        headline: '尚未探测',
+        detail: '输入设备地址后点击“连接”，应用会固定使用 5034 端口请求宿主。',
+        color: const Color(0xFF475569),
+        backgroundColor: const Color(0xFFF8FAFC),
+        icon: Icons.info_outline_rounded,
+      );
 
   const ProbeState.loading()
-      : this._(
-          headline: '正在连接',
-          detail: '正在请求 /api/system/status，并登录 FileBrowser ...',
-          color: const Color(0xFF0F766E),
-        );
+    : this._(
+        headline: '正在连接',
+        detail: '正在请求 5034 端口的 /api/system/status，并登录 FileBrowser ...',
+        color: const Color(0xFF0F766E),
+        backgroundColor: const Color(0xFFECFEFF),
+        icon: Icons.sync_rounded,
+      );
 
   const ProbeState.error(String message)
-      : this._(
-          headline: '连接失败',
-          detail: message,
-          color: const Color(0xFFB42318),
-        );
+    : this._(
+        headline: '连接失败',
+        detail: message,
+        color: const Color(0xFFB42318),
+        backgroundColor: const Color(0xFFFEF2F2),
+        icon: Icons.error_outline_rounded,
+      );
 
   const ProbeState.success({
     required String endpoint,
     required String hostName,
     required String detail,
   }) : this._(
-          headline: '宿主在线',
-          detail: detail,
-          color: const Color(0xFF0F766E),
-          endpoint: endpoint,
-          hostName: hostName,
-        );
+         headline: '宿主在线',
+         detail: detail,
+         color: const Color(0xFF0F766E),
+         backgroundColor: const Color(0xFFECFDF5),
+         icon: Icons.check_circle_outline_rounded,
+         endpoint: endpoint,
+         hostName: hostName,
+       );
 
   final String headline;
   final String detail;
   final Color color;
+  final Color backgroundColor;
+  final IconData icon;
   final String? endpoint;
   final String? hostName;
+}
+
+class _ConnectionPageMetrics {
+  const _ConnectionPageMetrics({
+    required this.screenWidth,
+    required this.horizontalPadding,
+    required this.listBottomPadding,
+    required this.cardPadding,
+    required this.cardRadius,
+    required this.sectionSpacing,
+    required this.titleFontSize,
+    required this.iconBoxSize,
+    required this.iconBoxRadius,
+    required this.iconSize,
+    required this.inlineSpacing,
+    required this.badgeHorizontalPadding,
+    required this.badgeVerticalPadding,
+    required this.badgeRadius,
+    required this.inputRadius,
+    required this.primaryButtonVerticalPadding,
+    required this.helpButtonSize,
+  });
+
+  factory _ConnectionPageMetrics.of(BuildContext context) {
+    final screenWidth = MediaQuery.sizeOf(context).width;
+    final isNarrow = screenWidth < 400;
+    final horizontalPadding = isNarrow ? 14.0
+        : (screenWidth * 0.053).clamp(16.0, 24.0).toDouble();
+    final sectionWidth = screenWidth - (horizontalPadding * 2);
+    final cardPadding = isNarrow
+        ? (sectionWidth * 0.042).clamp(13.0, 16.0).toDouble()
+        : (sectionWidth * 0.055).clamp(16.0, 22.0).toDouble();
+    final iconBoxSize = isNarrow
+        ? (sectionWidth * 0.13).clamp(42.0, 50.0).toDouble()
+        : (sectionWidth * 0.17).clamp(50.0, 60.0).toDouble();
+    final badgeHorizontalPadding = isNarrow
+        ? (sectionWidth * 0.026).clamp(7.0, 10.0).toDouble()
+        : (sectionWidth * 0.034).clamp(10.0, 14.0).toDouble();
+    final badgeVerticalPadding = isNarrow
+        ? (sectionWidth * 0.018).clamp(5.0, 8.0).toDouble()
+        : (sectionWidth * 0.028).clamp(8.0, 10.0).toDouble();
+
+    return _ConnectionPageMetrics(
+      screenWidth: screenWidth,
+      horizontalPadding: horizontalPadding,
+      listBottomPadding: (screenWidth * 0.06).clamp(20.0, 32.0).toDouble(),
+      cardPadding: cardPadding,
+      cardRadius: isNarrow
+          ? (sectionWidth * 0.065).clamp(18.0, 24.0).toDouble()
+          : (sectionWidth * 0.08).clamp(24.0, 30.0).toDouble(),
+      sectionSpacing: isNarrow
+          ? (cardPadding * 0.8).clamp(10.0, 14.0).toDouble()
+          : (cardPadding * 0.9).clamp(14.0, 20.0).toDouble(),
+      titleFontSize: isNarrow
+          ? (screenWidth * 0.072).clamp(24.0, 30.0).toDouble()
+          : (screenWidth * 0.088).clamp(30.0, 40.0).toDouble(),
+      iconBoxSize: iconBoxSize,
+      iconBoxRadius: (iconBoxSize * 0.32).clamp(13.0, 20.0).toDouble(),
+      iconSize: (iconBoxSize * 0.48).clamp(20.0, 30.0).toDouble(),
+      inlineSpacing: isNarrow
+          ? (sectionWidth * 0.032).clamp(10.0, 13.0).toDouble()
+          : (sectionWidth * 0.04).clamp(12.0, 16.0).toDouble(),
+      badgeHorizontalPadding: badgeHorizontalPadding,
+      badgeVerticalPadding: badgeVerticalPadding,
+      badgeRadius: isNarrow
+          ? (sectionWidth * 0.04).clamp(10.0, 14.0).toDouble()
+          : (sectionWidth * 0.05).clamp(14.0, 18.0).toDouble(),
+      inputRadius: isNarrow
+          ? (sectionWidth * 0.044).clamp(12.0, 16.0).toDouble()
+          : (sectionWidth * 0.055).clamp(16.0, 20.0).toDouble(),
+      primaryButtonVerticalPadding: isNarrow
+          ? (sectionWidth * 0.038).clamp(10.0, 14.0).toDouble()
+          : (sectionWidth * 0.05).clamp(14.0, 18.0).toDouble(),
+      helpButtonSize: (screenWidth * 0.11).clamp(40.0, 52.0).toDouble(),
+    );
+  }
+
+  final double screenWidth;
+  final double horizontalPadding;
+  final double listBottomPadding;
+  final double cardPadding;
+  final double cardRadius;
+  final double sectionSpacing;
+  final double titleFontSize;
+  final double iconBoxSize;
+  final double iconBoxRadius;
+  final double iconSize;
+  final double inlineSpacing;
+  final double badgeHorizontalPadding;
+  final double badgeVerticalPadding;
+  final double badgeRadius;
+  final double inputRadius;
+  final double primaryButtonVerticalPadding;
+  final double helpButtonSize;
+
+  double illustrationWidthFor(double maxWidth) {
+    final ratio = maxWidth < 430 ? 0.48 : 0.34;
+    return (maxWidth * ratio).clamp(132.0, 176.0).toDouble();
+  }
+
+  double illustrationHeightFor(double maxWidth) {
+    return illustrationWidthFor(maxWidth) * 0.72;
+  }
+}
+
+class CloudSession {
+  const CloudSession({
+    required this.accessToken,
+    required this.user,
+    this.expiresAt,
+  });
+
+  final String accessToken;
+  final CloudUser user;
+  final DateTime? expiresAt;
+}
+
+class CloudUser {
+  const CloudUser({
+    required this.username,
+    this.deviceId,
+    this.deviceName,
+    this.ipv6Address,
+    this.isActive = true,
+    this.updatedAt,
+  });
+
+  factory CloudUser.fromJson(Map<String, dynamic> json) {
+    return CloudUser(
+      username: json['username']?.toString() ?? '未命名账号',
+      deviceId: json['deviceId']?.toString(),
+      deviceName: json['deviceName']?.toString(),
+      ipv6Address: json['ipv6Address']?.toString(),
+      isActive: json['isActive'] is bool ? json['isActive'] as bool : true,
+      updatedAt: DateTime.tryParse(json['updatedAt']?.toString() ?? ''),
+    );
+  }
+
+  final String username;
+  final String? deviceId;
+  final String? deviceName;
+  final String? ipv6Address;
+  final bool isActive;
+  final DateTime? updatedAt;
 }
 
 class NasHostStatus {
@@ -3648,22 +4965,26 @@ class NasHostStatus {
     final fileBrowserMap = fileBrowser is Map<String, dynamic>
         ? fileBrowser
         : fileBrowser is Map
-            ? Map<String, dynamic>.from(fileBrowser)
-            : const <String, dynamic>{};
+        ? Map<String, dynamic>.from(fileBrowser)
+        : const <String, dynamic>{};
     final running = fileBrowserMap['running'] ?? json['fileBrowserRunning'];
     final storageJson = json['storage'];
     final storageMap = storageJson is Map<String, dynamic>
         ? storageJson
         : storageJson is Map
-            ? Map<String, dynamic>.from(storageJson)
-            : null;
+        ? Map<String, dynamic>.from(storageJson)
+        : null;
 
     return NasHostStatus(
       hostName: json['name']?.toString() ?? 'loal_NAS 宿主',
       fileBrowserRunning: running is bool ? running : null,
-      fileBrowserBaseUrl: (fileBrowserMap['baseUrl'] ?? json['fileBrowserBaseUrl'])?.toString(),
-      sharedRoot: (fileBrowserMap['sharedRoot'] ?? json['sharedRootPath'])?.toString(),
-      storage: storageMap == null ? null : HostStorageSummary.fromJson(storageMap),
+      fileBrowserBaseUrl:
+          (fileBrowserMap['baseUrl'] ?? json['fileBrowserBaseUrl'])?.toString(),
+      sharedRoot: (fileBrowserMap['sharedRoot'] ?? json['sharedRootPath'])
+          ?.toString(),
+      storage: storageMap == null
+          ? null
+          : HostStorageSummary.fromJson(storageMap),
     );
   }
 
@@ -3716,10 +5037,13 @@ class FileBrowserDirectory {
     final rawItems = json['items'];
     final items = rawItems is List
         ? rawItems
-            .whereType<Map>()
-            .map((item) => FileBrowserEntry.fromJson(Map<String, dynamic>.from(item)))
-        .where((entry) => !(entry.isDir && entry.name.startsWith('.')))
-            .toList()
+              .whereType<Map>()
+              .map(
+                (item) =>
+                    FileBrowserEntry.fromJson(Map<String, dynamic>.from(item)),
+              )
+              .where((entry) => !(entry.isDir && entry.name.startsWith('.')))
+              .toList()
         : <FileBrowserEntry>[];
 
     items.sort((left, right) {
@@ -3755,7 +5079,10 @@ class FileBrowserEntry {
 
     return FileBrowserEntry(
       name: json['name']?.toString() ?? '(unnamed)',
-      path: _normalizeResourcePath(json['path']?.toString() ?? '', isDirectory: isDir),
+      path: _normalizeResourcePath(
+        json['path']?.toString() ?? '',
+        isDirectory: isDir,
+      ),
       isDir: isDir,
       size: size,
     );
@@ -3809,7 +5136,9 @@ class ImagePreviewPage extends StatelessWidget {
                   const SizedBox(height: 16),
                   Text(
                     '正在加载图片...',
-                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: Colors.white),
+                    style: Theme.of(
+                      context,
+                    ).textTheme.bodyMedium?.copyWith(color: Colors.white),
                   ),
                 ],
               );
@@ -3820,11 +5149,17 @@ class ImagePreviewPage extends StatelessWidget {
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    const Icon(Icons.broken_image_outlined, size: 64, color: Colors.white70),
+                    const Icon(
+                      Icons.broken_image_outlined,
+                      size: 64,
+                      color: Colors.white70,
+                    ),
                     const SizedBox(height: 16),
                     Text(
                       '图片预览失败，请稍后重试。',
-                      style: Theme.of(context).textTheme.titleMedium?.copyWith(color: Colors.white),
+                      style: Theme.of(
+                        context,
+                      ).textTheme.titleMedium?.copyWith(color: Colors.white),
                       textAlign: TextAlign.center,
                     ),
                   ],
@@ -3941,8 +5276,13 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
   }
 
   Future<Duration?> _loadWindowsAudioFromTempFile() async {
-    final tempDirectory = await Directory.systemTemp.createTemp('nas_phone_audio_');
-    final localFilePath = _joinLocalPath(tempDirectory.path, _safeLocalFileName(widget.title));
+    final tempDirectory = await Directory.systemTemp.createTemp(
+      'nas_phone_audio_',
+    );
+    final localFilePath = _joinLocalPath(
+      tempDirectory.path,
+      _safeLocalFileName(widget.title),
+    );
     final localFile = File(localFilePath);
 
     await _downloadAudioToLocalFile(localFile);
@@ -3957,20 +5297,31 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
   }
 
   Future<void> _downloadAudioToLocalFile(File localFile) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 15);
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 15);
 
     try {
-      final request = await client.getUrl(widget.audioUri).timeout(const Duration(seconds: 15));
+      final request = await client
+          .getUrl(widget.audioUri)
+          .timeout(const Duration(seconds: 15));
       request.headers.set('X-Auth', widget.authToken);
 
-      final response = await request.close().timeout(const Duration(seconds: 30));
+      final response = await request.close().timeout(
+        const Duration(seconds: 30),
+      );
       if (response.statusCode < 200 || response.statusCode >= 300) {
-        final body = await utf8.decodeStream(response).timeout(const Duration(seconds: 30));
-        throw NasApiException('音频下载失败：${response.statusCode}。${_compactAudioErrorBody(body)}');
+        final body = await utf8
+            .decodeStream(response)
+            .timeout(const Duration(seconds: 30));
+        throw NasApiException(
+          '音频下载失败：${response.statusCode}。${_compactAudioErrorBody(body)}',
+        );
       }
 
       await localFile.parent.create(recursive: true);
-      await response.pipe(localFile.openWrite()).timeout(const Duration(seconds: 2 * 60));
+      await response
+          .pipe(localFile.openWrite())
+          .timeout(const Duration(seconds: 2 * 60));
     } on TimeoutException {
       throw const NasApiException('音频下载超时，请稍后重试。');
     } on SocketException catch (error) {
@@ -4052,10 +5403,15 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
     final totalMs = _duration.inMilliseconds.toDouble();
     final hasKnownDuration = totalMs > 0;
     final sliderMax = hasKnownDuration ? totalMs : 1.0;
-    final displayedPositionMs = _dragValueMs ?? _position.inMilliseconds.toDouble();
-    final sliderValue = hasKnownDuration ? displayedPositionMs.clamp(0.0, sliderMax) : 0.0;
+    final displayedPositionMs =
+        _dragValueMs ?? _position.inMilliseconds.toDouble();
+    final sliderValue = hasKnownDuration
+        ? displayedPositionMs.clamp(0.0, sliderMax)
+        : 0.0;
     final canSeek = !_isPreparing && _error == null && hasKnownDuration;
-    final effectivePosition = Duration(milliseconds: displayedPositionMs.round());
+    final effectivePosition = Duration(
+      milliseconds: displayedPositionMs.round(),
+    );
 
     return Scaffold(
       appBar: AppBar(title: Text(widget.title)),
@@ -4085,14 +5441,21 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
                       Text(
                         widget.title,
                         textAlign: TextAlign.center,
-                        style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+                        style: theme.textTheme.titleLarge?.copyWith(
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
                       const SizedBox(height: 8),
                       Text(
-                        _error ?? (_isPlaying ? '正在播放' : (_isPreparing ? '正在加载音频...' : '已暂停')),
+                        _error ??
+                            (_isPlaying
+                                ? '正在播放'
+                                : (_isPreparing ? '正在加载音频...' : '已暂停')),
                         textAlign: TextAlign.center,
                         style: theme.textTheme.bodyMedium?.copyWith(
-                          color: _error == null ? const Color(0xFF475569) : const Color(0xFFB42318),
+                          color: _error == null
+                              ? const Color(0xFF475569)
+                              : const Color(0xFFB42318),
                         ),
                       ),
                       const SizedBox(height: 20),
@@ -4113,15 +5476,25 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
                           Text(_formatMediaDuration(effectivePosition)),
-                          Text(hasKnownDuration ? _formatMediaDuration(_duration) : '--:--'),
+                          Text(
+                            hasKnownDuration
+                                ? _formatMediaDuration(_duration)
+                                : '--:--',
+                          ),
                         ],
                       ),
                       const SizedBox(height: 20),
                       Center(
                         child: IconButton.filledTonal(
-                          onPressed: _error == null && !_isPreparing ? _togglePlayback : null,
+                          onPressed: _error == null && !_isPreparing
+                              ? _togglePlayback
+                              : null,
                           iconSize: 34,
-                          icon: Icon(_isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded),
+                          icon: Icon(
+                            _isPlaying
+                                ? Icons.pause_rounded
+                                : Icons.play_arrow_rounded,
+                          ),
                         ),
                       ),
                     ],
@@ -4147,10 +5520,12 @@ class RemoteDirectoryPickerDialog extends StatefulWidget {
   final Future<FileBrowserDirectory> Function(String path) fetchDirectory;
 
   @override
-  State<RemoteDirectoryPickerDialog> createState() => _RemoteDirectoryPickerDialogState();
+  State<RemoteDirectoryPickerDialog> createState() =>
+      _RemoteDirectoryPickerDialogState();
 }
 
-class _RemoteDirectoryPickerDialogState extends State<RemoteDirectoryPickerDialog> {
+class _RemoteDirectoryPickerDialogState
+    extends State<RemoteDirectoryPickerDialog> {
   late String _currentDirectory;
   List<FileBrowserEntry> _directories = const [];
   bool _isLoading = true;
@@ -4215,12 +5590,16 @@ class _RemoteDirectoryPickerDialogState extends State<RemoteDirectoryPickerDialo
                 FilledButton.tonalIcon(
                   onPressed: _isLoading || _currentDirectory == '/'
                       ? null
-                      : () => _loadDirectory(_parentDirectoryPath(_currentDirectory)),
+                      : () => _loadDirectory(
+                          _parentDirectoryPath(_currentDirectory),
+                        ),
                   icon: const Icon(Icons.arrow_upward),
                   label: const Text('上级目录'),
                 ),
                 FilledButton.tonalIcon(
-                  onPressed: _isLoading ? null : () => _loadDirectory(_currentDirectory),
+                  onPressed: _isLoading
+                      ? null
+                      : () => _loadDirectory(_currentDirectory),
                   icon: const Icon(Icons.refresh),
                   label: const Text('刷新'),
                 ),
@@ -4232,45 +5611,45 @@ class _RemoteDirectoryPickerDialogState extends State<RemoteDirectoryPickerDialo
               child: _isLoading
                   ? const Center(child: CircularProgressIndicator())
                   : _error != null
-                      ? Center(
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              Text(
-                                _error!,
-                                textAlign: TextAlign.center,
-                                style: const TextStyle(color: Color(0xFFB42318)),
-                              ),
-                              const SizedBox(height: 12),
-                              FilledButton.tonal(
-                                onPressed: () => _loadDirectory(_currentDirectory),
-                                child: const Text('重试'),
-                              ),
-                            ],
+                  ? Center(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Text(
+                            _error!,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(color: Color(0xFFB42318)),
                           ),
-                        )
-                      : _directories.isEmpty
-                          ? const Center(child: Text('这个目录下没有子目录。'))
-                          : ListView.separated(
-                              itemCount: _directories.length,
-                              separatorBuilder: (_, _) => const Divider(height: 1),
-                              itemBuilder: (context, index) {
-                                final directory = _directories[index];
-                                return ListTile(
-                                  contentPadding: EdgeInsets.zero,
-                                  leading: const CircleAvatar(
-                                    backgroundColor: Color(0xFFD1FAE5),
-                                    child: Icon(
-                                      Icons.folder_outlined,
-                                      color: Color(0xFF0F766E),
-                                    ),
-                                  ),
-                                  title: Text(directory.name),
-                                  trailing: const Icon(Icons.chevron_right),
-                                  onTap: () => _loadDirectory(directory.path),
-                                );
-                              },
+                          const SizedBox(height: 12),
+                          FilledButton.tonal(
+                            onPressed: () => _loadDirectory(_currentDirectory),
+                            child: const Text('重试'),
+                          ),
+                        ],
+                      ),
+                    )
+                  : _directories.isEmpty
+                  ? const Center(child: Text('这个目录下没有子目录。'))
+                  : ListView.separated(
+                      itemCount: _directories.length,
+                      separatorBuilder: (_, _) => const Divider(height: 1),
+                      itemBuilder: (context, index) {
+                        final directory = _directories[index];
+                        return ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: const CircleAvatar(
+                            backgroundColor: Color(0xFFD1FAE5),
+                            child: Icon(
+                              Icons.folder_outlined,
+                              color: Color(0xFF0F766E),
                             ),
+                          ),
+                          title: Text(directory.name),
+                          trailing: const Icon(Icons.chevron_right),
+                          onTap: () => _loadDirectory(directory.path),
+                        );
+                      },
+                    ),
             ),
           ],
         ),
@@ -4281,7 +5660,9 @@ class _RemoteDirectoryPickerDialogState extends State<RemoteDirectoryPickerDialo
           child: const Text('取消'),
         ),
         FilledButton(
-          onPressed: _isLoading ? null : () => Navigator.of(context).pop(_currentDirectory),
+          onPressed: _isLoading
+              ? null
+              : () => Navigator.of(context).pop(_currentDirectory),
           child: const Text('移动到当前目录'),
         ),
       ],
@@ -4317,9 +5698,9 @@ bool isPreviewableImagePath(String path) {
       normalized.endsWith('.heif');
 }
 
-    bool isPreviewableAudioPath(String path) {
-      final normalized = path.toLowerCase();
-      return normalized.endsWith('.mp3') ||
+bool isPreviewableAudioPath(String path) {
+  final normalized = path.toLowerCase();
+  return normalized.endsWith('.mp3') ||
       normalized.endsWith('.m4a') ||
       normalized.endsWith('.aac') ||
       normalized.endsWith('.wav') ||
@@ -4327,11 +5708,11 @@ bool isPreviewableImagePath(String path) {
       normalized.endsWith('.ogg') ||
       normalized.endsWith('.oga') ||
       normalized.endsWith('.opus');
-    }
+}
 
-    bool isPreviewableVideoPath(String path) {
-      final normalized = path.toLowerCase();
-      return normalized.endsWith('.mp4') ||
+bool isPreviewableVideoPath(String path) {
+  final normalized = path.toLowerCase();
+  return normalized.endsWith('.mp4') ||
       normalized.endsWith('.m4v') ||
       normalized.endsWith('.mov') ||
       normalized.endsWith('.mkv') ||
@@ -4345,7 +5726,7 @@ bool isPreviewableImagePath(String path) {
       normalized.endsWith('.3g2') ||
       normalized.endsWith('.ts') ||
       normalized.endsWith('.m2ts');
-    }
+}
 
 bool isCommonDocumentPath(String path) {
   final normalized = path.toLowerCase();
@@ -4366,7 +5747,9 @@ bool isCommonDocumentPath(String path) {
 }
 
 String _safeLocalFileName(String value) {
-  final sanitized = value.replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_').trim();
+  final sanitized = value
+      .replaceAll(RegExp(r'[<>:"/\\|?*\x00-\x1F]'), '_')
+      .trim();
   return sanitized.isEmpty ? 'audio.tmp' : sanitized;
 }
 
@@ -4447,7 +5830,9 @@ String _parentDirectoryPath(String currentDirectory) {
 }
 
 String _joinResourcePath(String directoryPath, String fileName) {
-  final safeDirectory = directoryPath == '/' ? '/' : _normalizeDirectoryPath(directoryPath);
+  final safeDirectory = directoryPath == '/'
+      ? '/'
+      : _normalizeDirectoryPath(directoryPath);
   return safeDirectory == '/' ? '/$fileName' : '$safeDirectory$fileName';
 }
 
@@ -4521,7 +5906,9 @@ String _compactAudioErrorBody(String body) {
     return '';
   }
 
-  return singleLine.length <= 120 ? singleLine : '${singleLine.substring(0, 120)}...';
+  return singleLine.length <= 120
+      ? singleLine
+      : '${singleLine.substring(0, 120)}...';
 }
 
 String _describeAudioError(Object error, {required String fallback}) {

@@ -33,7 +33,14 @@ loal_NAS 的 Flutter 手机端仓库。
 先启动 loal_NAS 宿主：
 
 ```powershell
-Set-Location "C:\Users\Administrator\Documents\wfm\loal_NAS"
+Set-Location "<你的 loal_NAS 仓库目录>"
+dotnet run --project src/LoalNas.Host
+```
+
+这台机器当前仓库路径示例：
+
+```powershell
+Set-Location "C:\Users\windy\Desktop\github_project\loal_NAS"
 dotnet run --project src/LoalNas.Host
 ```
 
@@ -42,15 +49,43 @@ dotnet run --project src/LoalNas.Host
 如果 `flutter` 已经在 PATH 里：
 
 ```powershell
-Set-Location "C:\Users\Administrator\Documents\wfm\NAS_phone"
+Set-Location "<你的 NAS_phone 仓库目录>"
 flutter run -d windows
 ```
 
-如果 `flutter` 还没加到 PATH，直接用当前机器上的 SDK：
+这台机器当前仓库路径示例：
 
 ```powershell
-Set-Location "C:\Users\Administrator\Documents\wfm\NAS_phone"
-& "C:\Users\Administrator\Documents\wfm\flutter-sdk\bin\flutter.bat" run -d windows
+Set-Location "C:\Users\windy\Desktop\github_project\NAS_phone"
+flutter run -d windows
+```
+
+如果运行时出现下面这个报错：
+
+```text
+Error: Building with plugins requires symlink support.
+```
+
+说明这台 Windows 机器还没有开启开发者模式。先执行：
+
+```powershell
+start ms-settings:developers
+```
+
+然后在系统设置里打开 **Developer Mode**，再重新运行 `flutter run -d windows`。
+
+如果 `flutter` 还没加到 PATH，直接把命令里的 `flutter` 换成你本机 Flutter SDK 里的 `flutter.bat` 绝对路径，例如：
+
+```powershell
+Set-Location "<你的 NAS_phone 仓库目录>"
+& "<你的 Flutter SDK 目录>\bin\flutter.bat" run -d windows
+```
+
+这台机器当前 Flutter SDK 路径示例：
+
+```powershell
+Set-Location "C:\Users\windy\Desktop\github_project\NAS_phone"
+& "C:\Users\windy\flutter\bin\flutter.bat" run -d windows
 ```
 
 程序启动后，在地址输入框里先填：
@@ -100,7 +135,7 @@ flutter build apk --debug
 准备好以后：
 
 ```powershell
-Set-Location "C:\Users\Administrator\Documents\wfm\NAS_phone"
+Set-Location "<你的 NAS_phone 仓库目录>"
 flutter devices
 flutter run -d <device-id>
 ```
