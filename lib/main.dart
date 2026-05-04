@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
+
+import 'package:crypto/crypto.dart' as crypto;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
@@ -202,6 +205,7 @@ class _NasHomePageState extends State<NasHomePage> {
   NasHostStatus? _hostStatus;
   Uri? _baseUri;
   String? _authToken;
+  String? _deviceSecret;
   String _currentDirectory = '/';
   List<FileBrowserEntry> _entries = const [];
   String? _fileError;
@@ -219,6 +223,7 @@ class _NasHomePageState extends State<NasHomePage> {
   @override
   void initState() {
     super.initState();
+    unawaited(_loadDeviceSecret());
     // 异步恢复上次的登录/连接状态
     WidgetsBinding.instance.addPostFrameCallback((_) => _restoreAndAutoConnect());
   }
@@ -634,6 +639,81 @@ class _NasHomePageState extends State<NasHomePage> {
     }
   }
 
+  // ── NAS 访问鉴权 ──────────────────────────────────────────────────────────
+
+  static const _kDeviceSecretKey = 'bound_device_secret';
+  static const _kAlphabet =
+      'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  final Random _random = Random.secure();
+
+  /// 手机端 secret 混淆存储规则（与 PC 端不同）：
+  ///   交换 index 1 与 index 5，在 index 15 与 16 之间插入 '3'（存储 65 字符）。
+  static String _encodeDeviceSecret(String secret) {
+    final chars = secret.split('');
+    final tmp = chars[1];
+    chars[1] = chars[5];
+    chars[5] = tmp;
+    chars.insert(15, '3');
+    return chars.join();
+  }
+
+  static String _decodeDeviceSecret(String encoded) {
+    final chars = encoded.split('')..removeAt(15);
+    final tmp = chars[1];
+    chars[1] = chars[5];
+    chars[5] = tmp;
+    return chars.join();
+  }
+
+  /// 读取本地 secret，若不存在、损坏或解码失败则返回 null。
+  Future<String?> _loadDeviceSecret() async {
+    final cachedSecret = _deviceSecret;
+    if (cachedSecret != null) {
+      return cachedSecret;
+    }
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final stored = prefs.getString(_kDeviceSecretKey);
+      if (stored == null || stored.length != 65) {
+        return null;
+      }
+      final secret = _decodeDeviceSecret(stored);
+      _deviceSecret = secret;
+      return secret;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 生成 8 位随机 nonce（字母+数字）。
+  String _generateNonce() {
+    return List.generate(8, (_) => _kAlphabet[_random.nextInt(_kAlphabet.length)]).join();
+  }
+
+  /// 计算鉴权哈希：SHA-256(secret:timestamp_seconds:nonce)，返回小写 hex。
+  static String _computeNasHash(String secret, int timestampSeconds, String nonce) {
+    final input = '$secret:$timestampSeconds:$nonce';
+    final bytes = utf8.encode(input);
+    return crypto.sha256.convert(bytes).toString();
+  }
+
+  /// 构建 NAS 请求鉴权头（需要 await 因为要读 SharedPreferences）。
+  /// 若本地无 secret 则返回空 Map（此时请求会被 PC 端拒绝，是预期行为）。
+  Future<Map<String, String>> _buildNasAuthHeaders() async {
+    final secret = await _loadDeviceSecret();
+    if (secret == null) {
+      return const {};
+    }
+    final ts = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final nonce = _generateNonce();
+    final hash = _computeNasHash(secret, ts, nonce);
+    return {
+      'X-NAS-Nonce': nonce,
+      'X-NAS-Hash': hash,
+    };
+  }
+
   // ── 扫码注册流程 ──────────────────────────────────────────────────────────
 
   /// 打开二维码扫描页。扫到合法设备 QR 后保存 secret，进入注册对话框。
@@ -656,10 +736,11 @@ class _NasHomePageState extends State<NasHomePage> {
       return;
     }
 
-    // 持久化保存 secret 和 deviceId，供后续安全通信使用
+    // 持久化保存 secret 和 deviceId，供后续安全通信使用（混淆存储）
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('bound_device_secret', secret);
+    await prefs.setString(_kDeviceSecretKey, _encodeDeviceSecret(secret));
     await prefs.setString('bound_device_id', deviceId);
+    _deviceSecret = secret;
 
     if (!mounted) return;
     await _showRegisterDialog(deviceId: deviceId, deviceName: deviceName);
@@ -1865,6 +1946,9 @@ class _NasHomePageState extends State<NasHomePage> {
           .timeout(const Duration(seconds: 15));
       request.bufferOutput = false;
       request.headers.set('X-Auth', token);
+      // NAS 鉴权头
+      final uploadAuthHeaders = await _buildNasAuthHeaders();
+      uploadAuthHeaders.forEach(request.headers.set);
       request.headers.contentType = ContentType.binary;
       // file.size is metadata-only (no file read), safe for any file size
       if (file.size >= 0) {
@@ -1923,6 +2007,9 @@ class _NasHomePageState extends State<NasHomePage> {
           .timeout(const Duration(seconds: 15));
       final bytes = utf8.encode(content);
       request.headers.set('X-Auth', token);
+      // NAS 鉴权头
+      final textUploadAuthHeaders = await _buildNasAuthHeaders();
+      textUploadAuthHeaders.forEach(request.headers.set);
       request.headers.set(HttpHeaders.contentTypeHeader, contentType);
       request.contentLength = bytes.length;
       request.add(bytes);
@@ -2063,6 +2150,9 @@ class _NasHomePageState extends State<NasHomePage> {
           .getUrl(_buildRawDownloadUri(baseUri, resourcePath))
           .timeout(const Duration(seconds: 15));
       request.headers.set('X-Auth', token);
+      // NAS 鉴权头
+      final downloadAuthHeaders = await _buildNasAuthHeaders();
+      downloadAuthHeaders.forEach(request.headers.set);
 
       final response = await request.close().timeout(
         const Duration(seconds: 30),
@@ -2098,6 +2188,16 @@ class _NasHomePageState extends State<NasHomePage> {
     Map<String, String>? headers,
     String? requestBody,
   }) async {
+    // 非云端请求自动注入 NAS 访问鉴权头（secret + 时间戳 + nonce）
+    final isCloudApi = uri.host.contains('reportzs.me');
+    Map<String, String> effectiveHeaders = headers ?? const {};
+    if (!isCloudApi) {
+      final authHeaders = await _buildNasAuthHeaders();
+      if (authHeaders.isNotEmpty) {
+        effectiveHeaders = {...effectiveHeaders, ...authHeaders};
+      }
+    }
+
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
 
     try {
@@ -2119,7 +2219,7 @@ class _NasHomePageState extends State<NasHomePage> {
               .timeout(const Duration(seconds: 8));
       }
 
-      headers?.forEach(request.headers.set);
+      effectiveHeaders.forEach(request.headers.set);
       if (requestBody != null) {
         final bytes = utf8.encode(requestBody);
         request.contentLength = bytes.length;
