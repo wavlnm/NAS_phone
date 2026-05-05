@@ -128,6 +128,19 @@ class LocalNote {
   }
 }
 
+String _deriveLocalNoteTitle(String rawTitle, String rawContent) {
+  if (rawTitle.isNotEmpty) {
+    return rawTitle;
+  }
+
+  final normalized = rawContent.replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (normalized.isEmpty) {
+    return '未命名笔记';
+  }
+
+  return normalized.length <= 18 ? normalized : normalized.substring(0, 18);
+}
+
 const String _notesDirectoryPath = '/.note/';
 const String _notesFilePath = '/.note/notes.json';
 
@@ -2752,6 +2765,36 @@ class _NasHomePageState extends State<NasHomePage> {
     );
   }
 
+  Future<void> _openBookkeepingToolPage() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (context) => const BookkeepingToolPage()),
+    );
+  }
+
+  Future<void> _openScheduledDownloadToolPage() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => const ScheduledDownloadToolPage(),
+      ),
+    );
+  }
+
+  Future<void> _openRemoteDesktopToolPage() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => const RemoteDesktopToolPage(),
+      ),
+    );
+  }
+
+  Future<void> _openCameraCenterToolPage() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => const CameraCenterToolPage(),
+      ),
+    );
+  }
+
   Widget _buildSectionCard({
     BuildContext? contextOverride,
     EdgeInsetsGeometry? paddingOverride,
@@ -3510,22 +3553,6 @@ class _NasHomePageState extends State<NasHomePage> {
                     ),
                   ),
                 ),
-                const SizedBox(height: 12),
-                Text(
-                  _probeState.hostName ?? '我的电脑',
-                  style: theme.textTheme.bodyMedium?.copyWith(
-                    color: const Color(0xFF475569),
-                  ),
-                ),
-                if (_baseUri != null) ...[
-                  const SizedBox(height: 4),
-                  Text(
-                    _baseUri!.origin,
-                    style: theme.textTheme.bodySmall?.copyWith(
-                      color: const Color(0xFF64748B),
-                    ),
-                  ),
-                ],
               ],
             ),
           ),
@@ -3577,6 +3604,7 @@ class _NasHomePageState extends State<NasHomePage> {
   }
 
   Widget _buildDirectorySection(ThemeData theme) {
+    final canOpenQuickActions = _hasFileSession;
     return _buildSectionCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -3592,6 +3620,8 @@ class _NasHomePageState extends State<NasHomePage> {
                     const SizedBox(height: 6),
                     Text(
                       _currentDirectory,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: theme.textTheme.bodyMedium?.copyWith(
                         color: const Color(0xFF475569),
                       ),
@@ -3599,60 +3629,48 @@ class _NasHomePageState extends State<NasHomePage> {
                   ],
                 ),
               ),
-              FilledButton.tonalIcon(
-                onPressed: _hasFileSession && !_isLoadingFiles
-                    ? () => _refreshFiles()
-                    : null,
-                icon: const Icon(Icons.refresh),
-                label: const Text('刷新'),
+              const SizedBox(width: 12),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF1F5F9),
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: IconButton(
+                      onPressed: _hasFileSession && !_isLoadingFiles
+                          ? () => _refreshFiles()
+                          : null,
+                      tooltip: '刷新',
+                      visualDensity: VisualDensity.compact,
+                      icon: const Icon(Icons.refresh_rounded),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  _buildDirectoryQuickActionButton(canOpenQuickActions),
+                  const SizedBox(width: 8),
+                  FilledButton.tonalIcon(
+                    onPressed: _canGoUp && !_isLoadingFiles
+                        ? () => _refreshFiles(
+                            path: _parentDirectoryPath(_currentDirectory),
+                          )
+                        : null,
+                    style: FilledButton.styleFrom(
+                      minimumSize: const Size(0, 40),
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    icon: const Icon(Icons.arrow_upward_rounded),
+                    label: const Text('上级目录'),
+                  ),
+                ],
               ),
             ],
           ),
-          const SizedBox(height: 14),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              FilledButton.tonalIcon(
-                onPressed: _canGoUp && !_isLoadingFiles
-                    ? () => _refreshFiles(
-                        path: _parentDirectoryPath(_currentDirectory),
-                      )
-                    : null,
-                icon: const Icon(Icons.arrow_upward),
-                label: const Text('上级目录'),
-              ),
-              FilledButton.icon(
-                onPressed: _hasFileSession && !_isUploading
-                    ? _pickAndUploadFiles
-                    : null,
-                icon: _isUploading
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.upload_file),
-                label: Text(_isUploading ? '上传中...' : '上传文件'),
-              ),
-              FilledButton.tonalIcon(
-                onPressed: _hasFileSession && !_isCreatingFolder
-                    ? _createFolder
-                    : null,
-                icon: _isCreatingFolder
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.create_new_folder_outlined),
-                label: Text(_isCreatingFolder ? '创建中...' : '新建文件夹'),
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
+          const SizedBox(height: 12),
           if (_isLoadingFiles) ...[
-            const LinearProgressIndicator(),
+            const LinearProgressIndicator(minHeight: 3),
             const SizedBox(height: 12),
           ],
           if (_fileError != null) ...[
@@ -3724,6 +3742,78 @@ class _NasHomePageState extends State<NasHomePage> {
             ),
           ],
         ],
+      ),
+    );
+  }
+
+  Widget _buildDirectoryQuickActionButton(bool canOpenQuickActions) {
+    return Container(
+      decoration: BoxDecoration(
+        color: canOpenQuickActions
+            ? const Color(0xFFCFF4EA)
+            : const Color(0xFFE2E8F0),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: SizedBox(
+        width: 40,
+        height: 40,
+        child: PopupMenuButton<String>(
+          enabled: canOpenQuickActions,
+          tooltip: '更多操作',
+          padding: EdgeInsets.zero,
+          splashRadius: 20,
+          iconColor: canOpenQuickActions
+              ? const Color(0xFF0F766E)
+              : const Color(0xFF94A3B8),
+          icon: const Icon(Icons.add_rounded),
+          color: Colors.white,
+          onSelected: (value) {
+            switch (value) {
+              case 'upload':
+                _pickAndUploadFiles();
+                break;
+              case 'folder':
+                _createFolder();
+                break;
+            }
+          },
+          itemBuilder: (context) => [
+            PopupMenuItem<String>(
+              value: 'upload',
+              enabled: !_isUploading,
+              child: Row(
+                children: [
+                  _isUploading
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.upload_file_outlined, size: 20),
+                  const SizedBox(width: 10),
+                  Text(_isUploading ? '上传中...' : '上传文件'),
+                ],
+              ),
+            ),
+            PopupMenuItem<String>(
+              value: 'folder',
+              enabled: !_isCreatingFolder,
+              child: Row(
+                children: [
+                  _isCreatingFolder
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.create_new_folder_outlined, size: 20),
+                  const SizedBox(width: 10),
+                  Text(_isCreatingFolder ? '创建中...' : '新建文件夹'),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -3892,13 +3982,6 @@ class _NasHomePageState extends State<NasHomePage> {
                     fontWeight: FontWeight.w700,
                   ),
                 ),
-                const SizedBox(height: 8),
-                Text(
-                  '这里展示当前会话里真实访问过的文件。',
-                  style: theme.textTheme.bodyMedium?.copyWith(
-                    color: const Color(0xFF64748B),
-                  ),
-                ),
                 const SizedBox(height: 14),
                 if (_recentFileVisits.isEmpty)
                   const Text('还没有访问记录。先打开一个文件，最近页就会出现内容。')
@@ -3944,14 +4027,7 @@ class _NasHomePageState extends State<NasHomePage> {
               fontWeight: FontWeight.w700,
             ),
           ),
-          const SizedBox(height: 8),
-          Text(
-            '先把独立工具入口收进来，每个工具单独进入自己的极简页面。',
-            style: theme.textTheme.bodyMedium?.copyWith(
-              color: const Color(0xFF64748B),
-            ),
-          ),
-          const SizedBox(height: 18),
+          const SizedBox(height: 16),
           _ToolLauncherButton(
             icon: Icons.edit_note_outlined,
             title: '笔记',
@@ -3964,7 +4040,7 @@ class _NasHomePageState extends State<NasHomePage> {
           _ToolLauncherButton(
             icon: Icons.forum_outlined,
             title: '聊天',
-            subtitle: '页面先留空，后续再接真实聊天功能。',
+            subtitle: '以个人电脑为服务器，完全自主的聊天平台。',
             backgroundColor: const Color(0xFFEEF2FF),
             foregroundColor: const Color(0xFF3730A3),
             onTap: _openChatToolPage,
@@ -3973,10 +4049,46 @@ class _NasHomePageState extends State<NasHomePage> {
           _ToolLauncherButton(
             icon: Icons.delete_outline,
             title: '回收站',
-            subtitle: '先单独给出回收站页面和当前状态说明。',
+            subtitle: '功能暂未接入，谨慎删除文件。',
             backgroundColor: const Color(0xFFFEF2F2),
             foregroundColor: const Color(0xFFB91C1C),
             onTap: _openRecycleBinToolPage,
+          ),
+          const SizedBox(height: 14),
+          _ToolLauncherButton(
+            icon: Icons.receipt_long_outlined,
+            title: '记账',
+            subtitle: '功能接入中，后续可在这里管理日常收支。',
+            backgroundColor: const Color(0xFFFFFBEB),
+            foregroundColor: const Color(0xFFB45309),
+            onTap: _openBookkeepingToolPage,
+          ),
+          const SizedBox(height: 14),
+          _ToolLauncherButton(
+            icon: Icons.download_outlined,
+            title: '定时下载',
+            subtitle: '功能接入中，后续可让电脑按计划下载内容。',
+            backgroundColor: const Color(0xFFECFDF5),
+            foregroundColor: const Color(0xFF047857),
+            onTap: _openScheduledDownloadToolPage,
+          ),
+          const SizedBox(height: 14),
+          _ToolLauncherButton(
+            icon: Icons.desktop_windows_outlined,
+            title: '远程桌面',
+            subtitle: '功能接入中，后续可远程打开并操作你的电脑。',
+            backgroundColor: const Color(0xFFEFF6FF),
+            foregroundColor: const Color(0xFF1D4ED8),
+            onTap: _openRemoteDesktopToolPage,
+          ),
+          const SizedBox(height: 14),
+          _ToolLauncherButton(
+            icon: Icons.videocam_outlined,
+            title: '摄像头中心',
+            subtitle: '功能接入中，后续可统一接入摄像头并在手机端观看。',
+            backgroundColor: const Color(0xFFF5F3FF),
+            foregroundColor: const Color(0xFF6D28D9),
+            onTap: _openCameraCenterToolPage,
           ),
         ],
       ),
@@ -3984,37 +4096,23 @@ class _NasHomePageState extends State<NasHomePage> {
   }
 
   String _mineDisplayName() {
-    final hostName = _hostStatus?.hostName.trim();
-    if (hostName == null ||
-        hostName.isEmpty ||
-        hostName == 'loal_NAS 宿主' ||
-        hostName == 'loal_NAS MVP host' ||
-        hostName == '千私云电脑' ||
-        hostName == '我的电脑') {
-      return 'NAS 用户';
+    final username = _cloudSession?.user.username.trim();
+    if (username == null || username.isEmpty) {
+      return '未登录云账号';
     }
 
-    return hostName;
+    return username;
   }
 
   Future<void> _openAccountSecurityPage() async {
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (context) => AccountSecurityPage(
-          displayName: _mineDisplayName(),
+          cloudAccountName: _mineDisplayName(),
           hostName: _hostStatus?.hostName ?? '未连接',
-          connectionAddress: _baseUri?.origin ?? '未连接',
           sharedRoot: _hostStatus?.sharedRoot,
           onReturnToConnectionPage: _returnToConnectionPage,
         ),
-      ),
-    );
-  }
-
-  Future<void> _openNotificationSettingsPage() async {
-    await Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (context) => const NotificationSettingsPage(),
       ),
     );
   }
@@ -4078,15 +4176,6 @@ class _NasHomePageState extends State<NasHomePage> {
                           color: const Color(0xFF64748B),
                         ),
                       ),
-                      const SizedBox(height: 6),
-                      Text(
-                        _baseUri?.origin ?? '未连接电脑',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: theme.textTheme.bodySmall?.copyWith(
-                          color: const Color(0xFF94A3B8),
-                        ),
-                      ),
                     ],
                   ),
                 ),
@@ -4107,7 +4196,7 @@ class _NasHomePageState extends State<NasHomePage> {
                 const SizedBox(height: 14),
                 if (storage == null)
                   Text(
-                    '暂时无法读取共享目录所在硬盘的空间信息。',
+                    '暂时看不到当前硬盘的空间信息。',
                     style: theme.textTheme.bodyMedium?.copyWith(
                       color: const Color(0xFF64748B),
                     ),
@@ -4150,7 +4239,7 @@ class _NasHomePageState extends State<NasHomePage> {
                   ),
                   const SizedBox(height: 10),
                   Text(
-                    '磁盘: ${storage.driveName.isEmpty ? '当前共享目录所在硬盘' : storage.driveName}',
+                    '当前硬盘: ${storage.driveName.isEmpty ? '共享目录所在硬盘' : storage.driveName}',
                     style: theme.textTheme.bodySmall?.copyWith(
                       color: const Color(0xFF64748B),
                     ),
@@ -4177,7 +4266,7 @@ class _NasHomePageState extends State<NasHomePage> {
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
-                          '这里只能显示当前硬盘的全部和已用空间。已用空间不一定都是云空间占用，计算机上的其他文件也会算进去。',
+                          '这里只显示当前硬盘总量，不单独统计云空间占用。',
                           style: theme.textTheme.bodySmall?.copyWith(
                             color: const Color(0xFF92400E),
                             height: 1.5,
@@ -4198,12 +4287,6 @@ class _NasHomePageState extends State<NasHomePage> {
                   icon: Icons.shield_outlined,
                   title: '账号与安全',
                   onTap: _openAccountSecurityPage,
-                ),
-                const Divider(height: 1),
-                _MineOptionTile(
-                  icon: Icons.notifications_none_rounded,
-                  title: '通知设置',
-                  onTap: _openNotificationSettingsPage,
                 ),
                 const Divider(height: 1),
                 _MineOptionTile(
@@ -4566,74 +4649,11 @@ class _NotesToolPageState extends State<NotesToolPage> {
   }
 
   Future<void> _editNote([LocalNote? existing]) async {
-    final titleController = TextEditingController(text: existing?.title ?? '');
-    final contentController = TextEditingController(
-      text: existing?.content ?? '',
-    );
-
-    final result = await showDialog<LocalNote>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: Text(existing == null ? '新建笔记' : '编辑笔记'),
-        content: SizedBox(
-          width: 420,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: titleController,
-                decoration: const InputDecoration(
-                  labelText: '标题',
-                  border: OutlineInputBorder(),
-                ),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: contentController,
-                minLines: 6,
-                maxLines: 10,
-                decoration: const InputDecoration(
-                  labelText: '内容',
-                  alignLabelWithHint: true,
-                  border: OutlineInputBorder(),
-                ),
-              ),
-            ],
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(dialogContext).pop(),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () {
-              final rawTitle = titleController.text.trim();
-              final rawContent = contentController.text.trim();
-              final derivedTitle = rawTitle.isNotEmpty
-                  ? rawTitle
-                  : rawContent.isNotEmpty
-                  ? rawContent.split('\n').first.trim()
-                  : '未命名笔记';
-              Navigator.of(dialogContext).pop(
-                LocalNote(
-                  id:
-                      existing?.id ??
-                      DateTime.now().microsecondsSinceEpoch.toString(),
-                  title: derivedTitle,
-                  content: rawContent,
-                  updatedAt: DateTime.now(),
-                ),
-              );
-            },
-            child: const Text('保存'),
-          ),
-        ],
+    final result = await Navigator.of(context).push<LocalNote>(
+      MaterialPageRoute<LocalNote>(
+        builder: (context) => _NoteEditorPage(existing: existing),
       ),
     );
-
-    titleController.dispose();
-    contentController.dispose();
 
     if (!mounted || result == null) {
       return;
@@ -4667,16 +4687,7 @@ class _NotesToolPageState extends State<NotesToolPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('笔记'),
-        actions: [
-          IconButton(
-            onPressed: _isLoading || _isSaving ? null : _editNote,
-            icon: const Icon(Icons.add),
-            tooltip: '新建笔记',
-          ),
-        ],
-      ),
+      appBar: AppBar(title: const Text('笔记')),
       body: SafeArea(
         child: _isLoading
             ? const Center(child: CircularProgressIndicator())
@@ -4726,7 +4737,7 @@ class _NotesToolPageState extends State<NotesToolPage> {
                     ),
                     const SizedBox(height: 8),
                     Text(
-                      '云端笔记保存在根目录的 /.note 文件夹下，点右上角加号先记下一条。',
+                      '云端笔记保存在根目录的 /.note 文件夹下，点右下角加号先记下一条。',
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                         color: const Color(0xFF64748B),
                       ),
@@ -4823,6 +4834,127 @@ class _NotesToolPageState extends State<NotesToolPage> {
   }
 }
 
+class _NoteEditorPage extends StatefulWidget {
+  const _NoteEditorPage({this.existing});
+
+  final LocalNote? existing;
+
+  @override
+  State<_NoteEditorPage> createState() => _NoteEditorPageState();
+}
+
+class _NoteEditorPageState extends State<_NoteEditorPage> {
+  late final TextEditingController _titleController;
+  late final TextEditingController _contentController;
+  bool _isClosing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _titleController = TextEditingController(text: widget.existing?.title ?? '');
+    _contentController = TextEditingController(
+      text: widget.existing?.content ?? '',
+    );
+  }
+
+  @override
+  void dispose() {
+    _titleController.dispose();
+    _contentController.dispose();
+    super.dispose();
+  }
+
+  LocalNote? _buildNoteResult() {
+    final rawTitle = _titleController.text.trim();
+    final rawContent = _contentController.text.trim();
+    final existing = widget.existing;
+
+    if (existing == null && rawTitle.isEmpty && rawContent.isEmpty) {
+      return null;
+    }
+
+    final resolvedTitle = _deriveLocalNoteTitle(rawTitle, rawContent);
+    if (existing != null &&
+        existing.title == resolvedTitle &&
+        existing.content == rawContent) {
+      return null;
+    }
+
+    return LocalNote(
+      id: existing?.id ?? DateTime.now().microsecondsSinceEpoch.toString(),
+      title: resolvedTitle,
+      content: rawContent,
+      updatedAt: DateTime.now(),
+    );
+  }
+
+  void _closeEditor() {
+    if (_isClosing) {
+      return;
+    }
+
+    _isClosing = true;
+    Navigator.of(context).pop(_buildNoteResult());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isNewNote = widget.existing == null;
+    return PopScope<LocalNote?>(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop) {
+          _closeEditor();
+        }
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          leading: IconButton(
+            onPressed: _closeEditor,
+            icon: const Icon(Icons.arrow_back_rounded),
+          ),
+          title: Text(isNewNote ? '新建笔记' : '编辑笔记'),
+        ),
+        body: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+            child: Column(
+              children: [
+                TextField(
+                  controller: _titleController,
+                  textInputAction: TextInputAction.next,
+                  decoration: const InputDecoration(
+                    labelText: '标题',
+                    hintText: '不填标题时，会自动取内容前几个字',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                Expanded(
+                  child: TextField(
+                    controller: _contentController,
+                    keyboardType: TextInputType.multiline,
+                    textInputAction: TextInputAction.newline,
+                    maxLines: null,
+                    expands: true,
+                    textAlignVertical: TextAlignVertical.top,
+                    decoration: const InputDecoration(
+                      labelText: '内容',
+                      hintText: '在这里记录想法、待办和说明',
+                      alignLabelWithHint: true,
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class ChatToolPage extends StatelessWidget {
   const ChatToolPage({super.key});
 
@@ -4830,7 +4962,12 @@ class ChatToolPage extends StatelessWidget {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('聊天')),
-      body: const SafeArea(child: SizedBox.expand()),
+      body: const _PendingToolPageBody(
+        icon: Icons.forum_outlined,
+        title: '功能接入中',
+        detail: '聊天功能正在接入中，后续会在这里提供完整的聊天体验。',
+        iconColor: Color(0xFF3730A3),
+      ),
     );
   }
 }
@@ -4842,37 +4979,125 @@ class RecycleBinToolPage extends StatelessWidget {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('回收站')),
-      body: SafeArea(
-        child: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                const Icon(
-                  Icons.delete_outline,
-                  size: 52,
-                  color: Color(0xFFB91C1C),
+      body: const _PendingToolPageBody(
+        icon: Icons.delete_outline,
+        title: '功能接入中',
+        detail: '回收站功能正在接入中，当前删除文件时请务必谨慎。',
+        iconColor: Color(0xFFB91C1C),
+      ),
+    );
+  }
+}
+
+class BookkeepingToolPage extends StatelessWidget {
+  const BookkeepingToolPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('记账')),
+      body: const _PendingToolPageBody(
+        icon: Icons.receipt_long_outlined,
+        title: '功能接入中',
+        detail: '记账功能正在接入中，后续会在这里提供个人收支记录与整理。',
+        iconColor: Color(0xFFB45309),
+      ),
+    );
+  }
+}
+
+class ScheduledDownloadToolPage extends StatelessWidget {
+  const ScheduledDownloadToolPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('定时下载')),
+      body: const _PendingToolPageBody(
+        icon: Icons.download_outlined,
+        title: '功能接入中',
+        detail: '定时下载功能正在接入中，后续可以让电脑按计划自动下载文件。',
+        iconColor: Color(0xFF047857),
+      ),
+    );
+  }
+}
+
+class RemoteDesktopToolPage extends StatelessWidget {
+  const RemoteDesktopToolPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('远程桌面')),
+      body: const _PendingToolPageBody(
+        icon: Icons.desktop_windows_outlined,
+        title: '功能接入中',
+        detail: '远程桌面功能正在接入中，后续会支持远程查看和操作你的电脑。',
+        iconColor: Color(0xFF1D4ED8),
+      ),
+    );
+  }
+}
+
+class CameraCenterToolPage extends StatelessWidget {
+  const CameraCenterToolPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('摄像头中心')),
+      body: const _PendingToolPageBody(
+        icon: Icons.videocam_outlined,
+        title: '功能接入中',
+        detail: '摄像头中心正在接入中，后续可统一接入摄像头，把视频流存到电脑并在手机端观看。',
+        iconColor: Color(0xFF6D28D9),
+      ),
+    );
+  }
+}
+
+class _PendingToolPageBody extends StatelessWidget {
+  const _PendingToolPageBody({
+    required this.icon,
+    required this.title,
+    required this.detail,
+    required this.iconColor,
+  });
+
+  final IconData icon;
+  final String title;
+  final String detail;
+  final Color iconColor;
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, size: 52, color: iconColor),
+              const SizedBox(height: 16),
+              Text(
+                title,
+                style: Theme.of(
+                  context,
+                ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 10),
+              Text(
+                detail,
+                style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                  color: const Color(0xFF475569),
+                  height: 1.5,
                 ),
-                const SizedBox(height: 16),
-                Text(
-                  '当前还没有接入回收站',
-                  style: Theme.of(
-                    context,
-                  ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
-                  textAlign: TextAlign.center,
-                ),
-                const SizedBox(height: 10),
-                Text(
-                  '现在的删除操作会直接调用 FileBrowser 的删除接口，不会先进入回收站。后续如果改成软删除，这里会显示可恢复的项目。',
-                  style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                    color: const Color(0xFF475569),
-                    height: 1.5,
-                  ),
-                  textAlign: TextAlign.center,
-                ),
-              ],
-            ),
+                textAlign: TextAlign.center,
+              ),
+            ],
           ),
         ),
       ),
@@ -4882,17 +5107,15 @@ class RecycleBinToolPage extends StatelessWidget {
 
 class AccountSecurityPage extends StatelessWidget {
   const AccountSecurityPage({
-    required this.displayName,
+    required this.cloudAccountName,
     required this.hostName,
-    required this.connectionAddress,
     required this.sharedRoot,
     required this.onReturnToConnectionPage,
     super.key,
   });
 
-  final String displayName;
+  final String cloudAccountName;
   final String hostName;
-  final String connectionAddress;
   final String? sharedRoot;
   final VoidCallback onReturnToConnectionPage;
 
@@ -4905,11 +5128,10 @@ class AccountSecurityPage extends StatelessWidget {
           padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
           children: [
             _PlainInfoCard(
-              title: '当前身份',
+              title: '当前状态',
               lines: [
-                '显示名称: $displayName',
-                '电脑名称: $hostName',
-                '连接地址: $connectionAddress',
+                '云账号: $cloudAccountName',
+                '当前电脑: $hostName',
                 if (sharedRoot != null && sharedRoot!.isNotEmpty)
                   '共享目录: $sharedRoot',
               ],
@@ -4918,8 +5140,9 @@ class AccountSecurityPage extends StatelessWidget {
             _PlainInfoCard(
               title: '安全说明',
               lines: const [
-                '当前版本没有独立账号体系，手机端通过电脑地址和登录状态访问文件。',
-                '如果需要切换电脑或重新建立连接，可以返回连接页重新探测。',
+                '云账号当前主要用于登录状态和同步电脑地址。',
+                '手机访问电脑前，需要先扫码授权，请求会自动完成安全校验。',
+                '如果需要更换电脑或重新授权，可以返回连接页重新扫码或连接。',
               ],
             ),
             const SizedBox(height: 16),
