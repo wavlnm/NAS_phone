@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:ui';
 
 import 'package:crypto/crypto.dart' as crypto;
 
@@ -5947,58 +5948,78 @@ class ImagePreviewPage extends StatelessWidget {
     return Scaffold(
       appBar: AppBar(title: Text(title)),
       backgroundColor: Colors.black,
-      body: Center(
-        child: InteractiveViewer(
-          minScale: 0.8,
-          maxScale: 5,
-          child: Image.network(
-            imageUri.toString(),
-            headers: {'X-Auth': authToken},
-            fit: BoxFit.contain,
-            loadingBuilder: (context, child, loadingProgress) {
-              if (loadingProgress == null) {
-                return child;
-              }
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          final viewportWidth = constraints.maxWidth;
+          final viewportHeight = constraints.maxHeight;
 
-              return Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const CircularProgressIndicator(),
-                  const SizedBox(height: 16),
-                  Text(
-                    '正在加载图片...',
-                    style: Theme.of(
-                      context,
-                    ).textTheme.bodyMedium?.copyWith(color: Colors.white),
-                  ),
-                ],
-              );
-            },
-            errorBuilder: (context, error, stackTrace) {
-              return Padding(
-                padding: const EdgeInsets.all(24),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    const Icon(
-                      Icons.broken_image_outlined,
-                      size: 64,
-                      color: Colors.white70,
+          return InteractiveViewer(
+            minScale: 1,
+            maxScale: 5,
+            child: SizedBox(
+              width: viewportWidth,
+              height: viewportHeight,
+              child: Image.network(
+                imageUri.toString(),
+                headers: {'X-Auth': authToken},
+                width: viewportWidth,
+                height: viewportHeight,
+                fit: BoxFit.contain,
+                loadingBuilder: (context, child, loadingProgress) {
+                  if (loadingProgress == null) {
+                    return child;
+                  }
+
+                  return SizedBox(
+                    width: viewportWidth,
+                    height: viewportHeight,
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const CircularProgressIndicator(),
+                        const SizedBox(height: 16),
+                        Text(
+                          '正在加载图片...',
+                          style: Theme.of(
+                            context,
+                          ).textTheme.bodyMedium?.copyWith(
+                            color: Colors.white,
+                          ),
+                        ),
+                      ],
                     ),
-                    const SizedBox(height: 16),
-                    Text(
-                      '图片预览失败，请稍后重试。',
-                      style: Theme.of(
-                        context,
-                      ).textTheme.titleMedium?.copyWith(color: Colors.white),
-                      textAlign: TextAlign.center,
+                  );
+                },
+                errorBuilder: (context, error, stackTrace) {
+                  return SizedBox(
+                    width: viewportWidth,
+                    height: viewportHeight,
+                    child: Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          const Icon(
+                            Icons.broken_image_outlined,
+                            size: 64,
+                            color: Colors.white70,
+                          ),
+                          const SizedBox(height: 16),
+                          Text(
+                            '图片预览失败，请稍后重试。',
+                            style: Theme.of(context).textTheme.titleMedium
+                                ?.copyWith(color: Colors.white),
+                            textAlign: TextAlign.center,
+                          ),
+                        ],
+                      ),
                     ),
-                  ],
-                ),
-              );
-            },
-          ),
-        ),
+                  );
+                },
+              ),
+            ),
+          );
+        },
       ),
     );
   }
@@ -6243,98 +6264,178 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
     final effectivePosition = Duration(
       milliseconds: displayedPositionMs.round(),
     );
+    final statusText =
+        _error ??
+        (_isPlaying ? '正在播放' : (_isPreparing ? '正在加载音频...' : '已暂停'));
+    final statusColor = _error == null
+        ? Colors.white.withValues(alpha: 0.82)
+        : const Color(0xFFFECACA);
 
     return Scaffold(
-      appBar: AppBar(title: Text(widget.title)),
-      body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(20),
-          child: Center(
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 560),
-              child: Card(
-                child: Padding(
-                  padding: const EdgeInsets.all(24),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      const CircleAvatar(
-                        radius: 36,
-                        backgroundColor: Color(0xFFEEE7FF),
-                        child: Icon(
-                          Icons.music_note_outlined,
-                          size: 36,
-                          color: Color(0xFF6D28D9),
-                        ),
-                      ),
-                      const SizedBox(height: 20),
-                      Text(
-                        widget.title,
-                        textAlign: TextAlign.center,
-                        style: theme.textTheme.titleLarge?.copyWith(
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        _error ??
-                            (_isPlaying
-                                ? '正在播放'
-                                : (_isPreparing ? '正在加载音频...' : '已暂停')),
-                        textAlign: TextAlign.center,
-                        style: theme.textTheme.bodyMedium?.copyWith(
-                          color: _error == null
-                              ? const Color(0xFF475569)
-                              : const Color(0xFFB42318),
-                        ),
-                      ),
-                      const SizedBox(height: 20),
-                      Slider(
-                        min: 0,
-                        max: sliderMax,
-                        value: sliderValue,
-                        onChanged: canSeek
-                            ? (value) {
-                                setState(() {
-                                  _dragValueMs = value;
-                                });
-                              }
-                            : null,
-                        onChangeEnd: canSeek ? _seekTo : null,
-                      ),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          Text(_formatMediaDuration(effectivePosition)),
-                          Text(
-                            hasKnownDuration
-                                ? _formatMediaDuration(_duration)
-                                : '--:--',
+      extendBodyBehindAppBar: true,
+      appBar: AppBar(
+        title: const SizedBox.shrink(),
+        backgroundColor: Colors.transparent,
+        foregroundColor: Colors.white,
+        surfaceTintColor: Colors.transparent,
+        elevation: 0,
+      ),
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          Image.asset(
+            'assets/images/music_player_background_alt.png',
+            fit: BoxFit.cover,
+          ),
+          const DecoratedBox(
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [
+                  Color(0x66040A07),
+                  Color(0x33040A07),
+                  Color(0x8C040A07),
+                ],
+              ),
+            ),
+          ),
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(18, 12, 18, 20),
+              child: Align(
+                alignment: const Alignment(0, -0.1),
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 560),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(24),
+                    child: BackdropFilter(
+                      filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: const Color(0x2A111827),
+                          borderRadius: BorderRadius.circular(24),
+                          border: Border.all(
+                            color: Colors.white.withValues(alpha: 0.2),
                           ),
-                        ],
-                      ),
-                      const SizedBox(height: 20),
-                      Center(
-                        child: IconButton.filledTonal(
-                          onPressed: _error == null && !_isPreparing
-                              ? _togglePlayback
-                              : null,
-                          iconSize: 34,
-                          icon: Icon(
-                            _isPlaying
-                                ? Icons.pause_rounded
-                                : Icons.play_arrow_rounded,
+                          boxShadow: const [
+                            BoxShadow(
+                              color: Color(0x22000000),
+                              blurRadius: 24,
+                              offset: Offset(0, 12),
+                            ),
+                          ],
+                        ),
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(18, 14, 18, 16),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              Text(
+                                widget.title,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                textAlign: TextAlign.center,
+                                style: theme.textTheme.titleLarge?.copyWith(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                statusText,
+                                textAlign: TextAlign.center,
+                                style: theme.textTheme.bodyMedium?.copyWith(
+                                  color: statusColor,
+                                ),
+                              ),
+                              const SizedBox(height: 10),
+                              SliderTheme(
+                                data: SliderTheme.of(context).copyWith(
+                                  activeTrackColor: Colors.white,
+                                  inactiveTrackColor: Colors.white.withValues(
+                                    alpha: 0.24,
+                                  ),
+                                  thumbColor: Colors.white,
+                                  overlayColor: Colors.white.withValues(
+                                    alpha: 0.16,
+                                  ),
+                                ),
+                                child: Slider(
+                                  min: 0,
+                                  max: sliderMax,
+                                  value: sliderValue,
+                                  onChanged: canSeek
+                                      ? (value) {
+                                          setState(() {
+                                            _dragValueMs = value;
+                                          });
+                                        }
+                                      : null,
+                                  onChangeEnd: canSeek ? _seekTo : null,
+                                ),
+                              ),
+                              Row(
+                                mainAxisAlignment:
+                                    MainAxisAlignment.spaceBetween,
+                                children: [
+                                  Text(
+                                    _formatMediaDuration(effectivePosition),
+                                    style: theme.textTheme.bodySmall?.copyWith(
+                                      color: Colors.white.withValues(
+                                        alpha: 0.88,
+                                      ),
+                                    ),
+                                  ),
+                                  Text(
+                                    hasKnownDuration
+                                        ? _formatMediaDuration(_duration)
+                                        : '--:--',
+                                    style: theme.textTheme.bodySmall?.copyWith(
+                                      color: Colors.white.withValues(
+                                        alpha: 0.88,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 10),
+                              Center(
+                                child: IconButton.filled(
+                                  onPressed: _error == null && !_isPreparing
+                                      ? _togglePlayback
+                                      : null,
+                                  style: IconButton.styleFrom(
+                                    backgroundColor: Colors.white.withValues(
+                                      alpha: 0.92,
+                                    ),
+                                    foregroundColor: const Color(0xFF0F172A),
+                                    disabledBackgroundColor:
+                                        Colors.white.withValues(alpha: 0.36),
+                                    disabledForegroundColor:
+                                        Colors.white.withValues(alpha: 0.72),
+                                    fixedSize: const Size(52, 52),
+                                  ),
+                                  iconSize: 30,
+                                  icon: Icon(
+                                    _isPlaying
+                                        ? Icons.pause_rounded
+                                        : Icons.play_arrow_rounded,
+                                  ),
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                       ),
-                    ],
+                    ),
                   ),
                 ),
               ),
             ),
           ),
-        ),
+        ],
       ),
     );
   }
