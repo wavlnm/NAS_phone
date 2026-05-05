@@ -804,7 +804,7 @@ class _NasHomePageState extends State<NasHomePage> {
                   const Text('注册云账号'),
                   const SizedBox(height: 8),
                   Text(
-                    '绑定设备：$deviceName\n设置账号和密码后，即可在手机和电脑之间同步访问。',
+                    '绑定设备：$deviceName\n设备网络地址易变，注册云账号即可实时获取最新连接地址。',
                     style: const TextStyle(
                       fontSize: 13,
                       color: Color(0xFF64748B),
@@ -1100,9 +1100,9 @@ class _NasHomePageState extends State<NasHomePage> {
         title: const Text('连接说明'),
         content: const Text(
           '1. 云账号登录只用于账号体系。\n'
-          '2. 扫码卡片只负责注册云账号。\n'
-          '3. 当前手动连接固定使用 5034 端口。\n'
-          '4. 自动发现界面已预留，后续再接入局域网扫描。',
+          '2. 扫码获取授权和注册云账号。\n'
+          '3. 自动发现当前用于展示最近设备，后续会实现局域网自动扫描设备。\n'
+          '4. 手动连接只需输入ipv4或ipv6地址。',
           style: TextStyle(height: 1.6),
         ),
         actions: [
@@ -1861,7 +1861,7 @@ class _NasHomePageState extends State<NasHomePage> {
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw NasApiException(
-        '宿主返回了 ${response.statusCode}。${_compactBody(response.body)}',
+        '电脑返回了 ${response.statusCode}。${_compactBody(response.body)}',
       );
     }
 
@@ -1873,7 +1873,7 @@ class _NasHomePageState extends State<NasHomePage> {
 
       return NasHostStatus.fromJson(decoded);
     } on FormatException {
-      throw const NasApiException('宿主状态接口返回了非 JSON 内容。');
+      throw const NasApiException('电脑状态接口返回了非 JSON 内容。');
     }
   }
 
@@ -1883,13 +1883,13 @@ class _NasHomePageState extends State<NasHomePage> {
     );
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw NasApiException(
-        'FileBrowser 登录失败：${response.statusCode}。${_compactBody(response.body)}',
+        '文件服务登录失败：${response.statusCode}。${_compactBody(response.body)}',
       );
     }
 
     final token = response.body.trim();
     if (token.isEmpty) {
-      throw const NasApiException('FileBrowser 登录失败：token 为空。');
+      throw const NasApiException('文件服务登录失败：登录信息为空。');
     }
 
     return token;
@@ -2233,9 +2233,9 @@ class _NasHomePageState extends State<NasHomePage> {
           .timeout(const Duration(seconds: 8));
       return SimpleHttpResponse(response.statusCode, responseBody);
     } on TimeoutException {
-      throw const NasApiException('请求超时，请确认宿主仍然在线。');
+      throw const NasApiException('请求超时，请确认电脑仍然在线。');
     } on SocketException catch (error) {
-      throw NasApiException('无法连接宿主：${error.message}');
+      throw NasApiException('无法连接电脑：${error.message}');
     } on HttpException catch (error) {
       throw NasApiException('请求失败：${error.message}');
     } finally {
@@ -2391,20 +2391,39 @@ class _NasHomePageState extends State<NasHomePage> {
   String _buildProbeDetail(NasHostStatus status, {String? fileError}) {
     final lines = <String>[
       '状态接口可达。',
-      if (status.fileBrowserRunning != null)
-        'FileBrowser: ${status.fileBrowserRunning! ? '运行中' : '未运行'}',
-      if (status.fileBrowserBaseUrl != null &&
-          status.fileBrowserBaseUrl!.isNotEmpty)
-        '内部地址: ${status.fileBrowserBaseUrl}',
-      if (status.sharedRoot != null && status.sharedRoot!.isNotEmpty)
-        '共享目录: ${status.sharedRoot}',
       if (fileError == null)
-        '已连接 FileBrowser，可浏览、上传、下载和管理文件。'
+        '已连接，可浏览、上传、下载和管理文件。'
       else
-        '宿主在线，但文件接口连接失败：$fileError',
+        '电脑在线，但文件访问连接失败：$fileError',
     ];
 
     return lines.join('\n');
+  }
+
+  String _formatConnectionAddress(String endpoint) {
+    final uri = Uri.tryParse(endpoint);
+    if (uri != null && uri.host.isNotEmpty) {
+      return uri.host;
+    }
+
+    var value = endpoint.trim().replaceFirst(RegExp(r'^https?://'), '');
+    final slashIndex = value.indexOf('/');
+    if (slashIndex >= 0) {
+      value = value.substring(0, slashIndex);
+    }
+
+    if (value.startsWith('[')) {
+      final closingIndex = value.indexOf(']');
+      if (closingIndex > 0) {
+        return value.substring(1, closingIndex);
+      }
+    }
+
+    if (':'.allMatches(value).length == 1) {
+      return value.split(':').first;
+    }
+
+    return value;
   }
 
   void _resetFileSession() {
@@ -2467,7 +2486,7 @@ class _NasHomePageState extends State<NasHomePage> {
     final baseUri = _baseUri;
     final token = _authToken;
     if (baseUri == null || token == null) {
-      throw const NasApiException('当前还没有有效的文件会话，请先重新连接宿主。');
+      throw const NasApiException('当前还没有有效的文件会话，请先重新连接电脑。');
     }
 
     final collectedEntries = <FileBrowserEntry>[];
@@ -2625,7 +2644,7 @@ class _NasHomePageState extends State<NasHomePage> {
     final baseUri = _baseUri;
     final token = _authToken;
     if (baseUri == null || token == null) {
-      throw const NasApiException('当前还没有有效的文件会话，请先重新连接宿主。');
+      throw const NasApiException('当前还没有有效的文件会话，请先重新连接电脑。');
     }
 
     final response = await _sendTextRequest(
@@ -2650,7 +2669,7 @@ class _NasHomePageState extends State<NasHomePage> {
     final baseUri = _baseUri;
     final token = _authToken;
     if (baseUri == null || token == null) {
-      throw const NasApiException('当前还没有有效的文件会话，请先重新连接宿主。');
+      throw const NasApiException('当前还没有有效的文件会话，请先重新连接电脑。');
     }
 
     await _ensureNotesDirectoryExists();
@@ -2692,7 +2711,7 @@ class _NasHomePageState extends State<NasHomePage> {
     final baseUri = _baseUri;
     final token = _authToken;
     if (baseUri == null || token == null) {
-      throw const NasApiException('当前还没有有效的文件会话，请先重新连接宿主。');
+      throw const NasApiException('当前还没有有效的文件会话，请先重新连接电脑。');
     }
 
     await _ensureNotesDirectoryExists();
@@ -2735,11 +2754,12 @@ class _NasHomePageState extends State<NasHomePage> {
 
   Widget _buildSectionCard({
     BuildContext? contextOverride,
+    EdgeInsetsGeometry? paddingOverride,
     required Widget child,
   }) {
     final metrics = _ConnectionPageMetrics.of(contextOverride ?? context);
     return Container(
-      padding: EdgeInsets.all(metrics.cardPadding),
+      padding: paddingOverride ?? EdgeInsets.all(metrics.cardPadding),
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(metrics.cardRadius),
@@ -2864,7 +2884,7 @@ class _NasHomePageState extends State<NasHomePage> {
                 Icon(Icons.shield_outlined,
                     size: 14, color: const Color(0xFF3B82F6)),
                 const SizedBox(width: 4),
-                Text('端到端加密',
+                Text('点对点传输',
                     style: TextStyle(
                         color: const Color(0xFF64748B), fontSize: 13)),
                 Padding(
@@ -2876,7 +2896,7 @@ class _NasHomePageState extends State<NasHomePage> {
                 Icon(Icons.sync_rounded,
                     size: 14, color: const Color(0xFF3B82F6)),
                 const SizedBox(width: 4),
-                Text('设备间同步地址',
+                Text('实时同步地址',
                     style: TextStyle(
                         color: const Color(0xFF64748B), fontSize: 13)),
                 Padding(
@@ -2888,7 +2908,7 @@ class _NasHomePageState extends State<NasHomePage> {
                 Icon(Icons.devices_outlined,
                     size: 14, color: const Color(0xFF3B82F6)),
                 const SizedBox(width: 4),
-                Text('多端访问',
+                Text('远程访问',
                     style: TextStyle(
                         color: const Color(0xFF64748B), fontSize: 13)),
               ],
@@ -2902,11 +2922,12 @@ class _NasHomePageState extends State<NasHomePage> {
   Widget _buildDeviceScanIllustration(
     BuildContext context, {
     double? maxWidth,
+    double scale = 1,
   }) {
     final metrics = _ConnectionPageMetrics.of(context);
     final availableWidth = maxWidth ?? metrics.screenWidth;
-    final layoutWidth = metrics.illustrationWidthFor(availableWidth);
-    final layoutHeight = metrics.illustrationHeightFor(availableWidth);
+    final layoutWidth = metrics.illustrationWidthFor(availableWidth) * scale;
+    final layoutHeight = metrics.illustrationHeightFor(availableWidth) * scale;
     final monitorHeight = layoutHeight * 0.68;
     final phoneWidth = layoutWidth * 0.31;
     final phoneHeight = layoutHeight * 0.8;
@@ -3004,14 +3025,14 @@ class _NasHomePageState extends State<NasHomePage> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  '扫码绑定设备',
+                  '扫码获取授权和注册',
                   style: theme.textTheme.titleMedium?.copyWith(
                     fontWeight: FontWeight.w700,
                   ),
                 ),
                 const SizedBox(height: 6),
                 Text(
-                  '扫描电脑端二维码，\n快速绑定设备',
+                  '扫描电脑端二维码获取鉴权凭证',
                   style: theme.textTheme.bodySmall?.copyWith(
                     color: const Color(0xFF64748B),
                     height: 1.5,
@@ -3041,6 +3062,7 @@ class _NasHomePageState extends State<NasHomePage> {
           _buildDeviceScanIllustration(
             context,
             maxWidth: metrics.screenWidth * 0.36,
+            scale: 0.88,
           ),
         ],
       ),
@@ -3094,7 +3116,7 @@ class _NasHomePageState extends State<NasHomePage> {
       );
     }
 
-    final host = baseUri.host;
+    final host = _formatConnectionAddress(baseUri.origin);
 
     return Material(
       color: const Color(0xFFF8FAFC),
@@ -3121,23 +3143,11 @@ class _NasHomePageState extends State<NasHomePage> {
               ),
               SizedBox(width: metrics.inlineSpacing),
               Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      hostStatus.hostName,
-                      style: theme.textTheme.titleSmall?.copyWith(
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      '$host:5034',
-                      style: theme.textTheme.bodySmall?.copyWith(
-                        color: const Color(0xFF64748B),
-                      ),
-                    ),
-                  ],
+                child: Text(
+                  host,
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
               ),
               SizedBox(width: metrics.inlineSpacing * 0.85),
@@ -3167,20 +3177,50 @@ class _NasHomePageState extends State<NasHomePage> {
     final metrics = _ConnectionPageMetrics.of(context);
     return _buildSectionCard(
       contextOverride: context,
+      paddingOverride: EdgeInsets.fromLTRB(
+        metrics.cardPadding,
+        metrics.cardPadding * 0.62,
+        metrics.cardPadding,
+        metrics.cardPadding * 0.44,
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Expanded(
-                child: Text(
-                  '自动发现设备',
-                  style: theme.textTheme.titleMedium?.copyWith(
-                    fontWeight: FontWeight.w700,
-                  ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '自动发现设备',
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      _hostStatus == null ? '正在搜索同一局域网内的设备...' : '最近一次成功连接的设备会显示在这里。',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: const Color(0xFF64748B),
+                        height: 1.45,
+                      ),
+                    ),
+                  ],
                 ),
               ),
+              SizedBox(width: metrics.inlineSpacing * 0.6),
               TextButton.icon(
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  visualDensity: VisualDensity.compact,
+                  textStyle: theme.textTheme.bodySmall?.copyWith(
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
                 onPressed: () =>
                     _showPendingFeatureMessage('自动发现功能还在接入，当前先使用手动输入地址。'),
                 icon: const Icon(Icons.refresh_rounded),
@@ -3188,20 +3228,20 @@ class _NasHomePageState extends State<NasHomePage> {
               ),
             ],
           ),
-          SizedBox(height: metrics.inlineSpacing * 0.45),
-          Text(
-            _hostStatus == null ? '正在搜索同一局域网内的设备...' : '最近一次成功连接的设备会显示在这里。',
-            style: theme.textTheme.bodySmall?.copyWith(
-              color: const Color(0xFF64748B),
-              height: 1.5,
-            ),
-          ),
-          SizedBox(height: metrics.sectionSpacing),
+          SizedBox(height: metrics.sectionSpacing * 0.56),
           _buildDiscoveryHostTile(context, theme),
-          SizedBox(height: metrics.inlineSpacing * 0.8),
+          SizedBox(height: metrics.inlineSpacing * 0.38),
           Align(
             alignment: Alignment.center,
             child: TextButton(
+              style: TextButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                minimumSize: Size.zero,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                textStyle: theme.textTheme.bodySmall?.copyWith(
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
               onPressed: () =>
                   _showPendingFeatureMessage('未发现设备时，请先使用手动输入地址连接。'),
               child: const Text('未发现设备？'),
@@ -3252,16 +3292,7 @@ class _NasHomePageState extends State<NasHomePage> {
           if (_probeState.endpoint != null) ...[
             SizedBox(height: metrics.inlineSpacing * 0.65),
             Text(
-              '连接地址: ${_probeState.endpoint}',
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: const Color(0xFF0F172A),
-              ),
-            ),
-          ],
-          if (_probeState.hostName != null) ...[
-            SizedBox(height: metrics.inlineSpacing * 0.3),
-            Text(
-              '设备名称: ${_probeState.hostName}',
+              '连接地址: ${_formatConnectionAddress(_probeState.endpoint!)}',
               style: theme.textTheme.bodySmall?.copyWith(
                 color: const Color(0xFF0F172A),
               ),
@@ -3481,7 +3512,7 @@ class _NasHomePageState extends State<NasHomePage> {
                 ),
                 const SizedBox(height: 12),
                 Text(
-                  _probeState.hostName ?? 'loal_NAS 宿主',
+                  _probeState.hostName ?? '我的电脑',
                   style: theme.textTheme.bodyMedium?.copyWith(
                     color: const Color(0xFF475569),
                   ),
@@ -3957,7 +3988,9 @@ class _NasHomePageState extends State<NasHomePage> {
     if (hostName == null ||
         hostName.isEmpty ||
         hostName == 'loal_NAS 宿主' ||
-        hostName == 'loal_NAS MVP host') {
+        hostName == 'loal_NAS MVP host' ||
+        hostName == '千私云电脑' ||
+        hostName == '我的电脑') {
       return 'NAS 用户';
     }
 
@@ -4047,7 +4080,7 @@ class _NasHomePageState extends State<NasHomePage> {
                       ),
                       const SizedBox(height: 6),
                       Text(
-                        _baseUri?.origin ?? '未连接宿主',
+                        _baseUri?.origin ?? '未连接电脑',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: theme.textTheme.bodySmall?.copyWith(
@@ -4875,7 +4908,7 @@ class AccountSecurityPage extends StatelessWidget {
               title: '当前身份',
               lines: [
                 '显示名称: $displayName',
-                '宿主名称: $hostName',
+                '电脑名称: $hostName',
                 '连接地址: $connectionAddress',
                 if (sharedRoot != null && sharedRoot!.isNotEmpty)
                   '共享目录: $sharedRoot',
@@ -4885,8 +4918,8 @@ class AccountSecurityPage extends StatelessWidget {
             _PlainInfoCard(
               title: '安全说明',
               lines: const [
-                '当前版本没有独立账号体系，手机端通过宿主地址和 FileBrowser 会话访问文件。',
-                '如果需要切换宿主或重新建立连接，可以返回连接页重新探测。',
+                '当前版本没有独立账号体系，手机端通过电脑地址和登录状态访问文件。',
+                '如果需要切换电脑或重新建立连接，可以返回连接页重新探测。',
               ],
             ),
             const SizedBox(height: 16),
@@ -4943,7 +4976,7 @@ class _NotificationSettingsPageState extends State<NotificationSettingsPage> {
                     onChanged: (value) =>
                         setState(() => _connectionNotifications = value),
                     title: const Text('连接异常提醒'),
-                    subtitle: const Text('宿主无法访问时给出明显提示。'),
+                    subtitle: const Text('电脑无法访问时给出明显提示。'),
                   ),
                 ],
               ),
@@ -5311,7 +5344,7 @@ class ProbeState {
   const ProbeState.idle()
     : this._(
         headline: '尚未探测',
-        detail: '输入设备地址后点击“连接”，应用会固定使用 5034 端口请求宿主。',
+        detail: '输入电脑地址后点击“连接”，应用会通过 5034 端口连接这台电脑。',
         color: const Color(0xFF475569),
         backgroundColor: const Color(0xFFF8FAFC),
         icon: Icons.info_outline_rounded,
@@ -5320,7 +5353,7 @@ class ProbeState {
   const ProbeState.loading()
     : this._(
         headline: '正在连接',
-        detail: '正在请求 5034 端口的 /api/system/status，并登录 FileBrowser ...',
+        detail: '正在检查这台电脑，并登录文件服务...',
         color: const Color(0xFF0F766E),
         backgroundColor: const Color(0xFFECFEFF),
         icon: Icons.sync_rounded,
@@ -5340,7 +5373,7 @@ class ProbeState {
     required String hostName,
     required String detail,
   }) : this._(
-         headline: '宿主在线',
+         headline: '电脑在线',
          detail: detail,
          color: const Color(0xFF0F766E),
          backgroundColor: const Color(0xFFECFDF5),
@@ -5551,7 +5584,7 @@ class NasHostStatus {
         : null;
 
     return NasHostStatus(
-      hostName: json['name']?.toString() ?? 'loal_NAS 宿主',
+      hostName: json['name']?.toString() ?? '我的电脑',
       fileBrowserRunning: running is bool ? running : null,
       fileBrowserBaseUrl:
           (fileBrowserMap['baseUrl'] ?? json['fileBrowserBaseUrl'])?.toString(),

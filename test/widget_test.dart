@@ -34,7 +34,7 @@ void main() {
 
   test('parses host status with storage information', () {
     final status = NasHostStatus.fromJson({
-      'name': 'loal_NAS MVP host',
+      'name': '千私云电脑',
       'fileBrowser': {
         'running': true,
         'baseUrl': 'http://127.0.0.1:38080',
@@ -51,7 +51,7 @@ void main() {
       'sharedRootPath': 'ignored',
     });
 
-    expect(status.hostName, 'loal_NAS MVP host');
+    expect(status.hostName, '千私云电脑');
     expect(status.fileBrowserRunning, isTrue);
     expect(status.fileBrowserBaseUrl, 'http://127.0.0.1:38080');
     expect(status.sharedRoot, 'C:/share');
@@ -94,11 +94,9 @@ void main() {
   testWidgets('renders NAS host probe shell', (tester) async {
     await tester.pumpWidget(const NasPhoneApp());
 
-    expect(find.text('连接你的 loal_NAS 宿主'), findsOneWidget);
-    expect(find.text('宿主地址'), findsOneWidget);
-    expect(find.text('连接并加载文件'), findsOneWidget);
-    expect(find.text('尚未探测'), findsOneWidget);
-    expect(find.text('探测结果'), findsOneWidget);
+    expect(find.text('查看并连接你的设备'), findsOneWidget);
+    expect(find.text('扫码获取授权和注册'), findsOneWidget);
+    expect(find.text('扫一扫'), findsOneWidget);
     expect(find.text('文件列表'), findsNothing);
   });
 }
