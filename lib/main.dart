@@ -723,6 +723,7 @@ class _NasHomePageState extends State<NasHomePage> {
     final nonce = _generateNonce();
     final hash = _computeNasHash(secret, ts, nonce);
     return {
+      'X-NAS-Timestamp': '$ts',
       'X-NAS-Nonce': nonce,
       'X-NAS-Hash': hash,
     };
