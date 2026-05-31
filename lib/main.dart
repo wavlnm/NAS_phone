@@ -353,9 +353,9 @@ class _NasHomePageState extends State<NasHomePage> {
     }
   }
 
-  Future<void> _showCloudLoginDialog() async {
+  Future<void> _showCloudLoginDialog({String? prefillUsername}) async {
     final usernameController = TextEditingController(
-      text: _cloudSession?.user.username ?? '',
+      text: prefillUsername ?? _cloudSession?.user.username ?? '',
     );
     final passwordController = TextEditingController();
     var obscurePassword = true;
@@ -743,12 +743,20 @@ class _NasHomePageState extends State<NasHomePage> {
     final deviceId = result['deviceId']?.toString();
     final deviceName = result['deviceName']?.toString();
     final secret = result['secret']?.toString();
+    final ip = result['ip']?.toString();
+    final type = result['type']?.toString();
+    final username = result['username']?.toString();
 
     if (deviceId == null || deviceName == null || secret == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('二维码内容不是有效的设备信息，请重新扫描。')),
       );
       return;
+    }
+
+    // 扫码后将二维码里携带的 IP 自动填到地址栏，方便注册后直接连接。
+    if (ip != null && ip.isNotEmpty) {
+      _hostController.text = ip;
     }
 
     // 持久化保存 secret 和 deviceId，供后续安全通信使用（混淆存储）
@@ -758,6 +766,14 @@ class _NasHomePageState extends State<NasHomePage> {
     _deviceSecret = secret;
 
     if (!mounted) return;
+
+    // type == 'auth' 是电脑端提供的重新授权二维码：只更新本地 secret 并打开登录框，
+    // 不走注册流程，防止电脑端软件更新后 secret 变化导致连不上。
+    if (type == 'auth') {
+      await _showCloudLoginDialog(prefillUsername: username);
+      return;
+    }
+
     await _showRegisterDialog(deviceId: deviceId, deviceName: deviceName);
   }
 
@@ -1889,6 +1905,20 @@ class _NasHomePageState extends State<NasHomePage> {
       return NasHostStatus.fromJson(decoded);
     } on FormatException {
       throw const NasApiException('电脑状态接口返回了非 JSON 内容。');
+    }
+  }
+
+  /// 静默刷新 host 状态（用于"我的"页面进入时拉取最新空间占用）。
+  /// 失败不清空已有数据、不弹错误，下次成功时再更新。
+  Future<void> _refreshHostStatusSilently() async {
+    final baseUri = _baseUri;
+    if (baseUri == null) return;
+    try {
+      final status = await _fetchHostStatus(baseUri);
+      if (!mounted) return;
+      setState(() => _hostStatus = status);
+    } catch (_) {
+      // 保持现有数据不变
     }
   }
 
@@ -4327,9 +4357,13 @@ class _NasHomePageState extends State<NasHomePage> {
       bottomNavigationBar: NavigationBar(
         selectedIndex: _selectedTab.index,
         onDestinationSelected: (index) {
+          final next = MainTab.values[index];
           setState(() {
-            _selectedTab = MainTab.values[index];
+            _selectedTab = next;
           });
+          if (next == MainTab.mine) {
+            unawaited(_refreshHostStatusSilently());
+          }
         },
         destinations: const [
           NavigationDestination(
@@ -6638,6 +6672,9 @@ class _QrScanPageState extends State<_QrScanPage> {
           'deviceId': deviceId,
           'deviceName': deviceName,
           'secret': secret,
+          'ip': decoded['ip']?.toString(),
+          'type': decoded['type']?.toString(),
+          'username': decoded['username']?.toString(),
         });
         return;
       } catch (_) {
