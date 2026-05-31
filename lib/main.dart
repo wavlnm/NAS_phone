@@ -60,6 +60,9 @@ class ActiveTransferTask {
     required this.startedAt,
     required this.targetLocation,
     this.processedFiles = 0,
+    this.transferredBytes = 0,
+    this.totalBytes = 0,
+    this.bytesPerSecond = 0,
   });
 
   final String id;
@@ -68,8 +71,16 @@ class ActiveTransferTask {
   final DateTime startedAt;
   final String targetLocation;
   final int processedFiles;
+  final int transferredBytes;
+  final int totalBytes; // 0 表示总量未知
+  final double bytesPerSecond;
 
-  ActiveTransferTask copyWith({int? processedFiles}) {
+  ActiveTransferTask copyWith({
+    int? processedFiles,
+    int? transferredBytes,
+    int? totalBytes,
+    double? bytesPerSecond,
+  }) {
     return ActiveTransferTask(
       id: id,
       kind: kind,
@@ -77,8 +88,21 @@ class ActiveTransferTask {
       startedAt: startedAt,
       targetLocation: targetLocation,
       processedFiles: processedFiles ?? this.processedFiles,
+      transferredBytes: transferredBytes ?? this.transferredBytes,
+      totalBytes: totalBytes ?? this.totalBytes,
+      bytesPerSecond: bytesPerSecond ?? this.bytesPerSecond,
     );
   }
+}
+
+/// 活跃传输任务的计量与 UI 节流状态（不进入 immutable model）。
+class _TaskMeter {
+  int transferred = 0;
+  int total = 0;
+  DateTime? lastSampleAt;
+  int lastSampleBytes = 0;
+  double bytesPerSecond = 0;
+  DateTime? lastUiUpdateAt;
 }
 
 class LocalNote {
@@ -226,6 +250,7 @@ class _NasHomePageState extends State<NasHomePage> {
   String? _busyEntryPath;
   List<RecentFileVisit> _recentFileVisits = const [];
   List<ActiveTransferTask> _activeTransferTasks = const [];
+  final Map<String, _TaskMeter> _taskMeters = {};
   List<LocalNote> _notes = const [];
   bool _showMainShell = false;
   MainTab _selectedTab = MainTab.home;
@@ -1233,16 +1258,23 @@ class _NasHomePageState extends State<NasHomePage> {
           name: file.name,
           path: _joinResourcePath(_currentDirectory, file.name),
           isDir: false,
-          size: 0,
+          size: file.size >= 0 ? file.size : 0,
         );
         final taskId = _startTransferTask(
           kind: TransferTaskKind.upload,
           entry: uploadEntry,
           targetLocation: _currentDirectory,
+          totalBytes: file.size >= 0 ? file.size : 0,
         );
 
         try {
-          await _uploadFile(baseUri, token, _currentDirectory, file);
+          await _uploadFile(
+            baseUri,
+            token,
+            _currentDirectory,
+            file,
+            onBytes: (delta) => _updateTransferTaskBytes(taskId, delta),
+          );
         } finally {
           _finishTransferTask(taskId);
         }
@@ -1578,6 +1610,7 @@ class _NasHomePageState extends State<NasHomePage> {
       kind: TransferTaskKind.download,
       entry: entry,
       targetLocation: '下载/NAS_Downloads',
+      totalBytes: entry.isDir ? 0 : entry.size,
     );
     var count = 0;
 
@@ -1595,6 +1628,7 @@ class _NasHomePageState extends State<NasHomePage> {
           count++;
           _updateTransferTaskProgress(taskId, count);
         },
+        onBytes: (delta) => _updateTransferTaskBytes(taskId, delta),
       );
 
       // 将 tempBase 下所有文件复制到 MediaStore Downloads
@@ -1972,8 +2006,9 @@ class _NasHomePageState extends State<NasHomePage> {
     Uri baseUri,
     String token,
     String directoryPath,
-    PlatformFile file,
-  ) async {
+    PlatformFile file, {
+    void Function(int deltaBytes)? onBytes,
+  }) async {
     final targetPath = _joinResourcePath(directoryPath, file.name);
     final uri = _buildResourceUri(
       baseUri,
@@ -2001,11 +2036,19 @@ class _NasHomePageState extends State<NasHomePage> {
       }
       // readStream is a lazy stream backed by ContentResolver — no file copy, no OOM
       final readStream = file.readStream;
+      Stream<List<int>> wrap(Stream<List<int>> source) {
+        if (onBytes == null) return source;
+        return source.map((chunk) {
+          if (chunk.isNotEmpty) onBytes(chunk.length);
+          return chunk;
+        });
+      }
+
       if (readStream != null) {
-        await request.addStream(readStream).timeout(uploadTimeout);
+        await request.addStream(wrap(readStream)).timeout(uploadTimeout);
       } else if (file.path != null) {
         await request
-            .addStream(File(file.path!).openRead())
+            .addStream(wrap(File(file.path!).openRead()))
             .timeout(uploadTimeout);
       } else {
         throw const NasApiException('无法读取文件内容，请重试。');
@@ -2152,6 +2195,7 @@ class _NasHomePageState extends State<NasHomePage> {
     FileBrowserEntry entry,
     String localParentDirectory, {
     void Function()? onFileDownloaded,
+    void Function(int deltaBytes)? onBytes,
   }) async {
     if (entry.isDir) {
       final localDirectoryPath = _joinLocalPath(
@@ -2169,6 +2213,7 @@ class _NasHomePageState extends State<NasHomePage> {
           child,
           localDirectoryPath,
           onFileDownloaded: onFileDownloaded,
+          onBytes: onBytes,
         );
       }
 
@@ -2176,7 +2221,13 @@ class _NasHomePageState extends State<NasHomePage> {
     }
 
     final localFilePath = _joinLocalPath(localParentDirectory, entry.name);
-    await _downloadRemoteFileToLocal(baseUri, token, entry.path, localFilePath);
+    await _downloadRemoteFileToLocal(
+      baseUri,
+      token,
+      entry.path,
+      localFilePath,
+      onBytes: onBytes,
+    );
     onFileDownloaded?.call();
     return 1;
   }
@@ -2185,8 +2236,9 @@ class _NasHomePageState extends State<NasHomePage> {
     Uri baseUri,
     String token,
     String resourcePath,
-    String localFilePath,
-  ) async {
+    String localFilePath, {
+    void Function(int deltaBytes)? onBytes,
+  }) async {
     final client = HttpClient()
       ..connectionTimeout = const Duration(seconds: 15);
 
@@ -2213,9 +2265,18 @@ class _NasHomePageState extends State<NasHomePage> {
 
       final outputFile = File(localFilePath);
       await outputFile.parent.create(recursive: true);
-      await response
-          .pipe(outputFile.openWrite())
-          .timeout(const Duration(seconds: 2 * 60));
+      final sink = outputFile.openWrite();
+      try {
+        await response
+            .timeout(const Duration(seconds: 2 * 60))
+            .forEach((chunk) {
+          sink.add(chunk);
+          if (onBytes != null && chunk.isNotEmpty) onBytes(chunk.length);
+        });
+        await sink.flush();
+      } finally {
+        await sink.close();
+      }
     } on TimeoutException {
       throw const NasApiException('下载超时，请稍后重试。');
     } on SocketException catch (error) {
@@ -2634,6 +2695,7 @@ class _NasHomePageState extends State<NasHomePage> {
     required TransferTaskKind kind,
     required FileBrowserEntry entry,
     required String targetLocation,
+    int totalBytes = 0,
   }) {
     final taskId = '${DateTime.now().microsecondsSinceEpoch}:${entry.path}';
     final task = ActiveTransferTask(
@@ -2642,7 +2704,10 @@ class _NasHomePageState extends State<NasHomePage> {
       entry: entry,
       startedAt: DateTime.now(),
       targetLocation: targetLocation,
+      totalBytes: totalBytes,
     );
+
+    _taskMeters[taskId] = _TaskMeter()..total = totalBytes;
 
     setState(() {
       _activeTransferTasks = [task, ..._activeTransferTasks];
@@ -2667,7 +2732,54 @@ class _NasHomePageState extends State<NasHomePage> {
     });
   }
 
+  /// 累加任务已传输字节，并按节流将进度/速度同步到 UI。
+  void _updateTransferTaskBytes(String taskId, int deltaBytes) {
+    final meter = _taskMeters[taskId];
+    if (meter == null) return;
+
+    meter.transferred += deltaBytes;
+    final now = DateTime.now();
+
+    // 速度采样：每 800ms 重采样一次，使用指数加权平滑。
+    meter.lastSampleAt ??= now;
+    final sampleDtMs = now.difference(meter.lastSampleAt!).inMilliseconds;
+    if (sampleDtMs >= 800) {
+      final dBytes = meter.transferred - meter.lastSampleBytes;
+      final instant = dBytes * 1000.0 / sampleDtMs;
+      meter.bytesPerSecond = meter.bytesPerSecond == 0
+          ? instant
+          : meter.bytesPerSecond * 0.6 + instant * 0.4;
+      meter.lastSampleAt = now;
+      meter.lastSampleBytes = meter.transferred;
+    }
+
+    // UI 节流：≥250ms 或首次更新或已完成时才刷新。
+    final ui = meter.lastUiUpdateAt;
+    final isComplete = meter.total > 0 && meter.transferred >= meter.total;
+    if (ui != null &&
+        now.difference(ui).inMilliseconds < 250 &&
+        !isComplete) {
+      return;
+    }
+    meter.lastUiUpdateAt = now;
+
+    if (!mounted) return;
+    setState(() {
+      _activeTransferTasks = _activeTransferTasks
+          .map(
+            (task) => task.id == taskId
+                ? task.copyWith(
+                    transferredBytes: meter.transferred,
+                    bytesPerSecond: meter.bytesPerSecond,
+                  )
+                : task,
+          )
+          .toList(growable: false);
+    });
+  }
+
   void _finishTransferTask(String taskId) {
+    _taskMeters.remove(taskId);
     if (!mounted) {
       return;
     }
@@ -3939,6 +4051,18 @@ class _NasHomePageState extends State<NasHomePage> {
                           ? '目录$actionText · 已处理 ${task.processedFiles} 个文件'
                           : '文件$actionText · 正在传输';
 
+                      final hasTotal = task.totalBytes > 0;
+                      final ratio = hasTotal
+                          ? (task.transferredBytes / task.totalBytes)
+                              .clamp(0.0, 1.0)
+                          : null;
+                      final speedText = task.bytesPerSecond > 0
+                          ? '${_formatFileSize(task.bytesPerSecond.round())}/s'
+                          : '—';
+                      final progressText = hasTotal
+                          ? '${_formatFileSize(task.transferredBytes)} / ${_formatFileSize(task.totalBytes)} · ${(ratio! * 100).toStringAsFixed(ratio >= 0.1 ? 0 : 1)}%'
+                          : '已传输 ${_formatFileSize(task.transferredBytes)}';
+
                       return Container(
                         padding: const EdgeInsets.all(14),
                         decoration: BoxDecoration(
@@ -3987,8 +4111,36 @@ class _NasHomePageState extends State<NasHomePage> {
                               ],
                             ),
                             const SizedBox(height: 12),
-                            const LinearProgressIndicator(),
+                            ClipRRect(
+                              borderRadius: BorderRadius.circular(4),
+                              child: LinearProgressIndicator(
+                                value: ratio,
+                                minHeight: 6,
+                                backgroundColor: const Color(0xFFE2E8F0),
+                              ),
+                            ),
                             const SizedBox(height: 8),
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: Text(
+                                    progressText,
+                                    style: theme.textTheme.bodySmall?.copyWith(
+                                      color: const Color(0xFF334155),
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ),
+                                Text(
+                                  speedText,
+                                  style: theme.textTheme.bodySmall?.copyWith(
+                                    color: const Color(0xFF334155),
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 4),
                             Text(
                               '开始于 ${_formatRelativeTime(task.startedAt)}',
                               style: theme.textTheme.bodySmall?.copyWith(
