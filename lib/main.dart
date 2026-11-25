@@ -230,10 +230,14 @@ class NasHomePage extends StatefulWidget {
   State<NasHomePage> createState() => _NasHomePageState();
 }
 
-class _NasHomePageState extends State<NasHomePage> {
+class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
   final TextEditingController _hostController = TextEditingController();
 
-  CloudSession? _cloudSession;
+  /// 二维码下发的局域网/公网入口，用于自动选路。
+  String? _lanHost;
+  String? _publicHost;
+
+  // CloudSession? _cloudSession; // 云账号功能已停用
   ProbeState _probeState = const ProbeState.idle();
   bool _isProbing = false;
   bool _isLoadingFiles = false;
@@ -262,6 +266,7 @@ class _NasHomePageState extends State<NasHomePage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     unawaited(_loadDeviceSecret());
     // 异步恢复上次的登录/连接状态
     WidgetsBinding.instance.addPostFrameCallback((_) => _restoreAndAutoConnect());
@@ -269,8 +274,30 @@ class _NasHomePageState extends State<NasHomePage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _hostController.dispose();
     super.dispose();
+  }
+
+  /// 从后台回到前台时检查当前地址是否仍可用，不通则自动切换到另一条线路。
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) return;
+    if (!_hasFileSession || _isProbing || _isUploading || _busyEntryPath != null) {
+      return;
+    }
+    unawaited(_recheckConnection());
+  }
+
+  Future<void> _recheckConnection() async {
+    final baseUri = _baseUri;
+    if (baseUri == null) return;
+    try {
+      await _fetchHostStatus(baseUri).timeout(const Duration(seconds: 3));
+    } catch (_) {
+      if (!mounted) return;
+      await _probeHost(preferCandidates: true);
+    }
   }
 
   /// 启动时恢复持久化状态并尝试自动连接。
@@ -279,28 +306,38 @@ class _NasHomePageState extends State<NasHomePage> {
   ///   2. 无 session 但有保存的 host → 直接 _probeHost
   ///   3. 两者都没有 → 不做任何操作，显示连接页
   Future<void> _restoreAndAutoConnect() async {
-    final session = await _loadSavedSession();
-    if (!mounted) return;
-
-    if (session != null) {
-      // 有登录态：云端取最新地址自动连接（含重试逻辑）
-      await _onCloudLoginSuccess(session);
-      return;
+    // 无论有没有登录态，都先加载二维码里保存的局域网/公网入口，保证切换网络时能回退。
+    await _loadEndpoints();
+    await _loadHistory();
+    // 旧版本扫码只写了 endpoints 没进历史列表，这里补录一次
+    if (_lanHost != null && _lanHost!.isNotEmpty) {
+      await _addHistoryEntry(_lanHost!, isLan: true);
     }
+    if (_publicHost != null && _publicHost!.isNotEmpty) {
+      await _addHistoryEntry(_publicHost!, isLan: false);
+    }
+    unawaited(_checkHistoryReachability());
+    // 云账号登录态已停用，不再从云端取地址
+    // final session = await _loadSavedSession();
+    // if (session != null) {
+    //   await _onCloudLoginSuccess(session);
+    //   return;
+    // }
 
     final host = await _loadSavedHost();
     if (!mounted) return;
 
     if (host != null && host.isNotEmpty) {
-      // 无登录态但有上次地址：直接尝试局域网连接
+      // 无登录态但有上次地址：局域网优先尝试，失败再走公网
       _hostController.text = host;
-      await _probeHost();
+      await _probeHost(preferCandidates: true);
     }
   }
 
-  Future<void> _probeHost() async {
-    final baseUri = _buildBaseUri(_hostController.text);
-    if (baseUri == null) {
+  /// 依次尝试候选地址（局域网优先），选中第一个可用的。
+  Future<void> _probeHost({bool preferCandidates = false}) async {
+    final candidates = _hostCandidates(preferCandidates: preferCandidates);
+    if (candidates.isEmpty) {
       _resetFileSession();
       setState(() {
         _probeState = const ProbeState.error(
@@ -317,48 +354,49 @@ class _NasHomePageState extends State<NasHomePage> {
       _fileError = null;
     });
 
+    Object? lastError;
     try {
-      final status = await _fetchHostStatus(baseUri);
+      for (final host in candidates) {
+        final timeout = host == _lanHost
+            ? const Duration(milliseconds: 2500)
+            : const Duration(seconds: 8);
+        try {
+          final result = await _tryConnectHost(host, timeout);
+          if (!mounted) {
+            return;
+          }
 
-      String? token;
-      FileBrowserDirectory? directory;
-      String? fileError;
+          setState(() {
+            _hostController.text = host;
+            _hostStatus = result.status;
+            _baseUri = result.baseUri;
+            _authToken = result.token;
+            _currentDirectory = result.directory?.path ?? '/';
+            _entries = result.directory?.items ?? const [];
+            _fileError = result.fileError;
+            _recentFileVisits = const [];
+            _activeTransferTasks = const [];
+            _showMainShell = result.token != null && result.directory != null;
+            _selectedTab = MainTab.home;
+            _selectedSpace = SpaceScope.personal;
+            _probeState = ProbeState.success(
+              endpoint: result.baseUri.origin,
+              hostName: result.status.hostName,
+              detail: _buildProbeDetail(result.status, fileError: result.fileError),
+            );
+          });
 
-      try {
-        token = await _loginToFileBrowser(baseUri);
-        directory = await _fetchDirectory(baseUri, token, '/');
-      } on NasApiException catch (error) {
-        fileError = error.message;
+          // 连接成功时持久化本次地址，供下次启动直接重连
+          if (result.token != null && result.directory != null) {
+            await _saveLastHost(host);
+            await _rememberEndpoint(host);
+          }
+          return;
+        } catch (error) {
+          lastError = error;
+        }
       }
 
-      if (!mounted) {
-        return;
-      }
-
-      setState(() {
-        _hostStatus = status;
-        _baseUri = baseUri;
-        _authToken = token;
-        _currentDirectory = directory?.path ?? '/';
-        _entries = directory?.items ?? const [];
-        _fileError = fileError;
-        _recentFileVisits = const [];
-        _activeTransferTasks = const [];
-        _showMainShell = token != null && directory != null;
-        _selectedTab = MainTab.home;
-        _selectedSpace = SpaceScope.personal;
-        _probeState = ProbeState.success(
-          endpoint: baseUri.origin,
-          hostName: status.hostName,
-          detail: _buildProbeDetail(status, fileError: fileError),
-        );
-      });
-
-      // 连接成功时持久化本次地址，供下次启动直接重连
-      if (token != null && directory != null) {
-        await _saveLastHost(_hostController.text);
-      }
-    } on NasApiException catch (error) {
       if (!mounted) {
         return;
       }
@@ -367,8 +405,15 @@ class _NasHomePageState extends State<NasHomePage> {
       setState(() {
         _hostStatus = null;
         _showMainShell = false;
-        _probeState = ProbeState.error(error.message);
+        _probeState = ProbeState.error(
+          lastError is NasApiException
+              ? lastError.message
+              : _publicHost == null || _publicHost!.isEmpty
+              ? '无法连接电脑：局域网不可达，且没有保存公网入口。请重新扫二维码或手动输入公网地址（如 101.200.13.82:5034）。'
+              : '无法连接电脑：局域网和公网地址都不可达。',
+        );
       });
+      unawaited(_checkHistoryReachability());
     } finally {
       if (mounted) {
         setState(() {
@@ -378,265 +423,347 @@ class _NasHomePageState extends State<NasHomePage> {
     }
   }
 
-  Future<void> _showCloudLoginDialog({String? prefillUsername}) async {
-    final usernameController = TextEditingController(
-      text: prefillUsername ?? _cloudSession?.user.username ?? '',
-    );
-    final passwordController = TextEditingController();
-    var obscurePassword = true;
-    var isSubmitting = false;
-    String? inlineError;
-
-    final result = await showDialog<CloudSession>(
-      context: context,
-      builder: (dialogContext) {
-        return StatefulBuilder(
-          builder: (context, setDialogState) {
-            Future<void> submitLogin() async {
-              final username = usernameController.text.trim();
-              final password = passwordController.text;
-
-              if (username.isEmpty || password.isEmpty) {
-                setDialogState(() {
-                  inlineError = '请输入账号和密码。';
-                });
-                return;
-              }
-
-              setDialogState(() {
-                isSubmitting = true;
-                inlineError = null;
-              });
-
-              try {
-                final session = await _loginToCloudAccount(username, password);
-                if (!dialogContext.mounted) {
-                  return;
-                }
-
-                Navigator.of(dialogContext).pop(session);
-              } on NasApiException catch (error) {
-                if (!dialogContext.mounted) {
-                  return;
-                }
-
-                setDialogState(() {
-                  inlineError = error.message;
-                  isSubmitting = false;
-                });
-              }
-            }
-
-            return AlertDialog(
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(28),
-              ),
-              titlePadding: const EdgeInsets.fromLTRB(24, 24, 24, 12),
-              contentPadding: const EdgeInsets.fromLTRB(24, 0, 24, 0),
-              actionsPadding: const EdgeInsets.fromLTRB(24, 16, 24, 24),
-              title: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: const [
-                  Text('登录云账号'),
-                  SizedBox(height: 8),
-                  Text(
-                    '输入账号和密码进行登录。没有账号时，请使用下方扫码注册卡片。',
-                    style: TextStyle(
-                      fontSize: 13,
-                      color: Color(0xFF64748B),
-                      height: 1.5,
-                    ),
-                  ),
-                ],
-              ),
-              content: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  TextField(
-                    controller: usernameController,
-                    autofocus: true,
-                    decoration: const InputDecoration(
-                      labelText: '账号 / 邮箱 / 手机号',
-                      border: OutlineInputBorder(),
-                      prefixIcon: Icon(Icons.person_outline_rounded),
-                    ),
-                    textInputAction: TextInputAction.next,
-                    onSubmitted: (_) =>
-                        FocusScope.of(dialogContext).nextFocus(),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: passwordController,
-                    obscureText: obscurePassword,
-                    decoration: InputDecoration(
-                      labelText: '密码',
-                      border: const OutlineInputBorder(),
-                      prefixIcon: const Icon(Icons.lock_outline_rounded),
-                      suffixIcon: IconButton(
-                        onPressed: () {
-                          setDialogState(() {
-                            obscurePassword = !obscurePassword;
-                          });
-                        },
-                        icon: Icon(
-                          obscurePassword
-                              ? Icons.visibility_outlined
-                              : Icons.visibility_off_outlined,
-                        ),
-                      ),
-                    ),
-                    textInputAction: TextInputAction.done,
-                    onSubmitted: (_) {
-                      if (!isSubmitting) {
-                        submitLogin();
-                      }
-                    },
-                  ),
-                  if (inlineError != null) ...[
-                    const SizedBox(height: 12),
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(
-                        inlineError!,
-                        style: const TextStyle(
-                          color: Color(0xFFB42318),
-                          height: 1.4,
-                        ),
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-              actions: [
-                TextButton(
-                  onPressed: isSubmitting
-                      ? null
-                      : () => Navigator.of(dialogContext).pop(),
-                  child: const Text('取消'),
-                ),
-                FilledButton(
-                  onPressed: isSubmitting ? null : submitLogin,
-                  child: isSubmitting
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Text('登录'),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
-
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      usernameController.dispose();
-      passwordController.dispose();
-    });
-
-    if (!mounted || result == null) {
-      return;
+  /// 候选地址顺序：preferCandidates 时局域网 → 公网 → 当前输入；否则当前输入优先。
+  List<String> _hostCandidates({bool preferCandidates = false}) {
+    final current = _hostController.text.trim();
+    final ordered = <String>[];
+    void add(String? host) {
+      final value = host?.trim();
+      if (value != null && value.isNotEmpty && !ordered.contains(value)) {
+        ordered.add(value);
+      }
     }
 
-    await _onCloudLoginSuccess(result);
+    if (preferCandidates) {
+      add(_lanHost);
+      add(_publicHost);
+      for (final record in _endpointHistory) {
+        add(record.host);
+      }
+      add(current);
+    } else {
+      add(current);
+      add(_lanHost);
+      add(_publicHost);
+      for (final record in _endpointHistory) {
+        add(record.host);
+      }
+    }
+    return ordered;
   }
+
+  /// 尝试连接单个地址：状态接口 + 文件服务登录 + 根目录列表。
+  Future<
+      ({
+        Uri baseUri,
+        NasHostStatus status,
+        String? token,
+        FileBrowserDirectory? directory,
+        String? fileError,
+      })> _tryConnectHost(String host, Duration timeout) async {
+    final baseUri = _buildBaseUri(host);
+    if (baseUri == null) {
+      throw const NasApiException('设备地址格式不正确。');
+    }
+
+    try {
+      return await () async {
+        final status = await _fetchHostStatus(baseUri);
+
+        String? token;
+        FileBrowserDirectory? directory;
+        String? fileError;
+        try {
+          token = await _loginToFileBrowser(baseUri);
+          directory = await _fetchDirectory(baseUri, token, '/');
+        } on NasApiException catch (error) {
+          fileError = error.message;
+        }
+
+        return (
+          baseUri: baseUri,
+          status: status,
+          token: token,
+          directory: directory,
+          fileError: fileError,
+        );
+      }()
+          .timeout(timeout);
+    } on TimeoutException {
+      throw const NasApiException('连接超时，请确认电脑在线且网络可达。');
+    } on SocketException catch (error) {
+      throw NasApiException('无法连接电脑：${error.message}');
+    }
+  }
+
+  // ---- 云账号功能已停用：_showCloudLoginDialog ----
+//   Future<void> _showCloudLoginDialog({String? prefillUsername}
+// ) async {
+//     final usernameController = TextEditingController(
+//       text: prefillUsername ?? _cloudSession?.user.username ?? '',
+//     );
+//     final passwordController = TextEditingController();
+//     var obscurePassword = true;
+//     var isSubmitting = false;
+//     String? inlineError;
+//
+//     final result = await showDialog<CloudSession>(
+//       context: context,
+//       builder: (dialogContext) {
+//         return StatefulBuilder(
+//           builder: (context, setDialogState) {
+//             Future<void> submitLogin() async {
+//               final username = usernameController.text.trim();
+//               final password = passwordController.text;
+//
+//               if (username.isEmpty || password.isEmpty) {
+//                 setDialogState(() {
+//                   inlineError = '请输入账号和密码。';
+//                 });
+//                 return;
+//               }
+//
+//               setDialogState(() {
+//                 isSubmitting = true;
+//                 inlineError = null;
+//               });
+//
+//               try {
+//                 final session = await _loginToCloudAccount(username, password);
+//                 if (!dialogContext.mounted) {
+//                   return;
+//                 }
+//
+//                 Navigator.of(dialogContext).pop(session);
+//               } on NasApiException catch (error) {
+//                 if (!dialogContext.mounted) {
+//                   return;
+//                 }
+//
+//                 setDialogState(() {
+//                   inlineError = error.message;
+//                   isSubmitting = false;
+//                 });
+//               }
+//             }
+//
+//             return AlertDialog(
+//               shape: RoundedRectangleBorder(
+//                 borderRadius: BorderRadius.circular(28),
+//               ),
+//               titlePadding: const EdgeInsets.fromLTRB(24, 24, 24, 12),
+//               contentPadding: const EdgeInsets.fromLTRB(24, 0, 24, 0),
+//               actionsPadding: const EdgeInsets.fromLTRB(24, 16, 24, 24),
+//               title: Column(
+//                 crossAxisAlignment: CrossAxisAlignment.start,
+//                 mainAxisSize: MainAxisSize.min,
+//                 children: const [
+//                   Text('登录云账号'),
+//                   SizedBox(height: 8),
+//                   Text(
+//                     '输入账号和密码进行登录。没有账号时，请使用下方扫码注册卡片。',
+//                     style: TextStyle(
+//                       fontSize: 13,
+//                       color: Color(0xFF64748B),
+//                       height: 1.5,
+//                     ),
+//                   ),
+//                 ],
+//               ),
+//               content: Column(
+//                 mainAxisSize: MainAxisSize.min,
+//                 children: [
+//                   TextField(
+//                     controller: usernameController,
+//                     autofocus: true,
+//                     decoration: const InputDecoration(
+//                       labelText: '账号 / 邮箱 / 手机号',
+//                       border: OutlineInputBorder(),
+//                       prefixIcon: Icon(Icons.person_outline_rounded),
+//                     ),
+//                     textInputAction: TextInputAction.next,
+//                     onSubmitted: (_) =>
+//                         FocusScope.of(dialogContext).nextFocus(),
+//                   ),
+//                   const SizedBox(height: 12),
+//                   TextField(
+//                     controller: passwordController,
+//                     obscureText: obscurePassword,
+//                     decoration: InputDecoration(
+//                       labelText: '密码',
+//                       border: const OutlineInputBorder(),
+//                       prefixIcon: const Icon(Icons.lock_outline_rounded),
+//                       suffixIcon: IconButton(
+//                         onPressed: () {
+//                           setDialogState(() {
+//                             obscurePassword = !obscurePassword;
+//                           });
+//                         },
+//                         icon: Icon(
+//                           obscurePassword
+//                               ? Icons.visibility_outlined
+//                               : Icons.visibility_off_outlined,
+//                         ),
+//                       ),
+//                     ),
+//                     textInputAction: TextInputAction.done,
+//                     onSubmitted: (_) {
+//                       if (!isSubmitting) {
+//                         submitLogin();
+//                       }
+//                     },
+//                   ),
+//                   if (inlineError != null) ...[
+//                     const SizedBox(height: 12),
+//                     Align(
+//                       alignment: Alignment.centerLeft,
+//                       child: Text(
+//                         inlineError!,
+//                         style: const TextStyle(
+//                           color: Color(0xFFB42318),
+//                           height: 1.4,
+//                         ),
+//                       ),
+//                     ),
+//                   ],
+//                 ],
+//               ),
+//               actions: [
+//                 TextButton(
+//                   onPressed: isSubmitting
+//                       ? null
+//                       : () => Navigator.of(dialogContext).pop(),
+//                   child: const Text('取消'),
+//                 ),
+//                 FilledButton(
+//                   onPressed: isSubmitting ? null : submitLogin,
+//                   child: isSubmitting
+//                       ? const SizedBox(
+//                           width: 18,
+//                           height: 18,
+//                           child: CircularProgressIndicator(strokeWidth: 2),
+//                         )
+//                       : const Text('登录'),
+//                 ),
+//               ],
+//             );
+//           },
+//         );
+//       },
+//     );
+//
+//     WidgetsBinding.instance.addPostFrameCallback((_) {
+//       usernameController.dispose();
+//       passwordController.dispose();
+//     });
+//
+//     if (!mounted || result == null) {
+//       return;
+//     }
+//
+//     await _onCloudLoginSuccess(result);
+//   }
 
   // ── 登录后自动连接 ─────────────────────────────────────────────────────────
 
   /// 云账号登录成功后的统一处理：保存 session，并尝试从云端获取 IPv6 地址自动连接设备。
   /// 若首次 ipv6Address 为空，每隔 1 秒轮询 /users/me，最多重试 2 次（共 3 次检查）。
-  Future<void> _onCloudLoginSuccess(CloudSession session) async {
-    if (!mounted) return;
-    setState(() => _cloudSession = session);
-    await _saveSession(session); // 持久化登录态
-
-    // 最多检查 3 次（首次 + 2 次重试）
-    String? ipv6 = session.user.ipv6Address;
-    for (var attempt = 1; attempt <= 2 && (ipv6 == null || ipv6.isEmpty); attempt++) {
-      await Future<void>.delayed(const Duration(seconds: 1));
-      if (!mounted) return;
-      try {
-        final user = await _fetchCloudUserInfo(session.accessToken);
-        ipv6 = user.ipv6Address;
-      } catch (_) {
-        // 网络失败则直接跳出，稍后提示
-        break;
-      }
-    }
-
-    if (!mounted) return;
-
-    if (ipv6 != null && ipv6.isNotEmpty) {
-      // 填入地址栏并自动发起探测连接
-      _hostController.text = ipv6;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('已登录 ${session.user.username}，正在自动连接设备…'),
-          duration: const Duration(seconds: 3),
-        ),
-      );
-      await _probeHost();
-    } else {
-      // 3 次均未获取到地址
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            '已登录 ${session.user.username}，但未能获取到电脑端地址。\n'
-            '请确认电脑端网络已就绪，或在局域网内手动输入地址连接。',
-          ),
-          duration: const Duration(seconds: 6),
-        ),
-      );
-    }
-  }
+  // ---- 云账号功能已停用：_onCloudLoginSuccess ----
+//   Future<void> _onCloudLoginSuccess(CloudSession session) async {
+//     if (!mounted) return;
+//     await _loadEndpoints(); // 云端地址只作为候选之一，仍需带上二维码保存的公网入口
+//     if (!mounted) return;
+//     setState(() => _cloudSession = session);
+//     await _saveSession(session); // 持久化登录态
+//
+//     // 最多检查 3 次（首次 + 2 次重试）
+//     String? ipv6 = session.user.ipv6Address;
+//     for (var attempt = 1; attempt <= 2 && (ipv6 == null || ipv6.isEmpty); attempt++) {
+//       await Future<void>.delayed(const Duration(seconds: 1));
+//       if (!mounted) return;
+//       try {
+//         final user = await _fetchCloudUserInfo(session.accessToken);
+//         ipv6 = user.ipv6Address;
+//       } catch (_) {
+//         // 网络失败则直接跳出，稍后提示
+//         break;
+//       }
+//     }
+//
+//     if (!mounted) return;
+//
+//     if (ipv6 != null && ipv6.isNotEmpty) {
+//       // 填入地址栏并自动发起探测连接
+//       _hostController.text = ipv6;
+//       ScaffoldMessenger.of(context).showSnackBar(
+//         SnackBar(
+//           content: Text('已登录 ${session.user.username}，正在自动连接设备…'),
+//           duration: const Duration(seconds: 3),
+//         ),
+//       );
+//       await _probeHost(preferCandidates: true);
+//     } else {
+//       // 3 次均未获取到地址
+//       ScaffoldMessenger.of(context).showSnackBar(
+//         SnackBar(
+//           content: Text(
+//             '已登录 ${session.user.username}，但未能获取到电脑端地址。\n'
+//             '请确认电脑端网络已就绪，或在局域网内手动输入地址连接。',
+//           ),
+//           duration: const Duration(seconds: 6),
+//         ),
+//       );
+//     }
+//   }
 
   /// 使用 Bearer Token 查询自己的最新用户信息（主要用于获取 ipv6Address）。
-  Future<CloudUser> _fetchCloudUserInfo(String accessToken) async {
-    final response = await _sendCloudTextRequest(
-      Uri.parse('https://reportzs.me/nas-api/users/me'),
-      headers: {
-        HttpHeaders.acceptHeader: 'application/json',
-        HttpHeaders.authorizationHeader: 'Bearer $accessToken',
-      },
-    );
-    late final Map<String, dynamic> decoded;
-    try {
-      decoded = _decodeJsonObject(response.body, invalidMessage: '用户信息接口返回了无法解析的内容。');
-    } on NasApiException {
-      throw NasApiException('获取用户信息失败：${response.statusCode}。');
-    }
-    if (decoded['success'] != true) {
-      final err = decoded['error']?.toString();
-      throw NasApiException(err?.isNotEmpty == true ? err! : '获取用户信息失败。');
-    }
-    final userRaw = decoded['user'];
-    if (userRaw is! Map) throw const NasApiException('用户信息字段缺失。');
-    return CloudUser.fromJson(Map<String, dynamic>.from(userRaw));
-  }
+  // ---- 云账号功能已停用：_fetchCloudUserInfo ----
+//   Future<CloudUser> _fetchCloudUserInfo(String accessToken) async {
+//     final response = await _sendCloudTextRequest(
+//       Uri.parse('https://reportzs.me/nas-api/users/me'),
+//       headers: {
+//         HttpHeaders.acceptHeader: 'application/json',
+//         HttpHeaders.authorizationHeader: 'Bearer $accessToken',
+//       },
+//     );
+//     late final Map<String, dynamic> decoded;
+//     try {
+//       decoded = _decodeJsonObject(response.body, invalidMessage: '用户信息接口返回了无法解析的内容。');
+//     } on NasApiException {
+//       throw NasApiException('获取用户信息失败：${response.statusCode}。');
+//     }
+//     if (decoded['success'] != true) {
+//       final err = decoded['error']?.toString();
+//       throw NasApiException(err?.isNotEmpty == true ? err! : '获取用户信息失败。');
+//     }
+//     final userRaw = decoded['user'];
+//     if (userRaw is! Map) throw const NasApiException('用户信息字段缺失。');
+//     return CloudUser.fromJson(Map<String, dynamic>.from(userRaw));
+//   }
 
   // ── 状态持久化 ─────────────────────────────────────────────────────────────
 
-  static const _kSessionKey = 'cloud_session_v1';
+  // static const _kSessionKey = 'cloud_session_v1'; // 云账号功能已停用
   static const _kLastHostKey = 'last_connected_host';
+  static const _kEndpointsKey = 'nas_endpoints_v1';
 
   /// 将 CloudSession 序列化后存入 SharedPreferences。
-  Future<void> _saveSession(CloudSession session) async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_kSessionKey, jsonEncode(session.toJson()));
-    } catch (_) {}
-  }
+  // ---- 云账号功能已停用：_saveSession ----
+//   Future<void> _saveSession(CloudSession session) async {
+//     try {
+//       final prefs = await SharedPreferences.getInstance();
+//       await prefs.setString(_kSessionKey, jsonEncode(session.toJson()));
+//     } catch (_) {}
+//   }
 
   /// 清除持久化的 session（退出登录时调用）。
-  Future<void> _clearSession() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.remove(_kSessionKey);
-    } catch (_) {}
-  }
+  // ---- 云账号功能已停用：_clearSession ----
+//   Future<void> _clearSession() async {
+//     try {
+//       final prefs = await SharedPreferences.getInstance();
+//       await prefs.remove(_kSessionKey);
+//     } catch (_) {}
+//   }
 
   /// 保存最近一次成功连接的设备地址。
   Future<void> _saveLastHost(String host) async {
@@ -647,26 +774,27 @@ class _NasHomePageState extends State<NasHomePage> {
   }
 
   /// 从本地加载已保存的 CloudSession；若过期或不存在则返回 null。
-  Future<CloudSession?> _loadSavedSession() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final raw = prefs.getString(_kSessionKey);
-      if (raw == null || raw.isEmpty) return null;
-      final json = _decodeJsonObject(raw, invalidMessage: '');
-      final session = CloudSession.fromJson(json);
-      if (session.accessToken.isEmpty) return null;
-      // 已过期则丢弃（提前 30 分钟视为过期）
-      final expires = session.expiresAt;
-      if (expires != null &&
-          expires.isBefore(DateTime.now().add(const Duration(minutes: 30)))) {
-        await _clearSession();
-        return null;
-      }
-      return session;
-    } catch (_) {
-      return null;
-    }
-  }
+  // ---- 云账号功能已停用：_loadSavedSession ----
+//   Future<CloudSession?> _loadSavedSession() async {
+//     try {
+//       final prefs = await SharedPreferences.getInstance();
+//       final raw = prefs.getString(_kSessionKey);
+//       if (raw == null || raw.isEmpty) return null;
+//       final json = _decodeJsonObject(raw, invalidMessage: '');
+//       final session = CloudSession.fromJson(json);
+//       if (session.accessToken.isEmpty) return null;
+//       // 已过期则丢弃（提前 30 分钟视为过期）
+//       final expires = session.expiresAt;
+//       if (expires != null &&
+//           expires.isBefore(DateTime.now().add(const Duration(minutes: 30)))) {
+//         await _clearSession();
+//         return null;
+//       }
+//       return session;
+//     } catch (_) {
+//       return null;
+//     }
+//   }
 
   /// 从本地加载上次连接的设备地址。
   Future<String?> _loadSavedHost() async {
@@ -676,6 +804,287 @@ class _NasHomePageState extends State<NasHomePage> {
     } catch (_) {
       return null;
     }
+  }
+
+  // ── 历史地址列表：连接成功过或扫码得到的地址，带可达性探测 ──────────────────
+  static const _kHistoryKey = 'nas_endpoint_history_v1';
+  List<_EndpointRecord> _endpointHistory = [];
+  final Map<String, bool> _endpointReachable = {};
+  bool _isCheckingHistory = false;
+
+  String _normalizeEndpointHost(String input) {
+    final uri = _buildBaseUri(input);
+    return uri?.host ?? input.trim();
+  }
+
+  Future<void> _loadHistory() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_kHistoryKey);
+      if (raw == null || raw.isEmpty) return;
+      final decoded = jsonDecode(raw);
+      if (decoded is List) {
+        _endpointHistory = decoded
+            .whereType<Map>()
+            .map((e) => _EndpointRecord.fromJson(Map<String, dynamic>.from(e)))
+            .toList();
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _saveHistory() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        _kHistoryKey,
+        jsonEncode(_endpointHistory.map((e) => e.toJson()).toList()),
+      );
+    } catch (_) {}
+  }
+
+  Future<void> _addHistoryEntry(
+    String host, {
+    required bool isLan,
+    bool success = false,
+  }) async {
+    final normalized = _normalizeEndpointHost(host);
+    if (normalized.isEmpty) return;
+
+    final index = _endpointHistory.indexWhere((e) => e.host == normalized);
+    if (index >= 0) {
+      final old = _endpointHistory[index];
+      _endpointHistory[index] = _EndpointRecord(
+        host: normalized,
+        isLan: isLan,
+        lastSuccess: success ? DateTime.now() : old.lastSuccess,
+      );
+    } else {
+      _endpointHistory.add(_EndpointRecord(
+        host: normalized,
+        isLan: isLan,
+        lastSuccess: success ? DateTime.now() : null,
+      ));
+    }
+
+    _endpointHistory.sort((a, b) {
+      final at = a.lastSuccess?.millisecondsSinceEpoch ?? 0;
+      final bt = b.lastSuccess?.millisecondsSinceEpoch ?? 0;
+      return bt.compareTo(at);
+    });
+    if (_endpointHistory.length > 12) {
+      _endpointHistory = _endpointHistory.take(12).toList();
+    }
+    await _saveHistory();
+    if (mounted) setState(() {});
+  }
+
+  /// Android 无 root 不能发 ICMP ping，这里用 TCP + 状态接口探测，效果等同且更准。
+  Future<void> _checkHistoryReachability() async {
+    if (_isCheckingHistory || _endpointHistory.isEmpty) return;
+    _isCheckingHistory = true;
+    try {
+      for (final record in List<_EndpointRecord>.from(_endpointHistory)) {
+        if (!mounted) return;
+        final baseUri = _buildBaseUri(record.host);
+        if (baseUri == null) continue;
+        var ok = false;
+        try {
+          await _fetchHostStatus(baseUri).timeout(
+            record.isLan
+                ? const Duration(milliseconds: 1500)
+                : const Duration(seconds: 4),
+          );
+          ok = true;
+        } catch (_) {
+          ok = false;
+        }
+        if (!mounted) return;
+        setState(() => _endpointReachable[record.host] = ok);
+      }
+    } finally {
+      _isCheckingHistory = false;
+    }
+  }
+
+  Widget _buildEndpointHistoryCard(BuildContext context, ThemeData theme) {
+    final metrics = _ConnectionPageMetrics.of(context);
+    return _buildSectionCard(
+      contextOverride: context,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  '历史地址',
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              IconButton(
+                onPressed: _isCheckingHistory
+                    ? null
+                    : () => _checkHistoryReachability(),
+                icon: const Icon(Icons.refresh_rounded, size: 20),
+                color: const Color(0xFF64748B),
+                tooltip: '重新探测',
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '点按地址即可填入并连接；绿勾表示当前可通，感叹号表示不通。',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: const Color(0xFF64748B),
+              height: 1.5,
+            ),
+          ),
+          SizedBox(height: metrics.sectionSpacing * 0.7),
+          if (_endpointHistory.isEmpty)
+            Text(
+              '还没有记录。扫码或成功连接一次后，地址会自动出现在这里。',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: const Color(0xFF94A3B8),
+              ),
+            )
+          else
+            for (final record in _endpointHistory) ...[
+              InkWell(
+                onTap: _isProbing
+                    ? null
+                    : () {
+                        _hostController.text = record.host;
+                        _probeHost();
+                      },
+                borderRadius: BorderRadius.circular(metrics.inputRadius),
+                child: Padding(
+                  padding: EdgeInsets.symmetric(
+                    vertical: metrics.badgeVerticalPadding + 2,
+                    horizontal: 4,
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        _endpointReachable[record.host] == true
+                            ? Icons.check_circle_rounded
+                            : _endpointReachable[record.host] == false
+                                ? Icons.error_outline_rounded
+                                : Icons.hourglass_empty_rounded,
+                        size: 20,
+                        color: _endpointReachable[record.host] == true
+                            ? const Color(0xFF16A34A)
+                            : _endpointReachable[record.host] == false
+                                ? const Color(0xFFF59E0B)
+                                : const Color(0xFF94A3B8),
+                      ),
+                      SizedBox(width: metrics.inlineSpacing * 0.6),
+                      Expanded(
+                        child: Text(
+                          record.host,
+                          style: theme.textTheme.bodyMedium?.copyWith(
+                            color: const Color(0xFF0F172A),
+                            fontWeight: FontWeight.w600,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 8, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: record.isLan
+                              ? const Color(0xFFEFF6FF)
+                              : const Color(0xFFECFDF5),
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                        child: Text(
+                          record.isLan ? '局域网' : '公网',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            color: record.isLan
+                                ? const Color(0xFF2563EB)
+                                : const Color(0xFF047857),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      const Icon(Icons.chevron_right_rounded,
+                          size: 20, color: Color(0xFF94A3B8)),
+                    ],
+                  ),
+                ),
+              ),
+              if (record != _endpointHistory.last)
+                const Divider(height: 1, color: Color(0xFFF1F5F9)),
+            ],
+        ],
+      ),
+    );
+  }
+
+  /// 保存二维码下发的局域网/公网入口，供自动选路使用。
+  Future<void> _saveEndpoints({String? lan, String? publicHost}) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (lan != null) _lanHost = lan;
+      if (publicHost != null) _publicHost = publicHost;
+      await prefs.setString(
+        _kEndpointsKey,
+        jsonEncode({'lan': _lanHost, 'public': _publicHost}),
+      );
+    } catch (_) {}
+  }
+
+  /// 连接成功后按地址类型记住入口：内网地址记为局域网，其余记为公网。
+  /// 这样即使没有重新扫码，手动填一次地址也能被自动保存下来。
+  Future<void> _rememberEndpoint(String host) async {
+    final value = host.trim();
+    if (value.isEmpty) return;
+
+    final withoutScheme = value.contains('://')
+        ? value.substring(value.indexOf('://') + 3)
+        : value;
+    var hostPart = withoutScheme.split('/').first;
+    if (hostPart.startsWith('[')) {
+      final end = hostPart.indexOf(']');
+      hostPart = end > 0 ? hostPart.substring(1, end) : hostPart;
+    } else {
+      hostPart = hostPart.split(':').first;
+    }
+
+    final lower = hostPart.toLowerCase();
+    final isPrivate =
+        lower == 'localhost' ||
+        lower.startsWith('127.') ||
+        lower.startsWith('10.') ||
+        lower.startsWith('192.168.') ||
+        RegExp(r'^172\.(1[6-9]|2\d|3[01])\.').hasMatch(lower) ||
+        lower.startsWith('fe80') ||
+        lower.startsWith('fd') ||
+        lower.startsWith('::1');
+
+    if (isPrivate) {
+      if (_lanHost != value) await _saveEndpoints(lan: value);
+    } else {
+      if (_publicHost != value) await _saveEndpoints(publicHost: value);
+    }
+    await _addHistoryEntry(value, isLan: isPrivate, success: true);
+  }
+
+  Future<void> _loadEndpoints() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_kEndpointsKey);
+      if (raw == null || raw.isEmpty) return;
+      final decoded = jsonDecode(raw);
+      if (decoded is Map) {
+        _lanHost = decoded['lan']?.toString();
+        _publicHost = decoded['public']?.toString();
+      }
+    } catch (_) {}
   }
 
   // ── NAS 访问鉴权 ──────────────────────────────────────────────────────────
@@ -769,8 +1178,10 @@ class _NasHomePageState extends State<NasHomePage> {
     final deviceName = result['deviceName']?.toString();
     final secret = result['secret']?.toString();
     final ip = result['ip']?.toString();
-    final type = result['type']?.toString();
-    final username = result['username']?.toString();
+    final lan = result['lan']?.toString();
+    final publicHost = result['public']?.toString();
+    // final type = result['type']?.toString(); // 云账号功能已停用
+    // final username = result['username']?.toString(); // 云账号功能已停用
 
     if (deviceId == null || deviceName == null || secret == null) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -779,9 +1190,19 @@ class _NasHomePageState extends State<NasHomePage> {
       return;
     }
 
-    // 扫码后将二维码里携带的 IP 自动填到地址栏，方便注册后直接连接。
-    if (ip != null && ip.isNotEmpty) {
-      _hostController.text = ip;
+    // 扫码后保存二维码里的局域网/公网入口，自动选择可用的那条线路。
+    if ((lan != null && lan.isNotEmpty) || (publicHost != null && publicHost.isNotEmpty)) {
+      await _saveEndpoints(
+        lan: lan?.isNotEmpty == true ? lan : null,
+        publicHost: publicHost?.isNotEmpty == true ? publicHost : null,
+      );
+    }
+
+    final preferredHost = (lan != null && lan.isNotEmpty)
+        ? lan
+        : (ip != null && ip.isNotEmpty ? ip : publicHost);
+    if (preferredHost != null && preferredHost.isNotEmpty) {
+      _hostController.text = preferredHost;
     }
 
     // 持久化保存 secret 和 deviceId，供后续安全通信使用（混淆存储）
@@ -792,331 +1213,342 @@ class _NasHomePageState extends State<NasHomePage> {
 
     if (!mounted) return;
 
-    // type == 'auth' 是电脑端提供的重新授权二维码：只更新本地 secret 并打开登录框，
-    // 不走注册流程，防止电脑端软件更新后 secret 变化导致连不上。
-    if (type == 'auth') {
-      await _showCloudLoginDialog(prefillUsername: username);
-      return;
+    // 云账号注册/登录已停用：扫码拿到凭证后直接连接设备
+    // if (type == 'auth') {
+    //   await _showCloudLoginDialog(prefillUsername: username);
+    //   return;
+    // }
+    // await _showRegisterDialog(deviceId: deviceId, deviceName: deviceName);
+    if (lan != null && lan.isNotEmpty) {
+      await _addHistoryEntry(lan, isLan: true);
     }
-
-    await _showRegisterDialog(deviceId: deviceId, deviceName: deviceName);
+    if (publicHost != null && publicHost.isNotEmpty) {
+      await _addHistoryEntry(publicHost, isLan: false);
+    }
+    if (preferredHost != null && preferredHost.isNotEmpty) {
+      await _probeHost(preferCandidates: true);
+    }
   }
 
   /// 注册对话框：输入账号和密码，调用注册接口。
-  Future<void> _showRegisterDialog({
-    required String deviceId,
-    required String deviceName,
-  }) async {
-    final usernameCtrl = TextEditingController();
-    final passwordCtrl = TextEditingController();
-    var obscure = true;
-    var submitting = false;
-    String? inlineError;
-
-    final registered = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (dialogContext) {
-        return StatefulBuilder(
-          builder: (context, setDialogState) {
-            Future<void> submit() async {
-              final username = usernameCtrl.text.trim();
-              final password = passwordCtrl.text;
-              if (username.isEmpty || password.isEmpty) {
-                setDialogState(() => inlineError = '请输入账号和密码。');
-                return;
-              }
-              setDialogState(() {
-                submitting = true;
-                inlineError = null;
-              });
-              try {
-                await _registerToCloud(
-                  username: username,
-                  password: password,
-                  deviceId: deviceId,
-                );
-                if (!dialogContext.mounted) return;
-                Navigator.of(dialogContext).pop(true);
-              } on NasApiException catch (e) {
-                if (!dialogContext.mounted) return;
-                setDialogState(() {
-                  inlineError = e.message;
-                  submitting = false;
-                });
-              }
-            }
-
-            return AlertDialog(
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(28)),
-              titlePadding: const EdgeInsets.fromLTRB(24, 24, 24, 12),
-              contentPadding: const EdgeInsets.fromLTRB(24, 0, 24, 0),
-              actionsPadding: const EdgeInsets.fromLTRB(24, 16, 24, 24),
-              title: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Text('注册云账号'),
-                  const SizedBox(height: 8),
-                  Text(
-                    '绑定设备：$deviceName\n设备网络地址易变，注册云账号即可实时获取最新连接地址。',
-                    style: const TextStyle(
-                      fontSize: 13,
-                      color: Color(0xFF64748B),
-                      height: 1.5,
-                    ),
-                  ),
-                ],
-              ),
-              content: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  TextField(
-                    controller: usernameCtrl,
-                    autofocus: true,
-                    decoration: const InputDecoration(
-                      labelText: '账号（用户名）',
-                      border: OutlineInputBorder(),
-                      prefixIcon: Icon(Icons.person_outline_rounded),
-                    ),
-                    textInputAction: TextInputAction.next,
-                    onSubmitted: (_) =>
-                        FocusScope.of(dialogContext).nextFocus(),
-                  ),
-                  const SizedBox(height: 12),
-                  StatefulBuilder(
-                    builder: (_, setObscure) => TextField(
-                      controller: passwordCtrl,
-                      obscureText: obscure,
-                      decoration: InputDecoration(
-                        labelText: '密码',
-                        border: const OutlineInputBorder(),
-                        prefixIcon: const Icon(Icons.lock_outline_rounded),
-                        suffixIcon: IconButton(
-                          onPressed: () =>
-                              setObscure(() => obscure = !obscure),
-                          icon: Icon(obscure
-                              ? Icons.visibility_outlined
-                              : Icons.visibility_off_outlined),
-                        ),
-                      ),
-                      textInputAction: TextInputAction.done,
-                      onSubmitted: (_) {
-                        if (!submitting) submit();
-                      },
-                    ),
-                  ),
-                  if (inlineError != null) ...[
-                    const SizedBox(height: 12),
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(
-                        inlineError!,
-                        style: const TextStyle(
-                            color: Color(0xFFB42318), height: 1.4),
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-              actions: [
-                TextButton(
-                  onPressed:
-                      submitting ? null : () => Navigator.of(dialogContext).pop(),
-                  child: const Text('取消'),
-                ),
-                FilledButton(
-                  onPressed: submitting ? null : submit,
-                  child: submitting
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Text('注册'),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
-
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      usernameCtrl.dispose();
-      passwordCtrl.dispose();
-    });
-
-    if (!mounted || registered != true) return;
-
-    // 注册成功 → 用刚填写的账号密码自动登录
-    final username = usernameCtrl.text.trim();
-    final password = passwordCtrl.text;
-    try {
-      final session = await _loginToCloudAccount(username, password);
-      if (!mounted) return;
-      await _onCloudLoginSuccess(session);
-    } catch (_) {
-      // 自动登录失败时给一个提示，用户可手动登录
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('注册成功！自动登录失败，请在"我的"页面手动登录云账号。'),
-          duration: Duration(seconds: 5),
-        ),
-      );
-    }
-  }
+  // ---- 云账号功能已停用：_showRegisterDialog ----
+//   Future<void> _showRegisterDialog({
+//     required String deviceId,
+//     required String deviceName,
+//   }) async {
+//     final usernameCtrl = TextEditingController();
+//     final passwordCtrl = TextEditingController();
+//     var obscure = true;
+//     var submitting = false;
+//     String? inlineError;
+//
+//     final registered = await showDialog<bool>(
+//       context: context,
+//       barrierDismissible: false,
+//       builder: (dialogContext) {
+//         return StatefulBuilder(
+//           builder: (context, setDialogState) {
+//             Future<void> submit() async {
+//               final username = usernameCtrl.text.trim();
+//               final password = passwordCtrl.text;
+//               if (username.isEmpty || password.isEmpty) {
+//                 setDialogState(() => inlineError = '请输入账号和密码。');
+//                 return;
+//               }
+//               setDialogState(() {
+//                 submitting = true;
+//                 inlineError = null;
+//               });
+//               try {
+//                 await _registerToCloud(
+//                   username: username,
+//                   password: password,
+//                   deviceId: deviceId,
+//                 );
+//                 if (!dialogContext.mounted) return;
+//                 Navigator.of(dialogContext).pop(true);
+//               } on NasApiException catch (e) {
+//                 if (!dialogContext.mounted) return;
+//                 setDialogState(() {
+//                   inlineError = e.message;
+//                   submitting = false;
+//                 });
+//               }
+//             }
+//
+//             return AlertDialog(
+//               shape: RoundedRectangleBorder(
+//                   borderRadius: BorderRadius.circular(28)),
+//               titlePadding: const EdgeInsets.fromLTRB(24, 24, 24, 12),
+//               contentPadding: const EdgeInsets.fromLTRB(24, 0, 24, 0),
+//               actionsPadding: const EdgeInsets.fromLTRB(24, 16, 24, 24),
+//               title: Column(
+//                 crossAxisAlignment: CrossAxisAlignment.start,
+//                 mainAxisSize: MainAxisSize.min,
+//                 children: [
+//                   const Text('注册云账号'),
+//                   const SizedBox(height: 8),
+//                   Text(
+//                     '绑定设备：$deviceName\n设备网络地址易变，注册云账号即可实时获取最新连接地址。',
+//                     style: const TextStyle(
+//                       fontSize: 13,
+//                       color: Color(0xFF64748B),
+//                       height: 1.5,
+//                     ),
+//                   ),
+//                 ],
+//               ),
+//               content: Column(
+//                 mainAxisSize: MainAxisSize.min,
+//                 children: [
+//                   TextField(
+//                     controller: usernameCtrl,
+//                     autofocus: true,
+//                     decoration: const InputDecoration(
+//                       labelText: '账号（用户名）',
+//                       border: OutlineInputBorder(),
+//                       prefixIcon: Icon(Icons.person_outline_rounded),
+//                     ),
+//                     textInputAction: TextInputAction.next,
+//                     onSubmitted: (_) =>
+//                         FocusScope.of(dialogContext).nextFocus(),
+//                   ),
+//                   const SizedBox(height: 12),
+//                   StatefulBuilder(
+//                     builder: (_, setObscure) => TextField(
+//                       controller: passwordCtrl,
+//                       obscureText: obscure,
+//                       decoration: InputDecoration(
+//                         labelText: '密码',
+//                         border: const OutlineInputBorder(),
+//                         prefixIcon: const Icon(Icons.lock_outline_rounded),
+//                         suffixIcon: IconButton(
+//                           onPressed: () =>
+//                               setObscure(() => obscure = !obscure),
+//                           icon: Icon(obscure
+//                               ? Icons.visibility_outlined
+//                               : Icons.visibility_off_outlined),
+//                         ),
+//                       ),
+//                       textInputAction: TextInputAction.done,
+//                       onSubmitted: (_) {
+//                         if (!submitting) submit();
+//                       },
+//                     ),
+//                   ),
+//                   if (inlineError != null) ...[
+//                     const SizedBox(height: 12),
+//                     Align(
+//                       alignment: Alignment.centerLeft,
+//                       child: Text(
+//                         inlineError!,
+//                         style: const TextStyle(
+//                             color: Color(0xFFB42318), height: 1.4),
+//                       ),
+//                     ),
+//                   ],
+//                 ],
+//               ),
+//               actions: [
+//                 TextButton(
+//                   onPressed:
+//                       submitting ? null : () => Navigator.of(dialogContext).pop(),
+//                   child: const Text('取消'),
+//                 ),
+//                 FilledButton(
+//                   onPressed: submitting ? null : submit,
+//                   child: submitting
+//                       ? const SizedBox(
+//                           width: 18,
+//                           height: 18,
+//                           child: CircularProgressIndicator(strokeWidth: 2),
+//                         )
+//                       : const Text('注册'),
+//                 ),
+//               ],
+//             );
+//           },
+//         );
+//       },
+//     );
+//
+//     WidgetsBinding.instance.addPostFrameCallback((_) {
+//       usernameCtrl.dispose();
+//       passwordCtrl.dispose();
+//     });
+//
+//     if (!mounted || registered != true) return;
+//
+//     // 注册成功 → 用刚填写的账号密码自动登录
+//     final username = usernameCtrl.text.trim();
+//     final password = passwordCtrl.text;
+//     try {
+//       final session = await _loginToCloudAccount(username, password);
+//       if (!mounted) return;
+//       await _onCloudLoginSuccess(session);
+//     } catch (_) {
+//       // 自动登录失败时给一个提示，用户可手动登录
+//       if (!mounted) return;
+//       ScaffoldMessenger.of(context).showSnackBar(
+//         const SnackBar(
+//           content: Text('注册成功！自动登录失败，请在"我的"页面手动登录云账号。'),
+//           duration: Duration(seconds: 5),
+//         ),
+//       );
+//     }
+//   }
 
   /// 调用云服务注册接口。
-  Future<void> _registerToCloud({
-    required String username,
-    required String password,
-    required String deviceId,
-  }) async {
-    final response = await _sendCloudTextRequest(
-      Uri.parse('https://reportzs.me/nas-api/register'),
-      method: 'POST',
-      headers: const {
-        HttpHeaders.acceptHeader: 'application/json',
-        HttpHeaders.contentTypeHeader: 'application/json; charset=utf-8',
-      },
-      requestBody: jsonEncode({
-        'username': username,
-        'password': password,
-        'deviceId': deviceId,
-      }),
-    );
+  // ---- 云账号功能已停用：_registerToCloud ----
+//   Future<void> _registerToCloud({
+//     required String username,
+//     required String password,
+//     required String deviceId,
+//   }) async {
+//     final response = await _sendCloudTextRequest(
+//       Uri.parse('https://reportzs.me/nas-api/register'),
+//       method: 'POST',
+//       headers: const {
+//         HttpHeaders.acceptHeader: 'application/json',
+//         HttpHeaders.contentTypeHeader: 'application/json; charset=utf-8',
+//       },
+//       requestBody: jsonEncode({
+//         'username': username,
+//         'password': password,
+//         'deviceId': deviceId,
+//       }),
+//     );
+//
+//     late final Map<String, dynamic> decoded;
+//     try {
+//       decoded = _decodeJsonObject(
+//         response.body,
+//         invalidMessage: '注册接口返回了无法解析的内容。',
+//       );
+//     } on NasApiException {
+//       throw NasApiException(
+//         '注册失败：${response.statusCode}。${_compactBody(response.body)}',
+//       );
+//     }
+//
+//     final success = decoded['success'] == true;
+//     if (!success || response.statusCode < 200 || response.statusCode >= 300) {
+//       final err = decoded['error']?.toString();
+//       if (err != null && err.isNotEmpty) throw NasApiException(err);
+//       throw NasApiException('注册失败：${response.statusCode}。');
+//     }
+//   }
 
-    late final Map<String, dynamic> decoded;
-    try {
-      decoded = _decodeJsonObject(
-        response.body,
-        invalidMessage: '注册接口返回了无法解析的内容。',
-      );
-    } on NasApiException {
-      throw NasApiException(
-        '注册失败：${response.statusCode}。${_compactBody(response.body)}',
-      );
-    }
+  // ---- 云账号功能已停用：_loginToCloudAccount ----
+//   Future<CloudSession> _loginToCloudAccount(
+//     String username,
+//     String password,
+//   ) async {
+//     final response = await _sendCloudTextRequest(
+//       Uri.parse('https://reportzs.me/nas-api/login'),
+//       method: 'POST',
+//       headers: const {
+//         HttpHeaders.acceptHeader: 'application/json',
+//         HttpHeaders.contentTypeHeader: 'application/json; charset=utf-8',
+//       },
+//       requestBody: jsonEncode({'username': username, 'password': password}),
+//     );
+//
+//     late final Map<String, dynamic> decoded;
+//     try {
+//       decoded = _decodeJsonObject(
+//         response.body,
+//         invalidMessage: '云登录接口返回了无法解析的内容。',
+//       );
+//     } on NasApiException {
+//       if (response.statusCode >= 200 && response.statusCode < 300) {
+//         rethrow;
+//       }
+//
+//       throw NasApiException(
+//         '云账号登录失败：${response.statusCode}。${_compactBody(response.body)}',
+//       );
+//     }
+//
+//     final success = decoded['success'] == true;
+//     if (!success || response.statusCode < 200 || response.statusCode >= 300) {
+//       final error = decoded['error']?.toString();
+//       if (error != null && error.isNotEmpty) {
+//         throw NasApiException(error);
+//       }
+//
+//       throw NasApiException('云账号登录失败：${response.statusCode}。');
+//     }
+//
+//     final accessToken = decoded['accessToken']?.toString();
+//     if (accessToken == null || accessToken.isEmpty) {
+//       throw const NasApiException('云账号登录成功，但 accessToken 为空。');
+//     }
+//
+//     final userRaw = decoded['user'];
+//     if (userRaw is! Map) {
+//       throw const NasApiException('云账号登录成功，但用户信息缺失。');
+//     }
+//
+//     return CloudSession(
+//       accessToken: accessToken,
+//       expiresAt: DateTime.tryParse(decoded['expiresAt']?.toString() ?? ''),
+//       user: CloudUser.fromJson(Map<String, dynamic>.from(userRaw)),
+//     );
+//   }
 
-    final success = decoded['success'] == true;
-    if (!success || response.statusCode < 200 || response.statusCode >= 300) {
-      final err = decoded['error']?.toString();
-      if (err != null && err.isNotEmpty) throw NasApiException(err);
-      throw NasApiException('注册失败：${response.statusCode}。');
-    }
-  }
-
-  Future<CloudSession> _loginToCloudAccount(
-    String username,
-    String password,
-  ) async {
-    final response = await _sendCloudTextRequest(
-      Uri.parse('https://reportzs.me/nas-api/login'),
-      method: 'POST',
-      headers: const {
-        HttpHeaders.acceptHeader: 'application/json',
-        HttpHeaders.contentTypeHeader: 'application/json; charset=utf-8',
-      },
-      requestBody: jsonEncode({'username': username, 'password': password}),
-    );
-
-    late final Map<String, dynamic> decoded;
-    try {
-      decoded = _decodeJsonObject(
-        response.body,
-        invalidMessage: '云登录接口返回了无法解析的内容。',
-      );
-    } on NasApiException {
-      if (response.statusCode >= 200 && response.statusCode < 300) {
-        rethrow;
-      }
-
-      throw NasApiException(
-        '云账号登录失败：${response.statusCode}。${_compactBody(response.body)}',
-      );
-    }
-
-    final success = decoded['success'] == true;
-    if (!success || response.statusCode < 200 || response.statusCode >= 300) {
-      final error = decoded['error']?.toString();
-      if (error != null && error.isNotEmpty) {
-        throw NasApiException(error);
-      }
-
-      throw NasApiException('云账号登录失败：${response.statusCode}。');
-    }
-
-    final accessToken = decoded['accessToken']?.toString();
-    if (accessToken == null || accessToken.isEmpty) {
-      throw const NasApiException('云账号登录成功，但 accessToken 为空。');
-    }
-
-    final userRaw = decoded['user'];
-    if (userRaw is! Map) {
-      throw const NasApiException('云账号登录成功，但用户信息缺失。');
-    }
-
-    return CloudSession(
-      accessToken: accessToken,
-      expiresAt: DateTime.tryParse(decoded['expiresAt']?.toString() ?? ''),
-      user: CloudUser.fromJson(Map<String, dynamic>.from(userRaw)),
-    );
-  }
-
-  Future<SimpleHttpResponse> _sendCloudTextRequest(
-    Uri uri, {
-    String method = 'GET',
-    Map<String, String>? headers,
-    String? requestBody,
-  }) async {
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
-
-    try {
-      late HttpClientRequest request;
-      switch (method) {
-        case 'DELETE':
-          request = await client
-              .deleteUrl(uri)
-              .timeout(const Duration(seconds: 8));
-          break;
-        case 'GET':
-          request = await client
-              .getUrl(uri)
-              .timeout(const Duration(seconds: 8));
-          break;
-        default:
-          request = await client
-              .openUrl(method, uri)
-              .timeout(const Duration(seconds: 8));
-      }
-
-      headers?.forEach(request.headers.set);
-      if (requestBody != null) {
-        final bytes = utf8.encode(requestBody);
-        request.contentLength = bytes.length;
-        request.add(bytes);
-      }
-
-      final response = await request.close().timeout(
-        const Duration(seconds: 8),
-      );
-      final responseBody = await utf8
-          .decodeStream(response)
-          .timeout(const Duration(seconds: 8));
-      return SimpleHttpResponse(response.statusCode, responseBody);
-    } on TimeoutException {
-      throw const NasApiException('请求云服务超时，请稍后重试。');
-    } on SocketException catch (error) {
-      throw NasApiException('无法连接云服务：${error.message}');
-    } on HttpException catch (error) {
-      throw NasApiException('云服务请求失败：${error.message}');
-    } finally {
-      client.close(force: true);
-    }
-  }
+  // ---- 云账号功能已停用：_sendCloudTextRequest ----
+//   Future<SimpleHttpResponse> _sendCloudTextRequest(
+//     Uri uri, {
+//     String method = 'GET',
+//     Map<String, String>? headers,
+//     String? requestBody,
+//   }) async {
+//     final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+//
+//     try {
+//       late HttpClientRequest request;
+//       switch (method) {
+//         case 'DELETE':
+//           request = await client
+//               .deleteUrl(uri)
+//               .timeout(const Duration(seconds: 8));
+//           break;
+//         case 'GET':
+//           request = await client
+//               .getUrl(uri)
+//               .timeout(const Duration(seconds: 8));
+//           break;
+//         default:
+//           request = await client
+//               .openUrl(method, uri)
+//               .timeout(const Duration(seconds: 8));
+//       }
+//
+//       headers?.forEach(request.headers.set);
+//       if (requestBody != null) {
+//         final bytes = utf8.encode(requestBody);
+//         request.contentLength = bytes.length;
+//         request.add(bytes);
+//       }
+//
+//       final response = await request.close().timeout(
+//         const Duration(seconds: 8),
+//       );
+//       final responseBody = await utf8
+//           .decodeStream(response)
+//           .timeout(const Duration(seconds: 8));
+//       return SimpleHttpResponse(response.statusCode, responseBody);
+//     } on TimeoutException {
+//       throw const NasApiException('请求云服务超时，请稍后重试。');
+//     } on SocketException catch (error) {
+//       throw NasApiException('无法连接云服务：${error.message}');
+//     } on HttpException catch (error) {
+//       throw NasApiException('云服务请求失败：${error.message}');
+//     } finally {
+//       client.close(force: true);
+//     }
+//   }
 
   Map<String, dynamic> _decodeJsonObject(
     String body, {
@@ -1155,10 +1587,10 @@ class _NasHomePageState extends State<NasHomePage> {
       builder: (dialogContext) => AlertDialog(
         title: const Text('连接说明'),
         content: const Text(
-          '1. 云账号登录只用于账号体系。\n'
-          '2. 扫码获取授权和注册云账号。\n'
-          '3. 自动发现当前用于展示最近设备，后续会实现局域网自动扫描设备。\n'
-          '4. 手动连接只需输入ipv4或ipv6地址。',
+          '1. 扫码即完成授权，直接连接电脑。\n'
+          '2. 手动连接只需输入 ipv4 或 ipv6 地址，端口自动补全。\n'
+          '3. 历史地址会标注局域网/公网，并自动检测是否可通。\n'
+          '4. 连接时优先局域网，不可达会自动尝试公网和历史地址。',
           style: TextStyle(height: 1.6),
         ),
         actions: [
@@ -2551,6 +2983,7 @@ class _NasHomePageState extends State<NasHomePage> {
     setState(() {
       _showMainShell = false;
     });
+    unawaited(_checkHistoryReachability());
   }
 
   void _changeSpaceScope(SpaceScope? nextScope) {
@@ -3011,130 +3444,132 @@ class _NasHomePageState extends State<NasHomePage> {
     );
   }
 
-  String _buildCloudSummary() {
-    final session = _cloudSession;
-    if (session == null) {
-      return '查看并连接你的设备';
-    }
+  // ---- 云账号功能已停用：_buildCloudSummary ----
+//   String _buildCloudSummary() {
+//     final session = _cloudSession;
+//     if (session == null) {
+//       return '查看并连接你的设备';
+//     }
+//
+//     final expiresAt = session.expiresAt?.toLocal();
+//     if (expiresAt == null) {
+//       return '已登录 ${session.user.username}';
+//     }
+//
+//     final month = expiresAt.month.toString().padLeft(2, '0');
+//     final day = expiresAt.day.toString().padLeft(2, '0');
+//     final hour = expiresAt.hour.toString().padLeft(2, '0');
+//     final minute = expiresAt.minute.toString().padLeft(2, '0');
+//     return '已登录 ${session.user.username} · 有效至 $month-$day $hour:$minute';
+//   }
 
-    final expiresAt = session.expiresAt?.toLocal();
-    if (expiresAt == null) {
-      return '已登录 ${session.user.username}';
-    }
-
-    final month = expiresAt.month.toString().padLeft(2, '0');
-    final day = expiresAt.day.toString().padLeft(2, '0');
-    final hour = expiresAt.hour.toString().padLeft(2, '0');
-    final minute = expiresAt.minute.toString().padLeft(2, '0');
-    return '已登录 ${session.user.username} · 有效至 $month-$day $hour:$minute';
-  }
-
-  Widget _buildCloudAccountCard(BuildContext context, ThemeData theme) {
-    final metrics = _ConnectionPageMetrics.of(context);
-    final session = _cloudSession;
-    final actionLabel = session == null ? '登录 / 注册' : '切换账号';
-
-    return _buildSectionCard(
-      contextOverride: context,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              _buildAccentIconBox(
-                context,
-                icon: Icons.lock_rounded,
-                backgroundColor: const Color(0xFF3B82F6),
-                foregroundColor: Colors.white,
-              ),
-              SizedBox(width: metrics.inlineSpacing),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      '登录云账号',
-                      style: theme.textTheme.titleMedium?.copyWith(
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                    Text(
-                      _buildCloudSummary(),
-                      style: theme.textTheme.bodySmall?.copyWith(
-                        color: const Color(0xFF64748B),
-                      ),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ],
-                ),
-              ),
-              SizedBox(width: metrics.inlineSpacing * 0.5),
-              FilledButton(
-                onPressed: _showCloudLoginDialog,
-                style: FilledButton.styleFrom(
-                  padding: EdgeInsets.symmetric(
-                    horizontal: metrics.inlineSpacing,
-                    vertical: metrics.badgeVerticalPadding + 2,
-                  ),
-                  backgroundColor: const Color(0xFF2563EB),
-                  foregroundColor: Colors.white,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(999),
-                  ),
-                ),
-                child: Text(
-                  actionLabel,
-                  style: const TextStyle(
-                      fontSize: 13, fontWeight: FontWeight.w600),
-                ),
-              ),
-            ],
-          ),
-          SizedBox(height: metrics.sectionSpacing),
-          FittedBox(
-            fit: BoxFit.scaleDown,
-            alignment: Alignment.centerLeft,
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(Icons.shield_outlined,
-                    size: 14, color: const Color(0xFF3B82F6)),
-                const SizedBox(width: 4),
-                Text('点对点传输',
-                    style: TextStyle(
-                        color: const Color(0xFF64748B), fontSize: 13)),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 8),
-                  child: Text('|',
-                      style: TextStyle(
-                          color: const Color(0xFFCBD5E1), fontSize: 13)),
-                ),
-                Icon(Icons.sync_rounded,
-                    size: 14, color: const Color(0xFF3B82F6)),
-                const SizedBox(width: 4),
-                Text('实时同步地址',
-                    style: TextStyle(
-                        color: const Color(0xFF64748B), fontSize: 13)),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 8),
-                  child: Text('|',
-                      style: TextStyle(
-                          color: const Color(0xFFCBD5E1), fontSize: 13)),
-                ),
-                Icon(Icons.devices_outlined,
-                    size: 14, color: const Color(0xFF3B82F6)),
-                const SizedBox(width: 4),
-                Text('远程访问',
-                    style: TextStyle(
-                        color: const Color(0xFF64748B), fontSize: 13)),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+  // ---- 云账号功能已停用：_buildCloudAccountCard ----
+//   Widget _buildCloudAccountCard(BuildContext context, ThemeData theme) {
+//     final metrics = _ConnectionPageMetrics.of(context);
+//     final session = _cloudSession;
+//     final actionLabel = session == null ? '登录 / 注册' : '切换账号';
+//
+//     return _buildSectionCard(
+//       contextOverride: context,
+//       child: Column(
+//         crossAxisAlignment: CrossAxisAlignment.start,
+//         children: [
+//           Row(
+//             children: [
+//               _buildAccentIconBox(
+//                 context,
+//                 icon: Icons.lock_rounded,
+//                 backgroundColor: const Color(0xFF3B82F6),
+//                 foregroundColor: Colors.white,
+//               ),
+//               SizedBox(width: metrics.inlineSpacing),
+//               Expanded(
+//                 child: Column(
+//                   crossAxisAlignment: CrossAxisAlignment.start,
+//                   children: [
+//                     Text(
+//                       '登录云账号',
+//                       style: theme.textTheme.titleMedium?.copyWith(
+//                         fontWeight: FontWeight.w700,
+//                       ),
+//                     ),
+//                     Text(
+//                       _buildCloudSummary(),
+//                       style: theme.textTheme.bodySmall?.copyWith(
+//                         color: const Color(0xFF64748B),
+//                       ),
+//                       maxLines: 1,
+//                       overflow: TextOverflow.ellipsis,
+//                     ),
+//                   ],
+//                 ),
+//               ),
+//               SizedBox(width: metrics.inlineSpacing * 0.5),
+//               FilledButton(
+//                 onPressed: _showCloudLoginDialog,
+//                 style: FilledButton.styleFrom(
+//                   padding: EdgeInsets.symmetric(
+//                     horizontal: metrics.inlineSpacing,
+//                     vertical: metrics.badgeVerticalPadding + 2,
+//                   ),
+//                   backgroundColor: const Color(0xFF2563EB),
+//                   foregroundColor: Colors.white,
+//                   shape: RoundedRectangleBorder(
+//                     borderRadius: BorderRadius.circular(999),
+//                   ),
+//                 ),
+//                 child: Text(
+//                   actionLabel,
+//                   style: const TextStyle(
+//                       fontSize: 13, fontWeight: FontWeight.w600),
+//                 ),
+//               ),
+//             ],
+//           ),
+//           SizedBox(height: metrics.sectionSpacing),
+//           FittedBox(
+//             fit: BoxFit.scaleDown,
+//             alignment: Alignment.centerLeft,
+//             child: Row(
+//               mainAxisSize: MainAxisSize.min,
+//               children: [
+//                 Icon(Icons.shield_outlined,
+//                     size: 14, color: const Color(0xFF3B82F6)),
+//                 const SizedBox(width: 4),
+//                 Text('点对点传输',
+//                     style: TextStyle(
+//                         color: const Color(0xFF64748B), fontSize: 13)),
+//                 Padding(
+//                   padding: const EdgeInsets.symmetric(horizontal: 8),
+//                   child: Text('|',
+//                       style: TextStyle(
+//                           color: const Color(0xFFCBD5E1), fontSize: 13)),
+//                 ),
+//                 Icon(Icons.sync_rounded,
+//                     size: 14, color: const Color(0xFF3B82F6)),
+//                 const SizedBox(width: 4),
+//                 Text('实时同步地址',
+//                     style: TextStyle(
+//                         color: const Color(0xFF64748B), fontSize: 13)),
+//                 Padding(
+//                   padding: const EdgeInsets.symmetric(horizontal: 8),
+//                   child: Text('|',
+//                       style: TextStyle(
+//                           color: const Color(0xFFCBD5E1), fontSize: 13)),
+//                 ),
+//                 Icon(Icons.devices_outlined,
+//                     size: 14, color: const Color(0xFF3B82F6)),
+//                 const SizedBox(width: 4),
+//                 Text('远程访问',
+//                     style: TextStyle(
+//                         color: const Color(0xFF64748B), fontSize: 13)),
+//               ],
+//             ),
+//           ),
+//         ],
+//       ),
+//     );
+//   }
 
   Widget _buildDeviceScanIllustration(
     BuildContext context, {
@@ -3659,13 +4094,17 @@ class _NasHomePageState extends State<NasHomePage> {
               ],
             ),
             SizedBox(height: metrics.sectionSpacing),
-            _buildCloudAccountCard(context, theme),
-            SizedBox(height: metrics.sectionSpacing),
+            // 云账号入口已停用：扫码后直接连接设备
+            // _buildCloudAccountCard(context, theme),
+            // SizedBox(height: metrics.sectionSpacing),
             _buildScanRegisterCard(context, theme),
             SizedBox(height: metrics.sectionSpacing),
-            _buildAutoDiscoveryCard(context, theme),
-            SizedBox(height: metrics.sectionSpacing),
+            // 自动发现功能尚未接入，先隐藏
+            // _buildAutoDiscoveryCard(context, theme),
+            // SizedBox(height: metrics.sectionSpacing),
             _buildManualAddressCard(context, theme),
+            SizedBox(height: metrics.sectionSpacing),
+            _buildEndpointHistoryCard(context, theme),
           ],
         ),
       ),
@@ -3673,66 +4112,29 @@ class _NasHomePageState extends State<NasHomePage> {
   }
 
   Widget _buildHomeHeader(ThemeData theme) {
+    // 单行卡片：左侧连接状态云图标，右侧空间切换下拉框（不再显示"我的 NAS"标题）
     return Container(
-      padding: const EdgeInsets.all(22),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
       decoration: BoxDecoration(
         gradient: const LinearGradient(
           colors: [Color(0xFFFFFFFF), Color(0xFFF5FBFA)],
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
         ),
-        borderRadius: BorderRadius.circular(30),
+        borderRadius: BorderRadius.circular(22),
         boxShadow: const [
           BoxShadow(
             color: Color(0x120F172A),
-            blurRadius: 28,
-            offset: Offset(0, 10),
+            blurRadius: 18,
+            offset: Offset(0, 6),
           ),
         ],
       ),
       child: Row(
         children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  '我的 NAS',
-                  style: theme.textTheme.headlineSmall?.copyWith(
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFF1F5F9),
-                    borderRadius: BorderRadius.circular(18),
-                  ),
-                  child: DropdownButtonHideUnderline(
-                    child: DropdownButton<SpaceScope>(
-                      value: _selectedSpace,
-                      isDense: true,
-                      items: const [
-                        DropdownMenuItem(
-                          value: SpaceScope.personal,
-                          child: Text('个人空间'),
-                        ),
-                        DropdownMenuItem(
-                          value: SpaceScope.family,
-                          child: Text('家庭空间'),
-                        ),
-                      ],
-                      onChanged: _changeSpaceScope,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
           Container(
-            width: 52,
-            height: 52,
+            width: 36,
+            height: 36,
             decoration: const BoxDecoration(
               color: Color(0xFFDCFCE7),
               shape: BoxShape.circle,
@@ -3740,6 +4142,32 @@ class _NasHomePageState extends State<NasHomePage> {
             child: const Icon(
               Icons.cloud_done_outlined,
               color: Color(0xFF15803D),
+              size: 20,
+            ),
+          ),
+          const Spacer(),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            decoration: BoxDecoration(
+              color: const Color(0xFFF1F5F9),
+              borderRadius: BorderRadius.circular(18),
+            ),
+            child: DropdownButtonHideUnderline(
+              child: DropdownButton<SpaceScope>(
+                value: _selectedSpace,
+                isDense: true,
+                items: const [
+                  DropdownMenuItem(
+                    value: SpaceScope.personal,
+                    child: Text('个人空间'),
+                  ),
+                  DropdownMenuItem(
+                    value: SpaceScope.family,
+                    child: Text('家庭空间'),
+                  ),
+                ],
+                onChanged: _changeSpaceScope,
+              ),
             ),
           ),
         ],
@@ -4263,7 +4691,7 @@ class _NasHomePageState extends State<NasHomePage> {
           _ToolLauncherButton(
             icon: Icons.delete_outline,
             title: '回收站',
-            subtitle: '功能暂未接入，谨慎删除文件。',
+            subtitle: '删除的文件保留 30 天，期间可恢复，到期自动清理。',
             backgroundColor: const Color(0xFFFEF2F2),
             foregroundColor: const Color(0xFFB91C1C),
             onTap: _openRecycleBinToolPage,
@@ -4310,12 +4738,12 @@ class _NasHomePageState extends State<NasHomePage> {
   }
 
   String _mineDisplayName() {
-    final username = _cloudSession?.user.username.trim();
-    if (username == null || username.isEmpty) {
-      return '未登录云账号';
+    // 云账号已停用，这里显示设备名
+    final name = _hostStatus?.hostName.trim();
+    if (name == null || name.isEmpty) {
+      return '未连接设备';
     }
-
-    return username;
+    return name;
   }
 
   Future<void> _openAccountSecurityPage() async {
@@ -4348,55 +4776,12 @@ class _NasHomePageState extends State<NasHomePage> {
       child: ListView(
         padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
         children: [
-          Container(
-            padding: const EdgeInsets.all(20),
-            decoration: BoxDecoration(
-              color: Colors.white,
-              borderRadius: BorderRadius.circular(30),
-              boxShadow: const [
-                BoxShadow(
-                  color: Color(0x120F172A),
-                  blurRadius: 28,
-                  offset: Offset(0, 10),
-                ),
-              ],
-            ),
-            child: Row(
-              children: [
-                const CircleAvatar(
-                  radius: 30,
-                  backgroundColor: Color(0xFFE0F2FE),
-                  child: Icon(
-                    Icons.person_outline,
-                    color: Color(0xFF0369A1),
-                    size: 28,
-                  ),
-                ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        _mineDisplayName(),
-                        style: theme.textTheme.titleLarge?.copyWith(
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        '个人空间',
-                        style: theme.textTheme.bodyMedium?.copyWith(
-                          color: const Color(0xFF64748B),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 16),
+          // 云账号停用后，"我的"页顶部账号卡片隐藏
+          // Container(
+          //   padding: const EdgeInsets.all(20),
+          //   ... 账号头像 + _mineDisplayName() + 个人空间 ...
+          // ),
+          // const SizedBox(height: 16),
           _buildSectionCard(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -5688,7 +6073,7 @@ class AccountSecurityPage extends StatelessWidget {
             _PlainInfoCard(
               title: '当前状态',
               lines: [
-                '云账号: $cloudAccountName',
+                // '云账号: $cloudAccountName', // 云账号功能已停用
                 '当前电脑: $hostName',
                 if (sharedRoot != null && sharedRoot!.isNotEmpty)
                   '共享目录: $sharedRoot',
@@ -5698,7 +6083,7 @@ class AccountSecurityPage extends StatelessWidget {
             _PlainInfoCard(
               title: '安全说明',
               lines: const [
-                '云账号当前主要用于登录状态和同步电脑地址。',
+                '登录状态和电脑地址只保存在手机本机，不依赖云账号。',
                 '手机访问电脑前，需要先扫码授权，请求会自动完成安全校验。',
                 '如果需要更换电脑或重新授权，可以返回连接页重新扫码或连接。',
               ],
@@ -6338,6 +6723,33 @@ class CloudUser {
   final String? ipv6Address;
   final bool isActive;
   final DateTime? updatedAt;
+}
+
+class _EndpointRecord {
+  _EndpointRecord({
+    required this.host,
+    required this.isLan,
+    this.lastSuccess,
+  });
+
+  factory _EndpointRecord.fromJson(Map<String, dynamic> json) {
+    final ts = json['lastSuccess'];
+    return _EndpointRecord(
+      host: json['host']?.toString() ?? '',
+      isLan: json['isLan'] == true,
+      lastSuccess: ts is int ? DateTime.fromMillisecondsSinceEpoch(ts) : null,
+    );
+  }
+
+  final String host;
+  final bool isLan;
+  final DateTime? lastSuccess;
+
+  Map<String, dynamic> toJson() => {
+        'host': host,
+        'isLan': isLan,
+        'lastSuccess': lastSuccess?.millisecondsSinceEpoch,
+      };
 }
 
 class NasHostStatus {
@@ -7196,8 +7608,10 @@ class _QrScanPageState extends State<_QrScanPage> {
           'deviceName': deviceName,
           'secret': secret,
           'ip': decoded['ip']?.toString(),
-          'type': decoded['type']?.toString(),
-          'username': decoded['username']?.toString(),
+          'lan': decoded['lan']?.toString(),
+          'public': decoded['public']?.toString(),
+          // 'type': decoded['type']?.toString(), // 云账号功能已停用
+          // 'username': decoded['username']?.toString(), // 云账号功能已停用
         });
         return;
       } catch (_) {
