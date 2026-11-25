@@ -1716,8 +1716,8 @@ class _NasHomePageState extends State<NasHomePage> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: const Text('删除确认'),
-        content: Text('确定要删除 ${entry.name} 吗？'),
+        title: const Text('移入回收站'),
+        content: Text('将 ${entry.name} 移入回收站？之后可在「回收站」中恢复。'),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(dialogContext).pop(false),
@@ -1725,7 +1725,7 @@ class _NasHomePageState extends State<NasHomePage> {
           ),
           FilledButton(
             onPressed: () => Navigator.of(dialogContext).pop(true),
-            child: const Text('删除'),
+            child: const Text('移入回收站'),
           ),
         ],
       ),
@@ -1748,7 +1748,7 @@ class _NasHomePageState extends State<NasHomePage> {
 
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(SnackBar(content: Text('${entry.name} 已删除。')));
+      ).showSnackBar(SnackBar(content: Text('${entry.name} 已移入回收站。')));
       await _refreshFiles(showLoading: false);
     } on NasApiException catch (error) {
       if (!mounted) {
@@ -2904,9 +2904,39 @@ class _NasHomePageState extends State<NasHomePage> {
   }
 
   Future<void> _openRecycleBinToolPage() async {
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('请先连接电脑。')));
+      return;
+    }
+
     await Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (context) => const RecycleBinToolPage()),
+      MaterialPageRoute<void>(
+        builder: (context) => RecycleBinToolPage(
+          baseUri: baseUri,
+          token: token,
+          request:
+              (
+                Uri uri, {
+                String? method,
+                Map<String, String>? headers,
+                String? requestBody,
+              }) => _sendTextRequest(
+                uri,
+                method: method ?? 'GET',
+                headers: headers,
+                requestBody: requestBody,
+              ),
+        ),
+      ),
     );
+
+    if (mounted) {
+      await _refreshFiles(showLoading: false);
+    }
   }
 
   Future<void> _openBookkeepingToolPage() async {
@@ -5160,20 +5190,360 @@ class ChatToolPage extends StatelessWidget {
   }
 }
 
-class RecycleBinToolPage extends StatelessWidget {
-  const RecycleBinToolPage({super.key});
+typedef TrashRequest = Future<SimpleHttpResponse> Function(
+  Uri uri, {
+  String? method,
+  Map<String, String>? headers,
+  String? requestBody,
+});
+
+class RecycleBinToolPage extends StatefulWidget {
+  const RecycleBinToolPage({
+    super.key,
+    required this.baseUri,
+    required this.token,
+    required this.request,
+  });
+
+  final Uri baseUri;
+  final String token;
+  final TrashRequest request;
+
+  @override
+  State<RecycleBinToolPage> createState() => _RecycleBinToolPageState();
+}
+
+class _RecycleBinToolPageState extends State<RecycleBinToolPage> {
+  final List<_TrashItem> _items = <_TrashItem>[];
+  final Set<String> _busy = <String>{};
+  bool _loading = true;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Uri _trashUri([String suffix = '']) =>
+      widget.baseUri.replace(path: '/api/trash$suffix');
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final response = await widget.request(
+        _trashUri(),
+        headers: {'X-Auth': widget.token},
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw NasApiException('读取回收站失败：${response.statusCode}');
+      }
+      final decoded = jsonDecode(response.body);
+      final rawItems = (decoded is Map && decoded['items'] is List)
+          ? decoded['items'] as List
+          : const <dynamic>[];
+      final items = rawItems
+          .whereType<Map>()
+          .map((m) => _TrashItem.fromJson(Map<String, dynamic>.from(m)))
+          .toList();
+      if (!mounted) return;
+      setState(() {
+        _items
+          ..clear()
+          ..addAll(items);
+        _loading = false;
+      });
+    } on NasApiException catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = error.message;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = '$error';
+      });
+    }
+  }
+
+  Future<void> _restore(_TrashItem item) async {
+    if (_busy.contains(item.id)) return;
+    setState(() => _busy.add(item.id));
+    try {
+      final response = await widget.request(
+        _trashUri('/restore'),
+        method: 'POST',
+        headers: {
+          'X-Auth': widget.token,
+          HttpHeaders.contentTypeHeader: 'application/json; charset=utf-8',
+        },
+        requestBody: jsonEncode({'id': item.id}),
+      );
+      if (response.statusCode == 409) {
+        throw const NasApiException('原位置已有同名文件，无法恢复。');
+      }
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw NasApiException('恢复失败：${response.statusCode}');
+      }
+      _toast('${item.name} 已恢复。');
+      await _load();
+    } on NasApiException catch (error) {
+      _toast(error.message);
+    } finally {
+      if (mounted) setState(() => _busy.remove(item.id));
+    }
+  }
+
+  Future<void> _purge(_TrashItem item) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('彻底删除'),
+        content: Text('将永久删除 ${item.name}，不可恢复。确定吗？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('彻底删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || _busy.contains(item.id)) return;
+    setState(() => _busy.add(item.id));
+    try {
+      final response = await widget.request(
+        _trashUri('/${item.id}'),
+        method: 'DELETE',
+        headers: {'X-Auth': widget.token},
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw NasApiException('删除失败：${response.statusCode}');
+      }
+      _toast('${item.name} 已彻底删除。');
+      await _load();
+    } on NasApiException catch (error) {
+      _toast(error.message);
+    } finally {
+      if (mounted) setState(() => _busy.remove(item.id));
+    }
+  }
+
+  Future<void> _emptyAll() async {
+    if (_items.isEmpty) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('清空回收站'),
+        content: const Text('将永久删除回收站内所有内容，不可恢复。确定吗？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('清空'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      final response = await widget.request(
+        _trashUri(),
+        method: 'DELETE',
+        headers: {'X-Auth': widget.token},
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw NasApiException('清空失败：${response.statusCode}');
+      }
+      _toast('回收站已清空。');
+      await _load();
+    } on NasApiException catch (error) {
+      _toast(error.message);
+    }
+  }
+
+  void _toast(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('回收站')),
-      body: const _PendingToolPageBody(
-        icon: Icons.delete_outline,
-        title: '功能接入中',
-        detail: '回收站功能正在接入中，当前删除文件时请务必谨慎。',
-        iconColor: Color(0xFFB91C1C),
+      appBar: AppBar(
+        title: const Text('回收站'),
+        actions: [
+          IconButton(
+            onPressed: _loading ? null : _load,
+            icon: const Icon(Icons.refresh),
+            tooltip: '刷新',
+          ),
+          IconButton(
+            onPressed: _items.isEmpty ? null : _emptyAll,
+            icon: const Icon(Icons.delete_sweep_outlined),
+            tooltip: '清空',
+          ),
+        ],
+      ),
+      body: _buildBody(),
+    );
+  }
+
+  Widget _buildBody() {
+    if (_loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_error != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.error_outline,
+                size: 44,
+                color: Color(0xFFB91C1C),
+              ),
+              const SizedBox(height: 12),
+              Text(_error!, textAlign: TextAlign.center),
+              const SizedBox(height: 16),
+              FilledButton(onPressed: _load, child: const Text('重试')),
+            ],
+          ),
+        ),
+      );
+    }
+    if (_items.isEmpty) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.delete_outline, size: 48, color: Color(0xFF94A3B8)),
+              SizedBox(height: 12),
+              Text('回收站是空的', style: TextStyle(color: Color(0xFF64748B))),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return RefreshIndicator(
+      onRefresh: _load,
+      child: ListView.separated(
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        itemCount: _items.length,
+        separatorBuilder: (_, _) => const Divider(height: 1),
+        itemBuilder: (context, index) {
+          final item = _items[index];
+          final busy = _busy.contains(item.id);
+          return ListTile(
+            leading: Icon(
+              item.isDir ? Icons.folder_outlined : Icons.insert_drive_file_outlined,
+            ),
+            title: Text(item.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+            subtitle: Text(
+              '原位置：${item.originalPath}\n'
+              '删除于 ${item.deletedAtText}'
+              '${item.sizeText.isEmpty ? '' : ' · ${item.sizeText}'}',
+              maxLines: 3,
+            ),
+            isThreeLine: true,
+            trailing: busy
+                ? const SizedBox(
+                    width: 24,
+                    height: 24,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        onPressed: () => _restore(item),
+                        icon: const Icon(Icons.restore_from_trash_outlined),
+                        tooltip: '恢复',
+                      ),
+                      IconButton(
+                        onPressed: () => _purge(item),
+                        icon: const Icon(Icons.delete_forever_outlined),
+                        tooltip: '彻底删除',
+                      ),
+                    ],
+                  ),
+          );
+        },
       ),
     );
+  }
+}
+
+class _TrashItem {
+  const _TrashItem({
+    required this.id,
+    required this.name,
+    required this.originalPath,
+    required this.deletedAt,
+    required this.isDir,
+    required this.size,
+  });
+
+  final String id;
+  final String name;
+  final String originalPath;
+  final DateTime? deletedAt;
+  final bool isDir;
+  final int? size;
+
+  factory _TrashItem.fromJson(Map<String, dynamic> json) {
+    final rawSize = json['size'];
+    return _TrashItem(
+      id: '${json['id'] ?? ''}',
+      name: '${json['name'] ?? '(未命名)'}',
+      originalPath: '${json['originalPath'] ?? ''}',
+      deletedAt: DateTime.tryParse('${json['deletedAt'] ?? ''}'),
+      isDir: json['isDir'] == true,
+      size: rawSize is int
+          ? rawSize
+          : (rawSize is num ? rawSize.toInt() : null),
+    );
+  }
+
+  String get deletedAtText {
+    final value = deletedAt?.toLocal();
+    if (value == null) return '—';
+    String two(int n) => n.toString().padLeft(2, '0');
+    return '${value.year}-${two(value.month)}-${two(value.day)} '
+        '${two(value.hour)}:${two(value.minute)}';
+  }
+
+  String get sizeText {
+    final bytes = size;
+    if (bytes == null) return '';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    double value = bytes.toDouble();
+    int unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit++;
+    }
+    return unit == 0
+        ? '${value.toInt()} ${units[unit]}'
+        : '${value.toStringAsFixed(1)} ${units[unit]}';
   }
 }
 
@@ -6806,6 +7176,7 @@ class _QrScanPage extends StatefulWidget {
 
 class _QrScanPageState extends State<_QrScanPage> {
   bool _handled = false;
+  Key _scannerKey = UniqueKey();
 
   void _onDetect(BarcodeCapture capture) {
     if (_handled) return;
@@ -6847,7 +7218,50 @@ class _QrScanPageState extends State<_QrScanPage> {
       ),
       body: Stack(
         children: [
-          MobileScanner(onDetect: _onDetect),
+          MobileScanner(
+            key: _scannerKey,
+            onDetect: _onDetect,
+            errorBuilder: (context, error) {
+              final detail = error.errorDetails?.message;
+              final denied =
+                  error.errorCode == MobileScannerErrorCode.permissionDenied;
+              return Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.error_outline,
+                          color: Colors.white70, size: 40),
+                      const SizedBox(height: 12),
+                      Text(
+                        denied ? '相机权限被拒绝' : '相机启动失败',
+                        style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        denied
+                            ? '请到 设置 → 应用 → 千私云 → 权限 → 相机，选择“允许”，然后点重试。'
+                            : '错误码：${error.errorCode.name}${detail == null ? '' : '\n$detail'}',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                            color: Colors.white70, fontSize: 13),
+                      ),
+                      const SizedBox(height: 16),
+                      FilledButton(
+                        onPressed: () =>
+                            setState(() => _scannerKey = UniqueKey()),
+                        child: const Text('重试'),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
           Center(
             child: Container(
               width: 220,
