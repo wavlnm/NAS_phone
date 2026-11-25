@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 import 'dart:ui';
 
 import 'package:crypto/crypto.dart' as crypto;
@@ -268,6 +269,7 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     unawaited(_loadDeviceSecret());
+    unawaited(_loadViewMode());
     // 异步恢复上次的登录/连接状态
     WidgetsBinding.instance.addPostFrameCallback((_) => _restoreAndAutoConnect());
   }
@@ -1610,6 +1612,9 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
       return;
     }
 
+    // 刷新/切换目录时给之前失败的封面一次重试机会
+    _videoThumbFailed.clear();
+
     if (showLoading) {
       setState(() {
         _isLoadingFiles = true;
@@ -2856,74 +2861,354 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
   }
 
   Widget _buildEntryLeading(FileBrowserEntry entry) {
-    if (!entry.isPreviewableImage || _baseUri == null || _authToken == null) {
-      return CircleAvatar(
-        backgroundColor: entry.isDir
-            ? const Color(0xFFD1FAE5)
-            : entry.isPreviewableImage
-            ? const Color(0xFFFFEDD5)
-            : entry.isPreviewableAudio
-            ? const Color(0xFFEEE7FF)
-            : entry.isPreviewableVideo
-            ? const Color(0xFFE0E7FF)
-            : const Color(0xFFE0F2FE),
-        child: Icon(
-          entry.isDir
-              ? Icons.folder_outlined
-              : entry.isPreviewableImage
-              ? Icons.image_outlined
-              : entry.isPreviewableAudio
-              ? Icons.music_note_outlined
-              : entry.isPreviewableVideo
-              ? Icons.movie_outlined
-              : Icons.description_outlined,
-          color: entry.isDir
-              ? const Color(0xFF0F766E)
-              : entry.isPreviewableImage
-              ? const Color(0xFFEA580C)
-              : entry.isPreviewableAudio
-              ? const Color(0xFF6D28D9)
-              : entry.isPreviewableVideo
-              ? const Color(0xFF3730A3)
-              : const Color(0xFF0369A1),
-        ),
+    return _buildEntryThumb(entry, size: 44, radius: 12);
+  }
+
+  /// 文件缩略图：图片走 FileBrowser 预览接口，视频走后端 ffmpeg 抽帧，其余显示类型图标。
+  /// size 为 null 时填满父容器（格子视图使用）。
+  Widget _buildEntryThumb(
+    FileBrowserEntry entry, {
+    double? size,
+    double radius = 12,
+  }) {
+    final iconSize = size == null ? 32.0 : 20.0;
+
+    Widget iconPlaceholder(
+      IconData icon,
+      Color background,
+      Color foreground,
+    ) {
+      return Container(
+        color: background,
+        alignment: Alignment.center,
+        child: Icon(icon, color: foreground, size: iconSize),
       );
     }
 
-    return SizedBox(
-      width: 44,
-      height: 44,
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(12),
-        child: Image.network(
-          _buildThumbPreviewUri(_baseUri!, entry.path).toString(),
-          headers: {'X-Auth': _authToken!},
-          fit: BoxFit.cover,
-          errorBuilder: (context, error, stackTrace) {
-            return Container(
-              color: const Color(0xFFFFEDD5),
-              alignment: Alignment.center,
-              child: const Icon(Icons.image_outlined, color: Color(0xFFEA580C)),
-            );
-          },
-          loadingBuilder: (context, child, loadingProgress) {
-            if (loadingProgress == null) {
-              return child;
-            }
+    final Widget content;
+    if (entry.isDir) {
+      content = iconPlaceholder(
+        Icons.folder_outlined,
+        const Color(0xFFD1FAE5),
+        const Color(0xFF0F766E),
+      );
+    } else if (entry.isPreviewableImage &&
+        _baseUri != null &&
+        _authToken != null) {
+      content = Image.network(
+        _buildThumbPreviewUri(_baseUri!, entry.path).toString(),
+        headers: {'X-Auth': _authToken!},
+        fit: BoxFit.cover,
+        errorBuilder: (context, error, stackTrace) => iconPlaceholder(
+          Icons.image_outlined,
+          const Color(0xFFFFEDD5),
+          const Color(0xFFEA580C),
+        ),
+        loadingBuilder: (context, child, loadingProgress) {
+          if (loadingProgress == null) {
+            return child;
+          }
 
-            return Container(
-              color: const Color(0xFFFFEDD5),
-              alignment: Alignment.center,
-              child: const SizedBox(
-                width: 16,
-                height: 16,
-                child: CircularProgressIndicator(strokeWidth: 2),
+          return Container(
+            color: const Color(0xFFFFEDD5),
+            alignment: Alignment.center,
+            child: const SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+          );
+        },
+      );
+    } else if (entry.isPreviewableVideo && _baseUri != null) {
+      content = _NasVideoThumb(path: entry.path, loader: _requestVideoThumb);
+    } else if (entry.isPreviewableAudio) {
+      content = iconPlaceholder(
+        Icons.music_note_outlined,
+        const Color(0xFFEEE7FF),
+        const Color(0xFF6D28D9),
+      );
+    } else if (entry.isPreviewableVideo) {
+      content = iconPlaceholder(
+        Icons.movie_outlined,
+        const Color(0xFFE0E7FF),
+        const Color(0xFF3730A3),
+      );
+    } else {
+      content = iconPlaceholder(
+        Icons.description_outlined,
+        const Color(0xFFE0F2FE),
+        const Color(0xFF0369A1),
+      );
+    }
+
+    final thumb = Stack(
+      fit: StackFit.expand,
+      children: [
+        ClipRRect(borderRadius: BorderRadius.circular(radius), child: content),
+        if (entry.isPreviewableVideo)
+          Positioned(
+            right: 4,
+            bottom: 4,
+            child: Container(
+              padding: const EdgeInsets.all(2),
+              decoration: const BoxDecoration(
+                color: Color(0xCC000000),
+                shape: BoxShape.circle,
               ),
-            );
-          },
+              child: Icon(
+                Icons.play_arrow_rounded,
+                size: size == null ? 18 : 14,
+                color: Colors.white,
+              ),
+            ),
+          ),
+      ],
+    );
+
+    if (size == null) {
+      return thumb;
+    }
+    return SizedBox(width: size, height: size, child: thumb);
+  }
+
+  // ── 视频封面缓存与视图模式 ───────────────────────────────────────────────
+
+  static const _kViewModeKey = 'file_view_grid_v1';
+
+  bool _isGridView = false;
+  final Map<String, Uint8List?> _videoThumbCache = {};
+  final Map<String, Completer<Uint8List?>> _videoThumbWaiters = {};
+  final List<String> _videoThumbQueue = [];
+  final Set<String> _videoThumbFailed = {};
+  int _videoThumbActive = 0;
+  static const _kMaxVideoThumbConcurrent = 3;
+
+  Future<void> _loadViewMode() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final stored = prefs.getBool(_kViewModeKey);
+      if (stored != null && stored != _isGridView && mounted) {
+        setState(() => _isGridView = stored);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _setGridView(bool value) async {
+    if (_isGridView == value) {
+      return;
+    }
+    setState(() => _isGridView = value);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_kViewModeKey, value);
+    } catch (_) {}
+  }
+
+  Uri _buildVideoThumbUri(Uri baseUri, String resourcePath) {
+    return baseUri.replace(
+      path: '/api/video-thumb',
+      queryParameters: {'path': resourcePath},
+    );
+  }
+
+  /// 排队获取视频封面：并发受控（同时 3 个），但每个请求都会被处理，
+  /// 不会出现「先加载几个、剩下的永远不加载」的情况。
+  Future<Uint8List?> _requestVideoThumb(String resourcePath) {
+    final cached = _videoThumbCache[resourcePath];
+    if (cached != null) {
+      return Future.value(cached);
+    }
+    if (_videoThumbFailed.contains(resourcePath) || _baseUri == null) {
+      return Future.value(null);
+    }
+
+    final pending = _videoThumbWaiters[resourcePath];
+    if (pending != null) {
+      return pending.future;
+    }
+
+    final completer = Completer<Uint8List?>();
+    _videoThumbWaiters[resourcePath] = completer;
+    _videoThumbQueue.add(resourcePath);
+    _pumpVideoThumbQueue();
+    return completer.future;
+  }
+
+  void _pumpVideoThumbQueue() {
+    final visiblePaths = {for (final entry in _entries) entry.path};
+    while (_videoThumbActive < _kMaxVideoThumbConcurrent &&
+        _videoThumbQueue.isNotEmpty) {
+      final resourcePath = _videoThumbQueue.removeAt(0);
+      // 已切到别的目录或条目消失，直接跳过，别让旧目录的封面继续占着队列
+      if (!visiblePaths.contains(resourcePath)) {
+        _videoThumbWaiters.remove(resourcePath)?.complete(null);
+        continue;
+      }
+      _videoThumbActive++;
+      unawaited(() async {
+        try {
+          await _fetchVideoThumb(resourcePath);
+        } finally {
+          _videoThumbActive--;
+          _pumpVideoThumbQueue();
+        }
+      }());
+    }
+  }
+
+  Future<void> _fetchVideoThumb(String resourcePath) async {
+    final completer = _videoThumbWaiters.remove(resourcePath);
+    Uint8List? bytes;
+    final baseUri = _baseUri;
+
+    if (baseUri != null) {
+      final client = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 10);
+      try {
+        final headers = await _buildNasAuthHeaders();
+        final request = await client
+            .getUrl(_buildVideoThumbUri(baseUri, resourcePath))
+            .timeout(const Duration(seconds: 10));
+        headers.forEach(request.headers.set);
+        final response = await request.close().timeout(
+          const Duration(seconds: 30),
+        );
+
+        if (response.statusCode == 200) {
+          final builder = BytesBuilder(copy: false);
+          await response.forEach(builder.add);
+          final data = builder.takeBytes();
+          if (data.isNotEmpty && data.length <= 512 * 1024) {
+            bytes = data;
+          }
+        } else if (response.statusCode != 429) {
+          _videoThumbFailed.add(resourcePath);
+        }
+      } catch (_) {
+        // 超时或网络抖动不记失败，下次进目录会重新排队
+      } finally {
+        client.close(force: true);
+      }
+    }
+
+    if (bytes != null) {
+      if (_videoThumbCache.length >= 120) {
+        _videoThumbCache.clear();
+      }
+      _videoThumbCache[resourcePath] = bytes;
+    }
+
+    completer?.complete(bytes);
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  Widget _buildFileGridItem(FileBrowserEntry entry) {
+    final isBusy = _busyEntryPath == entry.path;
+    final theme = Theme.of(context);
+
+    return InkWell(
+      onTap: () => _openEntry(entry),
+      onLongPress: () => _showEntryActionsSheet(entry),
+      borderRadius: BorderRadius.circular(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          AspectRatio(
+            aspectRatio: 1,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                _buildEntryThumb(entry, radius: 14),
+                if (isBusy)
+                  Container(
+                    color: const Color(0x33000000),
+                    alignment: Alignment.center,
+                    child: const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            entry.name,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.bodySmall?.copyWith(
+              fontWeight: FontWeight.w600,
+              color: const Color(0xFF0F172A),
+            ),
+          ),
+          Text(
+            entry.isDir ? '目录' : _formatFileSize(entry.size),
+            maxLines: 1,
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: const Color(0xFF94A3B8),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showEntryActionsSheet(FileBrowserEntry entry) async {
+    final action = await showModalBottomSheet<EntryMenuAction>(
+      context: context,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
+              child: Text(
+                entry.name,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+            ),
+            for (final item in [
+              if (!entry.isDir)
+                (EntryMenuAction.download, '下载', Icons.download_outlined),
+              (EntryMenuAction.move, '移动', Icons.drive_file_move_outline),
+              (EntryMenuAction.rename, '重命名', Icons.drive_file_rename_outline),
+              (EntryMenuAction.delete, '删除', Icons.delete_outline),
+            ])
+              ListTile(
+                leading: Icon(
+                  item.$3,
+                  color: item.$1 == EntryMenuAction.delete
+                      ? const Color(0xFFB42318)
+                      : const Color(0xFF334155),
+                ),
+                title: Text(
+                  item.$2,
+                  style: TextStyle(
+                    color: item.$1 == EntryMenuAction.delete
+                        ? const Color(0xFFB42318)
+                        : null,
+                  ),
+                ),
+                onTap: () => Navigator.of(sheetContext).pop(item.$1),
+              ),
+          ],
         ),
       ),
     );
+
+    if (action != null && mounted) {
+      await _handleEntryAction(entry, action);
+    }
   }
 
   String _buildProbeDetail(NasHostStatus status, {String? fileError}) {
@@ -4211,30 +4496,38 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          Text('当前目录', style: theme.textTheme.titleMedium),
+          const SizedBox(height: 6),
+          Text(
+            _currentDirectory,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: const Color(0xFF475569),
+            ),
+          ),
+          const SizedBox(height: 10),
           Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('当前目录', style: theme.textTheme.titleMedium),
-                    const SizedBox(height: 6),
-                    Text(
-                      _currentDirectory,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: const Color(0xFF475569),
+                  Container(
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF1F5F9),
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: IconButton(
+                      onPressed: _hasFileSession
+                          ? () => _setGridView(!_isGridView)
+                          : null,
+                      tooltip: _isGridView ? '切换到列表' : '切换到格子',
+                      visualDensity: VisualDensity.compact,
+                      icon: Icon(
+                        _isGridView
+                            ? Icons.view_list_rounded
+                            : Icons.grid_view_rounded,
                       ),
                     ),
-                  ],
-                ),
-              ),
-              const SizedBox(width: 12),
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
+                  ),
+                  const SizedBox(width: 8),
                   Container(
                     decoration: BoxDecoration(
                       color: const Color(0xFFF1F5F9),
@@ -4252,6 +4545,7 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
                   const SizedBox(width: 8),
                   _buildDirectoryQuickActionButton(canOpenQuickActions),
                   const SizedBox(width: 8),
+                  const Spacer(),
                   FilledButton.tonalIcon(
                     onPressed: _canGoUp && !_isLoadingFiles
                         ? () => _refreshFiles(
@@ -4266,8 +4560,6 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
                     icon: const Icon(Icons.arrow_upward_rounded),
                     label: const Text('上级目录'),
                   ),
-                ],
-              ),
             ],
           ),
           const SizedBox(height: 12),
@@ -4294,7 +4586,22 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
               child: Text('当前目录为空。'),
             ),
           ] else ...[
-            ListView.separated(
+            if (_isGridView)
+              GridView.builder(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                  crossAxisCount: 3,
+                  mainAxisSpacing: 14,
+                  crossAxisSpacing: 12,
+                  childAspectRatio: 0.78,
+                ),
+                itemCount: _entries.length,
+                itemBuilder: (context, index) =>
+                    _buildFileGridItem(_entries[index]),
+              )
+            else
+              ListView.separated(
               shrinkWrap: true,
               physics: const NeverScrollableScrollPhysics(),
               itemCount: _entries.length,
@@ -6723,6 +7030,60 @@ class CloudUser {
   final String? ipv6Address;
   final bool isActive;
   final DateTime? updatedAt;
+}
+
+/// 视频封面：按需加载，加载中显示转圈，失败回落成影片图标。
+/// 并发被限流时 loader 返回 null，这里会短暂重试，避免一屏视频互相挤掉。
+class _NasVideoThumb extends StatefulWidget {
+  const _NasVideoThumb({required this.path, required this.loader});
+
+  final String path;
+  final Future<Uint8List?> Function(String path) loader;
+
+  @override
+  State<_NasVideoThumb> createState() => _NasVideoThumbState();
+}
+
+class _NasVideoThumbState extends State<_NasVideoThumb> {
+  Uint8List? _bytes;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_load());
+  }
+
+  Future<void> _load() async {
+    final data = await widget.loader(widget.path);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _bytes = data;
+      _loading = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bytes = _bytes;
+    if (bytes != null) {
+      return Image.memory(bytes, fit: BoxFit.cover, gaplessPlayback: true);
+    }
+
+    return Container(
+      color: const Color(0xFFE0E7FF),
+      alignment: Alignment.center,
+      child: _loading
+          ? const SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            )
+          : const Icon(Icons.movie_outlined, color: Color(0xFF3730A3)),
+    );
+  }
 }
 
 class _EndpointRecord {
