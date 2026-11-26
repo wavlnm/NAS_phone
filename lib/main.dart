@@ -2241,6 +2241,14 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
             title: entry.name,
             audioUri: _buildRawDownloadUri(baseUri, entry.path),
             authToken: token,
+            // 直连失败时（例如 FLAC）自动改走服务端转码；FLAC 直接转码省一次等待
+            transcode: AudioTranscodeSource(
+              baseUri: baseUri,
+              path: entry.path,
+              authToken: token,
+              authHeaders: _buildNasAuthHeaders,
+              transcodeFirst: entry.name.toLowerCase().endsWith('.flac'),
+            ),
           ),
         ),
       );
@@ -7355,17 +7363,36 @@ class ImagePreviewPage extends StatelessWidget {
   }
 }
 
+/// 音频转码兜底配置：直连播放失败时，请求电脑上的 ffmpeg 转成 MP3 再播。
+class AudioTranscodeSource {
+  const AudioTranscodeSource({
+    required this.baseUri,
+    required this.path,
+    required this.authToken,
+    required this.authHeaders,
+    this.transcodeFirst = false,
+  });
+
+  final Uri baseUri;
+  final String path;
+  final String authToken;
+  final Future<Map<String, String>> Function() authHeaders;
+  final bool transcodeFirst;
+}
+
 class AudioPreviewPage extends StatefulWidget {
   const AudioPreviewPage({
     required this.title,
     required this.audioUri,
     required this.authToken,
+    this.transcode,
     super.key,
   });
 
   final String title;
   final Uri audioUri;
   final String authToken;
+  final AudioTranscodeSource? transcode;
 
   @override
   State<AudioPreviewPage> createState() => _AudioPreviewPageState();
@@ -7385,6 +7412,8 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
   bool _isPreparing = true;
   bool _isPlaying = false;
   String? _error;
+  String? _preparingLabel;
+  bool _triedTranscode = false;
 
   @override
   void initState() {
@@ -7429,6 +7458,13 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
   }
 
   Future<void> _initializeAudio() async {
+    final transcode = widget.transcode;
+    if (transcode != null && transcode.transcodeFirst && !_triedTranscode) {
+      _triedTranscode = true;
+      await _initializeTranscoded();
+      return;
+    }
+
     try {
       final duration = Platform.isWindows
           ? await _loadWindowsAudioFromTempFile()
@@ -7444,6 +7480,94 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
         _duration = duration ?? Duration.zero;
         _isPreparing = false;
         _error = null;
+        _preparingLabel = null;
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      // 直连失败（解码器不认、内容类型被拒等）：改走服务端转码
+      if (transcode != null && !_triedTranscode) {
+        _triedTranscode = true;
+        await _initializeTranscoded();
+        return;
+      }
+
+      setState(() {
+        _isPreparing = false;
+        _preparingLabel = null;
+        _error = _describeAudioError(error, fallback: '音频加载失败，请稍后重试。');
+      });
+    }
+  }
+
+  /// 请求电脑把当前音频转成 MP3（缓存复用），再播放转码结果。
+  Future<void> _initializeTranscoded() async {
+    final source = widget.transcode;
+    if (source == null) {
+      return;
+    }
+
+    try {
+      if (mounted) {
+        setState(() {
+          _isPreparing = true;
+          _error = null;
+          _preparingLabel = '正在转码音频...';
+        });
+      }
+
+      var data = await _sendTranscodeRequest(
+        source,
+        '/api/system/audio-transcode',
+        body: {'path': source.path},
+      );
+      var status = data['status']?.toString() ?? 'processing';
+      var progress = (data['progress'] as num?)?.toDouble() ?? 0;
+      final key = data['key']?.toString();
+
+      var guard = 0;
+      while (status == 'processing' && guard < 600) {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _preparingLabel = progress > 0
+              ? '正在转码音频 ${(progress * 100).round()}%'
+              : '正在转码音频...';
+        });
+        await Future.delayed(const Duration(milliseconds: 600));
+        final polled = await _sendTranscodeRequest(
+          source,
+          '/api/system/audio-transcode/status/$key',
+        );
+        status = polled['status']?.toString() ?? status;
+        progress = (polled['progress'] as num?)?.toDouble() ?? progress;
+        if (status == 'failed') {
+          data = polled;
+        }
+        guard++;
+      }
+
+      if (status != 'ready' || key == null) {
+        throw NasApiException('音频转码失败：${data['error'] ?? '未知错误'}');
+      }
+
+      final playUri = source.baseUri.replace(
+        path:
+            '/api/system/audio-cache/$key/${Uri.encodeComponent(widget.title)}',
+      );
+      final duration = await _player.setUrl(playUri.toString());
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _duration = duration ?? Duration.zero;
+        _isPreparing = false;
+        _preparingLabel = null;
+        _error = null;
       });
     } catch (error) {
       if (!mounted) {
@@ -7452,8 +7576,63 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
 
       setState(() {
         _isPreparing = false;
-        _error = _describeAudioError(error, fallback: '音频加载失败，请稍后重试。');
+        _preparingLabel = null;
+        _error = _describeAudioError(
+          error,
+          fallback: '音频转码播放失败，请稍后重试。',
+        );
       });
+    }
+  }
+
+  Future<Map<String, dynamic>> _sendTranscodeRequest(
+    AudioTranscodeSource source,
+    String path, {
+    Map<String, dynamic>? body,
+  }) async {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10);
+
+    try {
+      final request = await client
+          .openUrl(
+            body == null ? 'GET' : 'POST',
+            source.baseUri.replace(path: path),
+          )
+          .timeout(const Duration(seconds: 10));
+      final headers = await source.authHeaders();
+      headers.forEach(request.headers.set);
+      request.headers.set('X-Auth', source.authToken);
+
+      if (body != null) {
+        final bytes = utf8.encode(jsonEncode(body));
+        request.headers.contentType = ContentType(
+          'application',
+          'json',
+          charset: 'utf-8',
+        );
+        request.contentLength = bytes.length;
+        request.add(bytes);
+      }
+
+      final response = await request.close().timeout(
+        const Duration(seconds: 30),
+      );
+      final text = await utf8.decoder.bind(response).join();
+      if (response.statusCode >= 300) {
+        throw NasApiException('转码服务返回 ${response.statusCode}。${text.trim()}');
+      }
+
+      final decoded = jsonDecode(text);
+      if (decoded is Map<String, dynamic>) {
+        return decoded;
+      }
+      if (decoded is Map) {
+        return Map<String, dynamic>.from(decoded);
+      }
+      throw const NasApiException('转码服务返回了无法识别的数据。');
+    } finally {
+      client.close(force: true);
     }
   }
 
@@ -7596,7 +7775,11 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
     );
     final statusText =
         _error ??
-        (_isPlaying ? '正在播放' : (_isPreparing ? '正在加载音频...' : '已暂停'));
+        (_isPlaying
+            ? '正在播放'
+            : (_isPreparing
+                  ? (_preparingLabel ?? '正在加载音频...')
+                  : '已暂停'));
     final statusColor = _error == null
         ? Colors.white.withValues(alpha: 0.82)
         : const Color(0xFFFECACA);
