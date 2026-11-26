@@ -3887,6 +3887,27 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
     ).push(MaterialPageRoute<void>(builder: (context) => const ChatToolPage()));
   }
 
+  Future<void> _openTerminalCommandPage() async {
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('请先连接电脑。')));
+      return;
+    }
+
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => TerminalCommandPage(
+          baseUri: baseUri,
+          authToken: token,
+          authHeaders: _buildNasAuthHeaders,
+        ),
+      ),
+    );
+  }
+
   Future<void> _openRecycleBinToolPage() async {
     final baseUri = _baseUri;
     final token = _authToken;
@@ -5279,6 +5300,15 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
             backgroundColor: const Color(0xFFEEF2FF),
             foregroundColor: const Color(0xFF3730A3),
             onTap: _openChatToolPage,
+          ),
+          const SizedBox(height: 14),
+          _ToolLauncherButton(
+            icon: Icons.terminal,
+            title: '终端指令',
+            subtitle: '在电脑上执行命令，需先在电脑端开启远程终端。',
+            backgroundColor: const Color(0xFFF1F5F9),
+            foregroundColor: const Color(0xFF334155),
+            onTap: _openTerminalCommandPage,
           ),
           const SizedBox(height: 14),
           _ToolLauncherButton(
@@ -7639,6 +7669,804 @@ class ImagePreviewPage extends StatelessWidget {
       ),
     );
   }
+}
+
+/// 终端快捷键：用户自存的"名称 + 命令"，只可删除不可编辑。
+class _TerminalQuickCommand {
+  const _TerminalQuickCommand({required this.name, required this.command});
+
+  final String name;
+  final String command;
+
+  Map<String, dynamic> toJson() => {'name': name, 'command': command};
+
+  static _TerminalQuickCommand? fromJson(Object? raw) {
+    if (raw is Map) {
+      final name = raw['name']?.toString().trim() ?? '';
+      final command = raw['command']?.toString().trim() ?? '';
+      if (name.isEmpty || command.isEmpty) {
+        return null;
+      }
+      return _TerminalQuickCommand(name: name, command: command);
+    }
+    return null;
+  }
+}
+
+/// 终端指令：把命令发到电脑执行（需先在电脑 /admin 面板开启远程终端）。
+class TerminalCommandPage extends StatefulWidget {
+  const TerminalCommandPage({
+    required this.baseUri,
+    required this.authToken,
+    required this.authHeaders,
+    super.key,
+  });
+
+  final Uri baseUri;
+  final String authToken;
+  final Future<Map<String, String>> Function() authHeaders;
+
+  @override
+  State<TerminalCommandPage> createState() => _TerminalCommandPageState();
+}
+
+class _TerminalCommandPageState extends State<TerminalCommandPage> {
+  static const String _historyPrefsKey = 'terminal_command_history';
+  static const int _historyLimit = 50;
+  static const String _quickPrefsKey = 'terminal_quick_commands';
+  static const int _quickLimit = 50;
+
+  final TextEditingController _commandController = TextEditingController();
+  final TextEditingController _quickNameController = TextEditingController();
+  bool _isRunning = false;
+  bool? _enabled;
+  DateTime? _expiresAt;
+  String? _error;
+  String _output = '';
+  int? _exitCode;
+  int? _durationMs;
+  List<String> _history = [];
+  List<_TerminalQuickCommand> _quickCommands = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _commandController.addListener(_onCommandTextChanged);
+    _loadStatus();
+    _loadHistory();
+    _loadQuickCommands();
+  }
+
+  void _onCommandTextChanged() {
+    // 只为刷新"存为快捷键"图标的可用状态。
+    setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _commandController.removeListener(_onCommandTextChanged);
+    _commandController.dispose();
+    _quickNameController.dispose();
+    super.dispose();
+  }
+
+  Future<Map<String, String>> _headers() async {
+    final headers = await widget.authHeaders();
+    headers['X-Auth'] = widget.authToken;
+    return headers;
+  }
+
+  Future<void> _loadHistory() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_historyPrefsKey);
+      if (raw == null || !mounted) {
+        return;
+      }
+      final decoded = jsonDecode(raw);
+      if (decoded is List) {
+        setState(() {
+          _history = decoded.whereType<String>().take(_historyLimit).toList();
+        });
+      }
+    } catch (_) {
+      // 历史损坏时静默忽略，不影响执行功能。
+    }
+  }
+
+  Future<void> _recordHistory(String command) async {
+    setState(() {
+      _history.remove(command);
+      _history.insert(0, command);
+      if (_history.length > _historyLimit) {
+        _history = _history.sublist(0, _historyLimit);
+      }
+    });
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_historyPrefsKey, jsonEncode(_history));
+    } catch (_) {
+      // 持久化失败不影响本次执行。
+    }
+  }
+
+  Future<void> _showHistory() async {
+    if (_history.isEmpty) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('暂无历史命令。')));
+      return;
+    }
+    final selected = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('历史命令'),
+        contentPadding: const EdgeInsets.symmetric(vertical: 8),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: ListView.builder(
+            shrinkWrap: true,
+            itemCount: _history.length,
+            itemBuilder: (context, index) {
+              final command = _history[index];
+              return ListTile(
+                dense: true,
+                title: Text(
+                  command,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 13,
+                  ),
+                ),
+                onTap: () => Navigator.of(dialogContext).pop(command),
+              );
+            },
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+    if (selected != null && mounted) {
+      _fillCommand(selected);
+    }
+  }
+
+  void _fillCommand(String command) {
+    setState(() {
+      _commandController.text = command;
+      _commandController.selection = TextSelection.collapsed(
+        offset: command.length,
+      );
+    });
+  }
+
+  Future<void> _loadQuickCommands() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_quickPrefsKey);
+      if (raw == null || !mounted) {
+        return;
+      }
+      final decoded = jsonDecode(raw);
+      if (decoded is List) {
+        final items = <_TerminalQuickCommand>[];
+        for (final entry in decoded) {
+          final item = _TerminalQuickCommand.fromJson(entry);
+          if (item != null) {
+            items.add(item);
+          }
+        }
+        setState(() {
+          _quickCommands = items.take(_quickLimit).toList();
+        });
+      }
+    } catch (_) {
+      // 快捷键数据损坏时静默忽略。
+    }
+  }
+
+  Future<void> _persistQuickCommands() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        _quickPrefsKey,
+        jsonEncode([for (final item in _quickCommands) item.toJson()]),
+      );
+    } catch (_) {
+      // 持久化失败不影响本次使用。
+    }
+  }
+
+  Future<void> _saveCurrentAsQuickCommand() async {
+    final command = _commandController.text.trim();
+    if (command.isEmpty) {
+      return;
+    }
+    await _promptAddQuickCommand(command);
+  }
+
+  Future<void> _promptAddQuickCommand(String command) async {
+    if (_quickCommands.length >= _quickLimit) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('快捷键已满 $_quickLimit 条，请先删除一些。')),
+      );
+      return;
+    }
+    if (_quickCommands.any((item) => item.command == command)) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('这条命令已经在快捷键里了。')));
+      return;
+    }
+
+    _quickNameController.clear();
+    String? errorText;
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          title: const Text('添加快捷键'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              TextField(
+                controller: _quickNameController,
+                autofocus: true,
+                maxLength: 20,
+                decoration: InputDecoration(
+                  labelText: '名称（必填）',
+                  hintText: '例如：拉起 Qoder',
+                  errorText: errorText,
+                  border: const OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                '命令',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Theme.of(dialogContext).colorScheme.onSurfaceVariant,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Container(
+                width: double.maxFinite,
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: Theme.of(
+                    dialogContext,
+                  ).colorScheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  command,
+                  maxLines: 5,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 12,
+                    height: 1.4,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final name = _quickNameController.text.trim();
+                if (name.isEmpty) {
+                  setDialogState(() {
+                    errorText = '请输入名称。';
+                  });
+                  return;
+                }
+                if (_quickCommands.any((item) => item.name == name)) {
+                  setDialogState(() {
+                    errorText = '名称已存在，换一个。';
+                  });
+                  return;
+                }
+                Navigator.of(dialogContext).pop(true);
+              },
+              child: const Text('保存'),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    final name = _quickNameController.text.trim();
+    if (saved != true || name.isEmpty || !mounted) {
+      return;
+    }
+    setState(() {
+      _quickCommands.insert(
+        0,
+        _TerminalQuickCommand(name: name, command: command),
+      );
+    });
+    await _persistQuickCommands();
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('已添加快捷键「$name」。')));
+  }
+
+  Future<void> _showQuickCommands() async {
+    if (_quickCommands.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('还没有快捷键：在命令框右侧点书签图标添加。')),
+      );
+      return;
+    }
+    final selected = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          title: const Text('快捷键'),
+          contentPadding: const EdgeInsets.symmetric(vertical: 8),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: _quickCommands.length,
+              itemBuilder: (context, index) {
+                final item = _quickCommands[index];
+                return ListTile(
+                  dense: true,
+                  title: Text(
+                    item.name,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w600,
+                      fontSize: 14,
+                    ),
+                  ),
+                  subtitle: Text(
+                    item.command,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontFamily: 'monospace',
+                      fontSize: 12,
+                    ),
+                  ),
+                  onTap: () => Navigator.of(dialogContext).pop(item.command),
+                  trailing: IconButton(
+                    tooltip: '删除',
+                    visualDensity: VisualDensity.compact,
+                    icon: const Icon(Icons.delete_outline, size: 20),
+                    onPressed: () async {
+                      setState(() {
+                        _quickCommands.removeAt(index);
+                      });
+                      await _persistQuickCommands();
+                      if (!dialogContext.mounted) {
+                        return;
+                      }
+                      if (_quickCommands.isEmpty) {
+                        Navigator.of(dialogContext).pop();
+                      } else {
+                        setDialogState(() {});
+                      }
+                    },
+                  ),
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('关闭'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (selected != null && mounted) {
+      _fillCommand(selected);
+    }
+  }
+
+  Future<void> _loadStatus() async {
+    try {
+      final headers = await _headers();
+      final client = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 8);
+      try {
+        final request = await client
+            .getUrl(
+              widget.baseUri.replace(path: '/api/system/terminal/status'),
+            )
+            .timeout(const Duration(seconds: 10));
+        headers.forEach(request.headers.set);
+        final response = await request.close().timeout(
+          const Duration(seconds: 12),
+        );
+        final body = await utf8.decoder.bind(response).join();
+        if (response.statusCode >= 300) {
+          throw NasApiException('读取终端状态失败：${response.statusCode}。');
+        }
+
+        final data = jsonDecode(body);
+        final expiresText = data is Map ? data['expiresAt']?.toString() : null;
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _enabled = data is Map && data['enabled'] == true;
+          _expiresAt = expiresText == null
+              ? null
+              : DateTime.tryParse(expiresText)?.toLocal();
+        });
+      } finally {
+        client.close(force: true);
+      }
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _enabled = false;
+        _error = error is NasApiException
+            ? error.message
+            : '无法读取终端状态，请确认已连接电脑。';
+      });
+    }
+  }
+
+  Future<void> _runCommand() async {
+    if (_isRunning) {
+      return;
+    }
+
+    final command = _commandController.text.trim();
+    if (command.isEmpty) {
+      return;
+    }
+
+    await _recordHistory(command);
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _isRunning = true;
+      _error = null;
+      _output = '';
+      _exitCode = null;
+      _durationMs = null;
+    });
+
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10);
+    try {
+      final headers = await _headers();
+      final request = await client
+          .postUrl(widget.baseUri.replace(path: '/api/system/terminal/exec'))
+          .timeout(const Duration(seconds: 10));
+      headers.forEach(request.headers.set);
+      request.headers.contentType = ContentType(
+        'application',
+        'json',
+        charset: 'utf-8',
+      );
+      final payload = utf8.encode(jsonEncode({'command': command}));
+      request.contentLength = payload.length;
+      request.add(payload);
+
+      final response = await request.close().timeout(
+        const Duration(seconds: 90),
+      );
+      final body = await utf8.decoder.bind(response).join();
+
+      if (response.statusCode == 404) {
+        throw const NasApiException(
+          '远程终端没有开启：请在电脑上打开 http://127.0.0.1:5034/admin 开启后重试。',
+        );
+      }
+      if (response.statusCode >= 300) {
+        throw NasApiException('执行失败：${response.statusCode}。${body.trim()}');
+      }
+
+      final data = jsonDecode(body);
+      final stdoutText = data is Map ? (data['stdout']?.toString() ?? '') : '';
+      final stderrText = data is Map ? (data['stderr']?.toString() ?? '') : '';
+      final timedOut = data is Map && data['timedOut'] == true;
+      final exitCode = data is Map ? (data['exitCode'] as num?)?.toInt() : null;
+      final durationMs = data is Map
+          ? (data['durationMs'] as num?)?.toInt()
+          : null;
+
+      final buffer = StringBuffer();
+      if (stdoutText.isNotEmpty) {
+        buffer.write(stdoutText);
+      }
+      if (stderrText.isNotEmpty) {
+        if (buffer.isNotEmpty) {
+          buffer.write('\n');
+        }
+        buffer.write(stderrText);
+      }
+      if (buffer.isEmpty) {
+        buffer.write('（无输出）');
+      }
+      if (timedOut) {
+        buffer.write('\n…执行超过 30 秒，已被终止。');
+      }
+
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _output = buffer.toString();
+        _exitCode = exitCode;
+        _durationMs = durationMs;
+        _enabled = true;
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _error = error is NasApiException ? error.message : '执行失败，请稍后重试。';
+      });
+    } finally {
+      client.close(force: true);
+      if (mounted) {
+        setState(() {
+          _isRunning = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('终端指令')),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 28),
+          children: [
+            _buildStatusCard(theme),
+            const SizedBox(height: 16),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _commandController,
+                    minLines: 3,
+                    maxLines: 6,
+                    style: const TextStyle(
+                      fontFamily: 'monospace',
+                      fontSize: 13.5,
+                    ),
+                    decoration: const InputDecoration(
+                      labelText: '命令',
+                      hintText: '例如：ls -al ~/项目',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 4),
+                Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      tooltip: '存为快捷键',
+                      visualDensity: VisualDensity.compact,
+                      onPressed:
+                          (_isRunning ||
+                              _commandController.text.trim().isEmpty)
+                          ? null
+                          : _saveCurrentAsQuickCommand,
+                      icon: const Icon(Icons.bookmark_add_outlined, size: 22),
+                    ),
+                    IconButton(
+                      tooltip: '清空',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: _isRunning
+                          ? null
+                          : () {
+                              setState(() {
+                                _commandController.clear();
+                                _output = '';
+                                _exitCode = null;
+                                _durationMs = null;
+                                _error = null;
+                              });
+                            },
+                      icon: const Icon(Icons.clear_all_outlined, size: 22),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                FilledButton.icon(
+                  onPressed: _isRunning ? null : _runCommand,
+                  icon: _isRunning
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.play_arrow_rounded),
+                  label: Text(_isRunning ? '执行中...' : '执行'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _isRunning ? null : _showHistory,
+                  icon: const Icon(Icons.history, size: 18),
+                  label: const Text('历史'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _isRunning ? null : _showQuickCommands,
+                  icon: const Icon(Icons.bookmarks_outlined, size: 18),
+                  label: const Text('快捷键'),
+                ),
+              ],
+            ),
+            if (_error != null) ...[
+              const SizedBox(height: 12),
+              Text(
+                _error!,
+                style: TextStyle(color: theme.colorScheme.error, fontSize: 13),
+              ),
+            ],
+            if (_output.isNotEmpty) ...[
+              const SizedBox(height: 16),
+              _buildOutputCard(theme),
+            ],
+            const SizedBox(height: 16),
+            Text(
+              '命令以 kali 身份在电脑上执行，最长 30 秒；可执行程序请自行加 nohup 放后台。'
+              '开启状态由电脑 /admin 面板控制，到期自动关闭。',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStatusCard(ThemeData theme) {
+    final enabled = _enabled;
+    final text = enabled == null
+        ? '正在读取远程终端状态…'
+        : enabled
+        ? (_expiresAt == null
+              ? '远程终端已开启（永久）。'
+              : '远程终端已开启，到期时间：${_formatDateTime(_expiresAt!)}。')
+        : '远程终端未开启。请在电脑上打开 http://127.0.0.1:5034/admin 开启（可设 30 分钟）。';
+
+    final color = enabled == true
+        ? const Color(0xFF047857)
+        : enabled == false
+        ? const Color(0xFFB45309)
+        : theme.colorScheme.onSurfaceVariant;
+
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: enabled == true
+            ? const Color(0xFFECFDF5)
+            : const Color(0xFFFFFBEB),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(
+            enabled == true ? Icons.verified_user_outlined : Icons.lock_clock,
+            size: 20,
+            color: color,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              text,
+              style: TextStyle(color: color, fontSize: 13, height: 1.5),
+            ),
+          ),
+          IconButton(
+            tooltip: '刷新状态',
+            onPressed: _isRunning ? null : _loadStatus,
+            icon: const Icon(Icons.refresh, size: 18),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildOutputCard(ThemeData theme) {
+    final meta = [
+      if (_exitCode != null) '退出码 $_exitCode',
+      if (_durationMs != null) '耗时 ${(_durationMs! / 1000).toStringAsFixed(1)} 秒',
+    ].join(' · ');
+
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF0B1220),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  meta.isEmpty ? '输出' : '输出 · $meta',
+                  style: const TextStyle(
+                    color: Color(0xFF94A3B8),
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              IconButton(
+                tooltip: '复制输出',
+                visualDensity: VisualDensity.compact,
+                onPressed: () async {
+                  await Clipboard.setData(ClipboardData(text: _output));
+                  if (!context.mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('已复制输出。')),
+                  );
+                },
+                icon: const Icon(
+                  Icons.copy_rounded,
+                  size: 16,
+                  color: Color(0xFF94A3B8),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          SelectableText(
+            _output,
+            style: const TextStyle(
+              color: Color(0xFFE2E8F0),
+              fontFamily: 'monospace',
+              fontSize: 12.5,
+              height: 1.5,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+String _formatDateTime(DateTime value) {
+  String two(int number) => number.toString().padLeft(2, '0');
+  return '${two(value.month)}-${two(value.day)} ${two(value.hour)}:${two(value.minute)}';
 }
 
 /// 音频转码兜底配置：直连播放失败时，请求电脑上的 ffmpeg 转成 MP3 再播。
