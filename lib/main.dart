@@ -3908,7 +3908,7 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
     );
   }
 
-  Future<void> _openScreenViewPage() async {
+  Future<void> _openScreenViewPage({bool monitor = false}) async {
     final baseUri = _baseUri;
     final token = _authToken;
     if (baseUri == null || token == null) {
@@ -3924,6 +3924,7 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
           baseUri: baseUri,
           authToken: token,
           authHeaders: _buildNasAuthHeaders,
+          monitor: monitor,
         ),
       ),
     );
@@ -5338,7 +5339,16 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
             subtitle: '查看电脑当前的屏幕画面。',
             backgroundColor: const Color(0xFFE0F2FE),
             foregroundColor: const Color(0xFF075985),
-            onTap: _openScreenViewPage,
+            onTap: () => _openScreenViewPage(),
+          ),
+          const SizedBox(height: 14),
+          _ToolLauncherButton(
+            icon: Icons.videocam_outlined,
+            title: '监控',
+            subtitle: '看摄像头画面、移动侦测自动录 10 秒、听现场声音。',
+            backgroundColor: const Color(0xFFECFCCB),
+            foregroundColor: const Color(0xFF3F6212),
+            onTap: () => _openScreenViewPage(monitor: true),
           ),
           const SizedBox(height: 14),
           _ToolLauncherButton(
@@ -7722,14 +7732,34 @@ const List<_ScreenQuality> _screenQualities = [
   _ScreenQuality(1920, 60, 'png'),
 ];
 
+/// 摄像头源档位：电脑端摄像头原生就是 1280x720，再往上没有意义；
+/// PNG 对摄像头画面（全是噪点细节）体积暴涨，所以不提供。
+const List<_ScreenQuality> _cameraQualities = [
+  _ScreenQuality(1280, 85, 'jpeg'),
+  _ScreenQuality(1280, 60, 'jpeg'),
+  _ScreenQuality(640, 85, 'jpeg'),
+  _ScreenQuality(640, 60, 'jpeg'),
+  _ScreenQuality(320, 60, 'jpeg'),
+];
+
+/// 侦测灵敏度：值越低越迟钝（只报大动作），越高越灵敏（也更容易被光线变化误报）。
+const List<String> _sensitivityOptions = ['low', 'mid', 'high'];
+
+String _sensitivityLabel(String value) => switch (value) {
+  'low' => '低',
+  'high' => '高',
+  _ => '中',
+};
+
 const List<double> _screenFpsOptions = [0, 0.2, 0.5, 1, 2, 5, 10, 15];
 
-/// 看屏幕：电脑端常驻抓取，这里只负责取图；自动刷新只在页面存活期间轮询。
+/// 看屏幕 / 监控：同一个页面，靠入口决定取哪个源、显示哪些按钮。
 class ScreenViewPage extends StatefulWidget {
   const ScreenViewPage({
     required this.baseUri,
     required this.authToken,
     required this.authHeaders,
+    this.monitor = false,
     super.key,
   });
 
@@ -7737,13 +7767,14 @@ class ScreenViewPage extends StatefulWidget {
   final String authToken;
   final Future<Map<String, String>> Function() authHeaders;
 
+  /// true = 摄像头源（监控），false = 桌面源（看屏幕）。
+  final bool monitor;
+
   @override
   State<ScreenViewPage> createState() => _ScreenViewPageState();
 }
 
 class _ScreenViewPageState extends State<ScreenViewPage> {
-  static const String _qualityPrefsKey = 'screen_view_quality';
-
   Uint8List? _frame;
   String? _etag;
   bool _fetching = false;
@@ -7762,17 +7793,43 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
   /// 全屏横屏模式：隐藏标题栏与系统栏，画面占满整屏。
   bool _immersive = false;
 
+  // ── 以下只在监控（摄像头源）模式下使用 ──────────────────────────────
+  /// 电脑端上报的监控状态（侦测开关、是否在录、今日片段数等）。
+  Map<String, dynamic>? _monitorStatus;
+  Timer? _statusTimer;
+  bool _statusBusy = false;
+  bool _detectEnabled = false;
+  String _sensitivity = 'mid';
+  bool _recording = false;
+  bool _listening = false;
+  String? _listenError;
+  final AudioPlayer _listenPlayer = AudioPlayer();
+
+  List<_ScreenQuality> get _qualities =>
+      widget.monitor ? _cameraQualities : _screenQualities;
+
+  String get _qualityPrefsKey =>
+      widget.monitor ? 'monitor_view_quality' : 'screen_view_quality';
+
   @override
   void initState() {
     super.initState();
     _loadPrefs();
+    if (widget.monitor) {
+      _statusTimer = Timer.periodic(
+        const Duration(seconds: 5),
+        (_) => _refreshMonitorStatus(),
+      );
+    }
   }
 
   @override
   void dispose() {
     _timer?.cancel();
+    _statusTimer?.cancel();
     _client.close(force: true);
     _transform.dispose();
+    _listenPlayer.dispose();
     if (_immersive) {
       SystemChrome.setPreferredOrientations(DeviceOrientation.values);
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
@@ -7809,17 +7866,19 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
     }
     const scale = 2.5;
     _transform.value = Matrix4.identity()
-      ..translate(local.dx, local.dy)
-      ..scale(scale)
-      ..translate(-local.dx, -local.dy);
+      ..translateByDouble(local.dx, local.dy, 0, 1)
+      ..scaleByDouble(scale, scale, scale, 1)
+      ..translateByDouble(-local.dx, -local.dy, 0, 1);
   }
 
   Future<void> _loadPrefs() async {
+    // 默认档：桌面 1280 q60，摄像头 640 q60（公网也扛得住）
+    _quality = _qualities[widget.monitor ? 3 : 3];
     try {
       final prefs = await SharedPreferences.getInstance();
       final saved = prefs.getString(_qualityPrefsKey);
       if (saved != null) {
-        for (final candidate in _screenQualities) {
+        for (final candidate in _qualities) {
           if (candidate.key == saved) {
             _quality = candidate;
             break;
@@ -7831,6 +7890,9 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
     }
     if (!mounted) {
       return;
+    }
+    if (widget.monitor) {
+      _refreshMonitorStatus();
     }
     await _fetch();
   }
@@ -7889,6 +7951,7 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
             widget.baseUri.replace(
               path: '/api/system/screen',
               queryParameters: {
+                'source': widget.monitor ? 'camera' : 'desktop',
                 'w': '${_quality.width}',
                 'q': '${_quality.quality}',
                 'format': _quality.format,
@@ -7963,6 +8026,202 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
     });
   }
 
+  // ── 监控接口 ──────────────────────────────────────────────────────────
+
+  /// 带签名头的 JSON 请求；失败返回 null，由调用方决定怎么提示。
+  Future<Map<String, dynamic>?> _jsonRequest(
+    String method,
+    String path, {
+    Map<String, dynamic>? body,
+  }) async {
+    try {
+      final headers = await widget.authHeaders();
+      headers['X-Auth'] = widget.authToken;
+      final request = await _client.openUrl(method, widget.baseUri.replace(path: path))
+          .timeout(const Duration(seconds: 10));
+      headers.forEach(request.headers.set);
+      if (body != null) {
+        request.headers.contentType = ContentType.json;
+        request.write(jsonEncode(body));
+      }
+      final response = await request.close().timeout(
+        const Duration(seconds: 20),
+      );
+      final text = await response.transform(utf8.decoder).join();
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        return null;
+      }
+      final decoded = jsonDecode(text);
+      return decoded is Map<String, dynamic> ? decoded : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _refreshMonitorStatus() async {
+    if (_statusBusy) {
+      return;
+    }
+    _statusBusy = true;
+    final status = await _jsonRequest('GET', '/api/monitor/status');
+    _statusBusy = false;
+    if (!mounted || status == null) {
+      return;
+    }
+    final detect = status['detect'];
+    final worker = status['worker'];
+    setState(() {
+      _monitorStatus = status;
+      _detectEnabled = detect is Map && detect['enabled'] == true;
+      if (detect is Map && detect['sensitivity'] is String) {
+        _sensitivity = detect['sensitivity'] as String;
+      }
+      _recording = worker is Map && worker['recording'] == true;
+    });
+  }
+
+  Future<void> _applyDetect(bool enabled, String sensitivity) async {
+    setState(() {
+      _detectEnabled = enabled;
+      _sensitivity = sensitivity;
+    });
+    await _jsonRequest(
+      'POST',
+      '/api/monitor/detect',
+      body: {'enabled': enabled, 'sensitivity': sensitivity},
+    );
+    await _refreshMonitorStatus();
+  }
+
+  Future<void> _recordNow() async {
+    await _jsonRequest('POST', '/api/monitor/record', body: const {});
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('已开始录 10 秒，稍后在事件片段里查看。')),
+    );
+    // 录 10 秒 + 合成编码要十几秒，之后再刷新，避免立刻看到旧状态。
+    Future<void>.delayed(const Duration(seconds: 15), () {
+      if (mounted) {
+        _refreshMonitorStatus();
+      }
+    });
+  }
+
+  /// 听现场：申请一次性票据，把电脑麦克风当流式音频播放。
+  Future<void> _toggleListen() async {
+    if (_listening) {
+      setState(() => _listening = false);
+      try {
+        await _listenPlayer.stop();
+      } catch (_) {}
+      return;
+    }
+
+    setState(() {
+      _listening = true;
+      _listenError = null;
+    });
+    final ticket = await _jsonRequest(
+      'POST',
+      '/api/monitor/listen-ticket',
+      body: const {},
+    );
+    final path = ticket?['path']?.toString();
+    if (path == null || path.isEmpty) {
+      setState(() {
+        _listening = false;
+        _listenError = '听现场不可用';
+      });
+      return;
+    }
+
+    try {
+      await _listenPlayer.setAudioSource(
+        AudioSource.uri(widget.baseUri.resolve(path)),
+      );
+      await _listenPlayer.play();
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _listening = false;
+        _listenError = '音频流打开失败';
+      });
+    }
+  }
+
+  /// 事件片段：走视频中转票据，交给系统播放器打开（与文件页里放视频同一套）。
+  Future<void> _openClip(String resourcePath) async {
+    final ticket = await _jsonRequest(
+      'POST',
+      '/api/system/media-tickets',
+      body: {'path': resourcePath},
+    );
+    final url = ticket?['url']?.toString();
+    if (url == null || url.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('取片段播放链接失败。')),
+        );
+      }
+      return;
+    }
+    final uri = Uri.tryParse(url);
+    if (uri == null) {
+      return;
+    }
+    await launchUrl(
+      uri.hasScheme ? uri : widget.baseUri.resolveUri(uri),
+      mode: LaunchMode.externalApplication,
+    );
+  }
+
+  Future<void> _showClipsSheet() async {
+    final data = await _jsonRequest('GET', '/api/monitor/clips');
+    if (!mounted) {
+      return;
+    }
+    final items = (data?['items'] as List?) ?? const [];
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (context) => SafeArea(
+        child: items.isEmpty
+            ? const Padding(
+                padding: EdgeInsets.all(24),
+                child: Text('今天还没有事件片段。'),
+              )
+            : ListView.separated(
+                shrinkWrap: true,
+                itemCount: items.length,
+                separatorBuilder: (_, _) => const Divider(height: 1),
+                itemBuilder: (context, index) {
+                  final item = items[index];
+                  final map = item is Map<String, dynamic> ? item : const {};
+                  final name = map['name']?.toString() ?? '';
+                  final bytes = (map['sizeBytes'] as num?)?.toInt() ?? 0;
+                  final modified = map['modifiedAt']?.toString() ?? '';
+                  return ListTile(
+                    dense: true,
+                    leading: const Icon(Icons.play_circle_outline),
+                    title: Text(name),
+                    subtitle: Text(
+                      '${bytes ~/ 1024}KB  ${modified.substring(0, modified.length.clamp(0, 19)).replaceFirst("T", " ")}',
+                    ),
+                    onTap: () {
+                      Navigator.of(context).pop();
+                      _openClip(map['relativePath']?.toString() ?? name);
+                    },
+                  );
+                },
+              ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -7982,8 +8241,14 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('看屏幕'),
+        title: Text(widget.monitor ? '监控' : '看屏幕'),
         actions: [
+          if (widget.monitor)
+            IconButton(
+              tooltip: '今日事件片段',
+              onPressed: _showClipsSheet,
+              icon: const Icon(Icons.folder_open),
+            ),
           IconButton(
             tooltip: '全屏横屏（可双指放大）',
             onPressed: () => _setImmersive(true),
@@ -8017,17 +8282,20 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
                   _buildDropdown<_ScreenQuality>(
                     label: '清晰度',
                     value: _quality,
-                    items: _screenQualities,
+                    items: _qualities,
                     text: (value) => value.label,
                     onChanged: _setQuality,
                   ),
                 ],
               ),
             ),
+            if (widget.monitor) _buildMonitorBar(theme),
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
               child: Text(
-                '自动刷新只在停留本页时生效，退出即停止；电脑端空闲 60 秒后自动结束抓取。',
+                widget.monitor
+                    ? '侦测开着时电脑端会一直采集；画面有动就自动录 10 秒存进共享目录的「监控录像」，跨天的自动移入回收站。'
+                    : '自动刷新只在停留本页时生效，退出即停止；电脑端空闲 60 秒后自动结束抓取。',
                 style: theme.textTheme.bodySmall?.copyWith(
                   color: theme.colorScheme.onSurfaceVariant,
                 ),
@@ -8035,6 +8303,76 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  /// 监控专属控制条：移动侦测开关、灵敏度、手动录一段、听现场。
+  Widget _buildMonitorBar(ThemeData theme) {
+    final clips = (_monitorStatus?['clipsToday'] as num?)?.toInt() ?? 0;
+    final cameraOn = _monitorStatus?['camera'] is Map &&
+        (_monitorStatus!['camera'] as Map)['running'] == true;
+    final sensitivityItems = _sensitivityOptions;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 4,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('移动侦测', style: TextStyle(fontSize: 13)),
+              Switch(
+                value: _detectEnabled,
+                onChanged: (value) => _applyDetect(value, _sensitivity),
+              ),
+            ],
+          ),
+          _buildDropdown<String>(
+            label: '灵敏度',
+            value: _sensitivity,
+            items: sensitivityItems,
+            text: _sensitivityLabel,
+            onChanged: (value) => _applyDetect(_detectEnabled, value),
+          ),
+          IconButton(
+            tooltip: _recording ? '正在录像…' : '手动录 10 秒',
+            onPressed: _recording ? null : _recordNow,
+            icon: Icon(_recording ? Icons.fiber_manual_record : Icons.videocam),
+          ),
+          IconButton(
+            tooltip: _listening ? '停止听现场' : '听现场',
+            onPressed: _toggleListen,
+            style: ButtonStyle(
+              backgroundColor: WidgetStatePropertyAll(
+                _listening ? const Color(0xFFDCFCE7) : Colors.transparent,
+              ),
+            ),
+            icon: Icon(_listening ? Icons.graphic_eq : Icons.hearing),
+          ),
+          TextButton.icon(
+            onPressed: _showClipsSheet,
+            icon: const Icon(Icons.folder_open, size: 18),
+            label: Text('今日片段 $clips'),
+          ),
+          if (_listenError != null)
+            Text(
+              _listenError!,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.error,
+              ),
+            ),
+          if (!cameraOn && _monitorStatus != null)
+            Text(
+              '摄像头未采集',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.error,
+              ),
+            ),
+        ],
       ),
     );
   }
@@ -8083,6 +8421,8 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
         ? '抓取中'
         : _failed
         ? '失败'
+        : widget.monitor && _recording
+        ? '录像中'
         : '';
 
     return Container(
