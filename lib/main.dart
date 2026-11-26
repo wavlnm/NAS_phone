@@ -3908,6 +3908,27 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
     );
   }
 
+  Future<void> _openScreenViewPage() async {
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('请先连接电脑。')));
+      return;
+    }
+
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => ScreenViewPage(
+          baseUri: baseUri,
+          authToken: token,
+          authHeaders: _buildNasAuthHeaders,
+        ),
+      ),
+    );
+  }
+
   Future<void> _openRecycleBinToolPage() async {
     final baseUri = _baseUri;
     final token = _authToken;
@@ -5309,6 +5330,15 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
             backgroundColor: const Color(0xFFF1F5F9),
             foregroundColor: const Color(0xFF334155),
             onTap: _openTerminalCommandPage,
+          ),
+          const SizedBox(height: 14),
+          _ToolLauncherButton(
+            icon: Icons.monitor_outlined,
+            title: '看屏幕',
+            subtitle: '查看电脑当前的屏幕画面。',
+            backgroundColor: const Color(0xFFE0F2FE),
+            foregroundColor: const Color(0xFF075985),
+            onTap: _openScreenViewPage,
           ),
           const SizedBox(height: 14),
           _ToolLauncherButton(
@@ -7666,6 +7696,520 @@ class ImagePreviewPage extends StatelessWidget {
             ),
           );
         },
+      ),
+    );
+  }
+}
+
+/// 清晰度档：直接暴露参数，不做"高清/流畅"之类命名。
+class _ScreenQuality {
+  const _ScreenQuality(this.width, this.quality, this.format);
+
+  final int width;
+  final int quality;
+  final String format;
+
+  String get label => format == 'png' ? 'PNG $width' : '$width q$quality';
+  String get key => '$width-$quality-$format';
+}
+
+const List<_ScreenQuality> _screenQualities = [
+  _ScreenQuality(1920, 85, 'jpeg'),
+  _ScreenQuality(1920, 60, 'jpeg'),
+  _ScreenQuality(1280, 85, 'jpeg'),
+  _ScreenQuality(1280, 60, 'jpeg'),
+  _ScreenQuality(960, 60, 'jpeg'),
+  _ScreenQuality(1920, 60, 'png'),
+];
+
+const List<double> _screenFpsOptions = [0, 0.2, 0.5, 1, 2, 5, 10, 15];
+
+/// 看屏幕：电脑端常驻抓取，这里只负责取图；自动刷新只在页面存活期间轮询。
+class ScreenViewPage extends StatefulWidget {
+  const ScreenViewPage({
+    required this.baseUri,
+    required this.authToken,
+    required this.authHeaders,
+    super.key,
+  });
+
+  final Uri baseUri;
+  final String authToken;
+  final Future<Map<String, String>> Function() authHeaders;
+
+  @override
+  State<ScreenViewPage> createState() => _ScreenViewPageState();
+}
+
+class _ScreenViewPageState extends State<ScreenViewPage> {
+  static const String _qualityPrefsKey = 'screen_view_quality';
+
+  Uint8List? _frame;
+  String? _etag;
+  bool _fetching = false;
+  bool _failed = false;
+  Timer? _timer;
+  double _autoFps = 0;
+  _ScreenQuality _quality = _screenQualities[3];
+
+  /// 画面缩放/平移状态；放大后靠双指或拖动看细节。
+  final TransformationController _transform = TransformationController();
+
+  /// 轮询复用同一个连接池，避免高帧率下反复建连接。
+  final HttpClient _client = HttpClient()
+    ..connectionTimeout = const Duration(seconds: 10);
+
+  /// 全屏横屏模式：隐藏标题栏与系统栏，画面占满整屏。
+  bool _immersive = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadPrefs();
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _client.close(force: true);
+    _transform.dispose();
+    if (_immersive) {
+      SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    }
+    super.dispose();
+  }
+
+  Future<void> _setImmersive(bool value) async {
+    if (_immersive == value) {
+      return;
+    }
+    setState(() => _immersive = value);
+    if (value) {
+      await SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ]);
+      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    } else {
+      await SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    }
+  }
+
+  void _resetZoom() {
+    _transform.value = Matrix4.identity();
+  }
+
+  /// 双击：在"适应屏幕"和"放大 2.5 倍（以点击处为中心）"之间切换。
+  void _toggleZoomAt(Offset local) {
+    if (_transform.value.getMaxScaleOnAxis() > 1.05) {
+      _resetZoom();
+      return;
+    }
+    const scale = 2.5;
+    _transform.value = Matrix4.identity()
+      ..translate(local.dx, local.dy)
+      ..scale(scale)
+      ..translate(-local.dx, -local.dy);
+  }
+
+  Future<void> _loadPrefs() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getString(_qualityPrefsKey);
+      if (saved != null) {
+        for (final candidate in _screenQualities) {
+          if (candidate.key == saved) {
+            _quality = candidate;
+            break;
+          }
+        }
+      }
+    } catch (_) {
+      // 读取失败就用默认档。
+    }
+    if (!mounted) {
+      return;
+    }
+    await _fetch();
+  }
+
+  Future<void> _setQuality(_ScreenQuality quality) async {
+    if (quality.key == _quality.key) {
+      return;
+    }
+    setState(() {
+      _quality = quality;
+      _etag = null;
+      _frame = null;
+    });
+    // 分辨率变了，旧的缩放/平移位置没有意义。
+    _resetZoom();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_qualityPrefsKey, quality.key);
+    } catch (_) {
+      // 持久化失败不影响本次使用。
+    }
+    await _fetch();
+  }
+
+  void _setAutoFps(double fps) {
+    _timer?.cancel();
+    _timer = null;
+    setState(() {
+      _autoFps = fps;
+    });
+    if (fps > 0) {
+      // 下限 100ms：公网 0.35MB/s 也喂不动更快，顺手防止误设超高帧率把连接打满。
+      final interval = Duration(
+        milliseconds: (1000 / fps).round().clamp(100, 60000),
+      );
+      _timer = Timer.periodic(interval, (_) => _fetch());
+      _fetch();
+    }
+  }
+
+  Future<void> _fetch() async {
+    if (_fetching) {
+      return;
+    }
+    _fetching = true;
+    if (mounted) {
+      setState(() {});
+    }
+
+    final client = _client;
+    try {
+      final headers = await widget.authHeaders();
+      headers['X-Auth'] = widget.authToken;
+      final request = await client
+          .getUrl(
+            widget.baseUri.replace(
+              path: '/api/system/screen',
+              queryParameters: {
+                'w': '${_quality.width}',
+                'q': '${_quality.quality}',
+                'format': _quality.format,
+              },
+            ),
+          )
+          .timeout(const Duration(seconds: 10));
+      headers.forEach(request.headers.set);
+      final etag = _etag;
+      if (etag != null) {
+        request.headers.set(HttpHeaders.ifNoneMatchHeader, etag);
+      }
+
+      final response = await request.close().timeout(
+        const Duration(seconds: 30),
+      );
+      if (response.statusCode == HttpStatus.notModified) {
+        await response.drain<void>().catchError((Object _) {});
+        if (mounted) {
+          setState(() {
+            _failed = false;
+          });
+        }
+        return;
+      }
+
+      final builder = await response.fold<BytesBuilder>(
+        BytesBuilder(copy: false),
+        (buffer, chunk) {
+          buffer.add(chunk);
+          return buffer;
+        },
+      );
+      if (response.statusCode != HttpStatus.ok) {
+        _markFailed();
+        return;
+      }
+
+      final data = builder.takeBytes();
+      if (data.isEmpty) {
+        _markFailed();
+        return;
+      }
+
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _frame = data;
+        _etag = response.headers.value(HttpHeaders.etagHeader);
+        _failed = false;
+      });
+    } catch (_) {
+      _markFailed();
+    } finally {
+      _fetching = false;
+      if (mounted) {
+        setState(() {});
+      }
+    }
+  }
+
+  /// 取图失败统一处理：不保留旧帧，页面上直接显示"无图"。
+  void _markFailed() {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _frame = null;
+      _etag = null;
+      _failed = true;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    if (_immersive) {
+      return Scaffold(
+        backgroundColor: const Color(0xFF070B14),
+        body: Stack(
+          fit: StackFit.expand,
+          children: [
+            _buildViewer(theme),
+            _buildImmersiveBar(theme),
+          ],
+        ),
+      );
+    }
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('看屏幕'),
+        actions: [
+          IconButton(
+            tooltip: '全屏横屏（可双指放大）',
+            onPressed: () => _setImmersive(true),
+            icon: const Icon(Icons.fullscreen),
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: Column(
+          children: [
+            Expanded(child: _buildViewer(theme)),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 10, 16, 4),
+              child: Wrap(
+                spacing: 12,
+                runSpacing: 8,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  IconButton.filledTonal(
+                    tooltip: '刷新',
+                    onPressed: _fetching ? null : _fetch,
+                    icon: const Icon(Icons.refresh),
+                  ),
+                  _buildDropdown<double>(
+                    label: '自动刷新',
+                    value: _autoFps,
+                    items: _screenFpsOptions,
+                    text: (value) => value == 0 ? '关' : '$value fps',
+                    onChanged: _setAutoFps,
+                  ),
+                  _buildDropdown<_ScreenQuality>(
+                    label: '清晰度',
+                    value: _quality,
+                    items: _screenQualities,
+                    text: (value) => value.label,
+                    onChanged: _setQuality,
+                  ),
+                ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+              child: Text(
+                '自动刷新只在停留本页时生效，退出即停止；电脑端空闲 60 秒后自动结束抓取。',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDropdown<T>({
+    required String label,
+    required T value,
+    required List<T> items,
+    required String Function(T) text,
+    required ValueChanged<T> onChanged,
+    bool dark = false,
+  }) {
+    final color = dark ? const Color(0xFFCBD5E1) : null;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          label,
+          style: TextStyle(fontSize: 13, color: color),
+        ),
+        const SizedBox(width: 6),
+        DropdownButton<T>(
+          value: value,
+          isDense: true,
+          dropdownColor: dark ? const Color(0xFF0B1220) : null,
+          style: dark
+              ? const TextStyle(fontSize: 13, color: Color(0xFFCBD5E1))
+              : null,
+          underline: const SizedBox.shrink(),
+          items: [
+            for (final item in items)
+              DropdownMenuItem<T>(value: item, child: Text(text(item))),
+          ],
+          onChanged: (selected) {
+            if (selected != null) {
+              onChanged(selected);
+            }
+          },
+        ),
+      ],
+    );
+  }
+
+  Widget _buildViewer(ThemeData theme) {
+    final status = _fetching
+        ? '抓取中'
+        : _failed
+        ? '失败'
+        : '';
+
+    return Container(
+      width: double.infinity,
+      color: const Color(0xFF070B14),
+      child: LayoutBuilder(
+        builder: (context, box) {
+          return Stack(
+            fit: StackFit.expand,
+            children: [
+              if (_frame != null)
+                GestureDetector(
+                  behavior: HitTestBehavior.translucent,
+                  onDoubleTap: () => _toggleZoomAt(
+                    Offset(box.maxWidth / 2, box.maxHeight / 2),
+                  ),
+                  child: InteractiveViewer(
+                    transformationController: _transform,
+                    minScale: 1.0,
+                    maxScale: 8.0,
+                    boundaryMargin: const EdgeInsets.all(160),
+                    child: Image.memory(
+                      _frame!,
+                      fit: BoxFit.contain,
+                      gaplessPlayback: true,
+                    ),
+                  ),
+                )
+              else
+                Center(
+                  child: Text(
+                    _failed ? '取图失败' : '正在取图…',
+                    style: const TextStyle(
+                      color: Color(0xFF94A3B8),
+                      fontSize: 13,
+                    ),
+                  ),
+                ),
+              Positioned(
+                top: 8,
+                right: 10,
+                child: status.isEmpty
+                    ? const SizedBox.shrink()
+                    : Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 3,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(0x990B1220),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Text(
+                          status,
+                          style: const TextStyle(
+                            color: Color(0xFFCBD5E1),
+                            fontSize: 11,
+                          ),
+                        ),
+                      ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  /// 全屏模式下的半透明工具条：退出、刷新、复位缩放 + 两个下拉。
+  Widget _buildImmersiveBar(ThemeData theme) {
+    return Positioned(
+      left: 0,
+      right: 0,
+      bottom: 0,
+      child: Container(
+        color: const Color(0xB3070B14),
+        padding: const EdgeInsets.fromLTRB(6, 2, 10, 4),
+        child: Wrap(
+          spacing: 4,
+          runSpacing: 2,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            IconButton(
+              tooltip: '退出全屏',
+              onPressed: () => _setImmersive(false),
+              icon: const Icon(
+                Icons.fullscreen_exit,
+                size: 20,
+                color: Color(0xFFCBD5E1),
+              ),
+            ),
+            IconButton(
+              tooltip: '刷新',
+              onPressed: _fetching ? null : _fetch,
+              icon: const Icon(
+                Icons.refresh,
+                size: 20,
+                color: Color(0xFFCBD5E1),
+              ),
+            ),
+            IconButton(
+              tooltip: '缩放复位（也可双击画面）',
+              onPressed: _resetZoom,
+              icon: const Icon(
+                Icons.zoom_out_map,
+                size: 20,
+                color: Color(0xFFCBD5E1),
+              ),
+            ),
+            _buildDropdown<double>(
+              label: '自动刷新',
+              value: _autoFps,
+              items: _screenFpsOptions,
+              text: (value) => value == 0 ? '关' : '$value fps',
+              onChanged: _setAutoFps,
+              dark: true,
+            ),
+            _buildDropdown<_ScreenQuality>(
+              label: '清晰度',
+              value: _quality,
+              items: _screenQualities,
+              text: (value) => value.label,
+              onChanged: _setQuality,
+              dark: true,
+            ),
+          ],
+        ),
       ),
     );
   }
