@@ -20,6 +20,24 @@ void main() {
   runApp(const NasPhoneApp());
 }
 
+const MethodChannel _folderUploadChannel = MethodChannel(
+  'nas_phone/folder_upload',
+);
+
+class _PickedFolderEntry {
+  const _PickedFolderEntry({
+    required this.index,
+    required this.relativePath,
+    required this.size,
+    required this.isDir,
+  });
+
+  final int index;
+  final String relativePath;
+  final int size;
+  final bool isDir;
+}
+
 enum EntryMenuAction { delete, move, rename, download }
 
 enum MainTab { home, recent, tools, mine }
@@ -1749,6 +1767,209 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
         context,
       ).showSnackBar(const SnackBar(content: Text(fallbackMessage)));
     } finally {
+      if (mounted) {
+        setState(() {
+          _isUploading = false;
+        });
+      }
+    }
+  }
+
+  /// 选择整个文件夹上传，保持原有目录结构（仅 Android）。
+  Future<void> _pickAndUploadFolder() async {
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null || _isUploading) {
+      return;
+    }
+
+    if (!Platform.isAndroid) {
+      const message = '上传文件夹目前只支持 Android 手机端。';
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text(message)));
+      return;
+    }
+
+    List<_PickedFolderEntry> picked;
+    try {
+      final raw = await _folderUploadChannel.invokeMethod<List<dynamic>>(
+        'pickFolder',
+      );
+      if (raw == null) {
+        return; // 用户取消
+      }
+
+      picked = [
+        for (var i = 0; i < raw.length; i++)
+          if (raw[i] is Map)
+            _PickedFolderEntry(
+              index: i,
+              relativePath: (raw[i] as Map)['path']?.toString() ?? '',
+              size: ((raw[i] as Map)['size'] as num?)?.toInt() ?? 0,
+              isDir: (raw[i] as Map)['isDir'] == true,
+            ),
+      ].where((entry) => entry.relativePath.isNotEmpty).toList();
+
+      if (picked.isEmpty) {
+        await _folderUploadChannel.invokeMethod<void>('clearSession');
+        if (!mounted) return;
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('这个文件夹是空的。')));
+        return;
+      }
+    } on PlatformException catch (error) {
+      if (!mounted) return;
+      final message = '打开文件夹失败：${error.message ?? error.code}';
+      setState(() {
+        _fileError = message;
+      });
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
+      return;
+    } on MissingPluginException {
+      if (!mounted) return;
+      const message = '当前安装包不支持选择文件夹，请安装最新版本。';
+      setState(() {
+        _fileError = message;
+      });
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text(message)));
+      return;
+    }
+
+    final files = picked.where((entry) => !entry.isDir).toList();
+    if (files.isEmpty) {
+      await _folderUploadChannel.invokeMethod<void>('clearSession');
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('文件夹里没有可上传的文件。')));
+      return;
+    }
+
+    // 汇总需要建立的目录（含空目录），按层级由浅到深创建
+    final directories = <String>{};
+    for (final entry in picked) {
+      final parts = entry.relativePath.split('/');
+      final depth = entry.isDir ? parts.length : parts.length - 1;
+      for (var i = 1; i <= depth; i++) {
+        directories.add(parts.sublist(0, i).join('/'));
+      }
+    }
+    final orderedDirectories = directories.toList()
+      ..sort((a, b) => a.split('/').length.compareTo(b.split('/').length));
+
+    setState(() {
+      _isUploading = true;
+      _fileError = null;
+    });
+
+    var uploaded = 0;
+    try {
+      for (final directory in orderedDirectories) {
+        try {
+          await _createDirectory(
+            baseUri,
+            token,
+            _joinResourcePath(_currentDirectory, '$directory/'),
+          );
+        } on NasApiException {
+          // 目录已存在时会被拒绝，忽略后继续
+        }
+      }
+
+      for (final entry in files) {
+        final parts = entry.relativePath.split('/');
+        final fileName = parts.last;
+        final relativeDirectory = parts.length > 1
+            ? '${parts.sublist(0, parts.length - 1).join('/')}/'
+            : '';
+        final targetDirectory = relativeDirectory.isEmpty
+            ? _currentDirectory
+            : _joinResourcePath(_currentDirectory, relativeDirectory);
+        final taskId = _startTransferTask(
+          kind: TransferTaskKind.upload,
+          entry: FileBrowserEntry(
+            name: entry.relativePath,
+            path: _joinResourcePath(targetDirectory, fileName),
+            isDir: false,
+            size: entry.size,
+          ),
+          targetLocation: targetDirectory,
+          totalBytes: entry.size,
+        );
+
+        try {
+          final localPath = await _folderUploadChannel.invokeMethod<String>(
+            'materialize',
+            {'index': entry.index},
+          );
+          if (localPath == null || localPath.isEmpty) {
+            throw NasApiException('读取文件失败：${entry.relativePath}');
+          }
+
+          await _uploadFile(
+            baseUri,
+            token,
+            targetDirectory,
+            PlatformFile(name: fileName, size: entry.size, path: localPath),
+            onBytes: (delta) => _updateTransferTaskBytes(taskId, delta),
+          );
+          uploaded++;
+        } finally {
+          _finishTransferTask(taskId);
+        }
+      }
+
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已上传 $uploaded 个文件，目录结构已保留。')),
+      );
+      await _refreshFiles(showLoading: false);
+    } on NasApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _fileError = error.message;
+      });
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message)));
+    } on PlatformException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      final message = '上传文件夹失败：${error.message ?? error.code}';
+      setState(() {
+        _fileError = message;
+      });
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(message)));
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      const fallbackMessage = '上传文件夹失败，请保持应用在前台后重试。';
+      setState(() {
+        _fileError = fallbackMessage;
+      });
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text(fallbackMessage)));
+    } finally {
+      try {
+        await _folderUploadChannel.invokeMethod<void>('clearSession');
+      } catch (_) {
+        // 清理失败不影响上传结果
+      }
       if (mounted) {
         setState(() {
           _isUploading = false;
@@ -4689,6 +4910,9 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
               case 'upload':
                 _pickAndUploadFiles();
                 break;
+              case 'uploadFolder':
+                _pickAndUploadFolder();
+                break;
               case 'folder':
                 _createFolder();
                 break;
@@ -4709,6 +4933,23 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
                       : const Icon(Icons.upload_file_outlined, size: 20),
                   const SizedBox(width: 10),
                   Text(_isUploading ? '上传中...' : '上传文件'),
+                ],
+              ),
+            ),
+            PopupMenuItem<String>(
+              value: 'uploadFolder',
+              enabled: !_isUploading && Platform.isAndroid,
+              child: Row(
+                children: [
+                  _isUploading
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.drive_folder_upload_outlined, size: 20),
+                  const SizedBox(width: 10),
+                  Text(_isUploading ? '上传中...' : '上传文件夹'),
                 ],
               ),
             ),
