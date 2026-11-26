@@ -19,7 +19,9 @@ class MainActivity : FlutterActivity() {
 	companion object {
 		private const val CHANNEL = "nas_phone/system_open"
 		private const val FOLDER_CHANNEL = "nas_phone/folder_upload"
+		private const val TRANSFER_CHANNEL = "nas_phone/transfer_service"
 		private const val REQ_PICK_FOLDER = 0x4E41
+		private const val REQ_NOTIFICATION = 0x4E42
 	}
 
 	private var pendingFolderResult: MethodChannel.Result? = null
@@ -80,6 +82,35 @@ class MainActivity : FlutterActivity() {
 				}
 				else -> result.notImplemented()
 			}
+		}
+
+		MethodChannel(flutterEngine.dartExecutor.binaryMessenger, TRANSFER_CHANNEL).setMethodCallHandler { call, result ->
+			when (call.method) {
+				"start" -> {
+					val text = call.argument<String>("text") ?: "正在传输"
+					requestNotificationPermissionIfNeeded()
+					try {
+						TransferService.start(this, text)
+						result.success(null)
+					} catch (e: Exception) {
+						result.error("service_failed", e.message, null)
+					}
+				}
+				"stop" -> {
+					TransferService.stop(this)
+					result.success(null)
+				}
+				else -> result.notImplemented()
+			}
+		}
+	}
+
+	private fun requestNotificationPermissionIfNeeded() {
+		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+			checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+			android.content.pm.PackageManager.PERMISSION_GRANTED
+		) {
+			requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFICATION)
 		}
 	}
 

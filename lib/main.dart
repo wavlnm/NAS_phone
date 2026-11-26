@@ -24,6 +24,10 @@ const MethodChannel _folderUploadChannel = MethodChannel(
   'nas_phone/folder_upload',
 );
 
+const MethodChannel _transferServiceChannel = MethodChannel(
+  'nas_phone/transfer_service',
+);
+
 class _PickedFolderEntry {
   const _PickedFolderEntry({
     required this.index,
@@ -3488,6 +3492,7 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
     _busyEntryPath = null;
     _recentFileVisits = const [];
     _activeTransferTasks = const [];
+    _syncTransferKeepAlive();
     _showMainShell = false;
     _selectedTab = MainTab.home;
     _selectedSpace = SpaceScope.personal;
@@ -3659,8 +3664,39 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
     setState(() {
       _activeTransferTasks = [task, ..._activeTransferTasks];
     });
+    _syncTransferKeepAlive();
 
     return taskId;
+  }
+
+  /// 有传输任务时启动前台服务，避免息屏后系统省电中断网络。
+  void _syncTransferKeepAlive() {
+    if (!Platform.isAndroid) {
+      return;
+    }
+
+    final count = _activeTransferTasks.length;
+    try {
+      if (count == 0) {
+        unawaited(
+          _transferServiceChannel
+              .invokeMethod<void>('stop')
+              .catchError((Object _) {}),
+        );
+        return;
+      }
+
+      final text = count == 1
+          ? '正在传输 · ${_activeTransferTasks.first.entry.name}'
+          : '正在传输 $count 个任务';
+      unawaited(
+        _transferServiceChannel
+            .invokeMethod<void>('start', {'text': text})
+            .catchError((Object _) {}),
+      );
+    } on MissingPluginException {
+      // 旧安装包没有该通道，忽略
+    }
   }
 
   void _updateTransferTaskProgress(String taskId, int processedFiles) {
@@ -3736,6 +3772,7 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
           .where((task) => task.id != taskId)
           .toList(growable: false);
     });
+    _syncTransferKeepAlive();
   }
 
   void _updateNotes(List<LocalNote> notes) {
