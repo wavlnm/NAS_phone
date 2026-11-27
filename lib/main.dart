@@ -2111,6 +2111,15 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
       return;
     }
 
+    if (_isPrivatePath(entry.path) &&
+        !_privacyActive &&
+        action != EntryMenuAction.download) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('隐私窗口已结束，请重新解锁后再操作。')),
+      );
+      return;
+    }
+
     switch (action) {
       case EntryMenuAction.delete:
         await _deleteEntry(entry);
@@ -4709,6 +4718,19 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
       });
     }
     if (!mounted) {
+      return;
+    }
+
+    if (wasInside && !manualExit) {
+      // 倒计时结束时如果人还在隐私目录里，不强制跳回根目录；
+      // 只锁定入口/写操作，等用户自己离开后 .private 自然隐藏。
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('隐私窗口已结束，离开当前目录后 .private 会隐藏。'),
+          ),
+        );
+      }
       return;
     }
 
