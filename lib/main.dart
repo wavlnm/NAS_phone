@@ -46,6 +46,14 @@ class _PickedFolderEntry {
 
 enum EntryMenuAction { delete, move, rename, compress, download, share }
 
+const String _kPrivateDirName = '.private';
+
+bool _isPrivatePath(String path) {
+  final normalized = path.replaceAll('\\', '/');
+  return normalized == '/$_kPrivateDirName' ||
+      normalized.startsWith('/$_kPrivateDirName/');
+}
+
 enum MainTab { home, recent, tools, mine }
 
 enum SpaceScope { personal, family }
@@ -282,6 +290,13 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
   final Map<String, _TaskMeter> _taskMeters = {};
   List<LocalNote> _notes = const [];
   bool _showMainShell = false;
+  DateTime? _privacyUntil;
+  Timer? _privacyTimer;
+  int _privacyTapCount = 0;
+  DateTime? _privacyFirstTapAt;
+  bool _privacyBusy = false;
+  bool get _privacyActive =>
+      _privacyUntil != null && DateTime.now().isBefore(_privacyUntil!);
   MainTab _selectedTab = MainTab.home;
   SpaceScope _selectedSpace = SpaceScope.personal;
 
@@ -301,6 +316,7 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _privacyTimer?.cancel();
     _hostController.dispose();
     super.dispose();
   }
@@ -309,6 +325,9 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state != AppLifecycleState.resumed) return;
+    if (_privacyUntil != null && !_privacyActive) {
+      unawaited(_exitPrivacyMode());
+    }
     if (!_hasFileSession || _isProbing || _isUploading || _busyEntryPath != null) {
       return;
     }
@@ -2085,6 +2104,13 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
       return;
     }
 
+    if (entry.path == '/$_kPrivateDirName') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('隐私目录本身不能执行该操作。')),
+      );
+      return;
+    }
+
     switch (action) {
       case EntryMenuAction.delete:
         await _deleteEntry(entry);
@@ -2708,6 +2734,14 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
       return;
     }
 
+    if ((_isPrivatePath(entry.path) || _isPrivatePath(destinationPath)) &&
+        !_privacyActive) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('隐私目录已锁定，请重新解锁后再移动。')),
+      );
+      return;
+    }
+
     setState(() {
       _busyEntryPath = entry.path;
       _fileError = null;
@@ -3137,8 +3171,9 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
   Future<FileBrowserDirectory> _fetchDirectory(
     Uri baseUri,
     String token,
-    String resourcePath,
-  ) async {
+    String resourcePath, {
+    bool? includePrivate,
+  }) async {
     final response = await _sendTextRequest(
       _buildResourceUri(baseUri, resourcePath),
       headers: {'X-Auth': token, HttpHeaders.acceptHeader: 'application/json'},
@@ -3156,7 +3191,10 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
         throw const FormatException('Unexpected response');
       }
 
-      return FileBrowserDirectory.fromJson(decoded);
+      return FileBrowserDirectory.fromJson(
+        decoded,
+        showPrivateDirectory: includePrivate ?? _privacyActive,
+      );
     } on FormatException {
       throw const NasApiException('文件列表接口返回了无法解析的内容。');
     }
@@ -4041,8 +4079,16 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
         return;
       }
 
-      final directory = await _fetchDirectory(baseUri, token, normalizedPath);
+      final directory = await _fetchDirectory(
+        baseUri,
+        token,
+        normalizedPath,
+        includePrivate: false,
+      );
       for (final entry in directory.items) {
+        if (entry.name == _kPrivateDirName) {
+          continue;
+        }
         if (entry.isDir) {
           await visitDirectory(entry.path);
           continue;
@@ -4115,7 +4161,7 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
   }
 
   void _recordRecentFileVisit(FileBrowserEntry entry) {
-    if (entry.isDir) {
+    if (entry.isDir || _isPrivatePath(entry.path)) {
       return;
     }
 
@@ -4413,6 +4459,306 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
         ),
       ),
     );
+  }
+
+  void _handleCloudTap() {
+    if (_privacyBusy) {
+      return;
+    }
+    if (_privacyActive) {
+      unawaited(_exitPrivacyMode(manualExit: true));
+      return;
+    }
+    if (!_hasFileSession) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('请先连接电脑。')));
+      return;
+    }
+
+    final now = DateTime.now();
+    if (_privacyFirstTapAt == null ||
+        now.difference(_privacyFirstTapAt!) > const Duration(seconds: 2)) {
+      _privacyTapCount = 0;
+    }
+    _privacyFirstTapAt = now;
+    _privacyTapCount++;
+    if (_privacyTapCount >= 5) {
+      _privacyTapCount = 0;
+      _privacyFirstTapAt = null;
+      unawaited(_openPrivacyGate());
+    }
+  }
+
+  String _privacyCountdownLabel() {
+    final until = _privacyUntil;
+    if (until == null) {
+      return '';
+    }
+    final seconds = max(0, until.difference(DateTime.now()).inSeconds);
+    return '隐私 ${seconds ~/ 60}:${(seconds % 60).toString().padLeft(2, '0')}';
+  }
+
+  Future<void> _openPrivacyGate() async {
+    final baseUri = _baseUri;
+    if (baseUri == null || _privacyBusy) {
+      return;
+    }
+
+    setState(() {
+      _privacyBusy = true;
+    });
+    try {
+      final statusResponse = await _sendTextRequest(
+        baseUri.replace(path: '/api/privacy/status'),
+      );
+      if (statusResponse.statusCode < 200 || statusResponse.statusCode >= 300) {
+        throw NasApiException(_privacyErrorText(statusResponse));
+      }
+      final status = jsonDecode(statusResponse.body);
+      final configured = status is Map && status['configured'] == true;
+
+      final credentials = await _askPrivacyPassword(setup: !configured);
+      if (!mounted || credentials == null || credentials.isEmpty) {
+        return;
+      }
+      final password = credentials.first;
+
+      if (!configured) {
+        final setupResponse = await _sendTextRequest(
+          baseUri.replace(path: '/api/privacy/setup'),
+          method: 'POST',
+          headers: const {'Content-Type': 'application/json'},
+          requestBody: jsonEncode({
+            'password': password,
+            'confirmPassword': credentials.length > 1 ? credentials[1] : '',
+          }),
+        );
+        if (setupResponse.statusCode < 200 || setupResponse.statusCode >= 300) {
+          throw NasApiException(_privacyErrorText(setupResponse));
+        }
+      }
+
+      final unlockResponse = await _sendTextRequest(
+        baseUri.replace(path: '/api/privacy/unlock'),
+        method: 'POST',
+        headers: const {'Content-Type': 'application/json'},
+        requestBody: jsonEncode({'password': password}),
+      );
+      if (unlockResponse.statusCode < 200 || unlockResponse.statusCode >= 300) {
+        throw NasApiException(_privacyErrorText(unlockResponse));
+      }
+
+      final decoded = jsonDecode(unlockResponse.body);
+      final expires = decoded is Map && decoded['expiresInSeconds'] is num
+          ? (decoded['expiresInSeconds'] as num).toInt()
+          : 180;
+      if (!mounted) {
+        return;
+      }
+      await _beginPrivacyWindow(expires);
+    } on NasApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message)));
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('隐私操作失败：$error')));
+    } finally {
+      if (mounted) {
+        setState(() {
+          _privacyBusy = false;
+        });
+      }
+    }
+  }
+
+  Future<List<String>?> _askPrivacyPassword({required bool setup}) async {
+    final passwordController = TextEditingController();
+    final confirmController = TextEditingController();
+    String? error;
+
+    final result = await showDialog<List<String>>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          title: Text(setup ? '设置隐私密码' : '进入隐私目录'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: passwordController,
+                  obscureText: true,
+                  autofocus: true,
+                  maxLength: 64,
+                  decoration: InputDecoration(
+                    border: const OutlineInputBorder(),
+                    labelText: setup ? '设置密码' : '输入密码',
+                    counterText: '',
+                  ),
+                ),
+                if (setup) ...[
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: confirmController,
+                    obscureText: true,
+                    maxLength: 64,
+                    decoration: const InputDecoration(
+                      border: OutlineInputBorder(),
+                      labelText: '再次输入密码',
+                      counterText: '',
+                    ),
+                  ),
+                ],
+                if (error != null) ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    error!,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: Color(0xFFB42318),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final password = passwordController.text;
+                if (password.length < 6) {
+                  setDialogState(() {
+                    error = '密码至少 6 个字符。';
+                  });
+                  return;
+                }
+                if (setup && password != confirmController.text) {
+                  setDialogState(() {
+                    error = '两次输入的密码不一致。';
+                  });
+                  return;
+                }
+                Navigator.of(dialogContext).pop(
+                  setup ? [password, confirmController.text] : [password],
+                );
+              },
+              child: Text(setup ? '设置并进入' : '解锁'),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      passwordController.dispose();
+      confirmController.dispose();
+    });
+    return result;
+  }
+
+  Future<void> _beginPrivacyWindow(int seconds) async {
+    final until = DateTime.now().add(Duration(seconds: max(1, seconds)));
+    _privacyTimer?.cancel();
+    setState(() {
+      _privacyUntil = until;
+    });
+    _privacyTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) {
+        return;
+      }
+      if (!_privacyActive) {
+        unawaited(_exitPrivacyMode());
+      } else {
+        setState(() {});
+      }
+    });
+
+    await _refreshFiles(showLoading: false);
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '隐私目录已解锁 ${max(1, seconds ~/ 60)} 分钟，点云图标可提前退出。',
+          ),
+        ),
+      );
+    }
+  }
+
+  Future<void> _exitPrivacyMode({bool manualExit = false}) async {
+    _privacyTimer?.cancel();
+    _privacyTimer = null;
+    final wasInside = _isPrivatePath(_currentDirectory);
+    if (mounted) {
+      setState(() {
+        _privacyUntil = null;
+      });
+    }
+    if (!mounted) {
+      return;
+    }
+
+    if (wasInside) {
+      await _refreshFiles(path: '/');
+    } else {
+      await _refreshFiles(showLoading: false);
+    }
+
+    if (manualExit && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('已退出隐私目录。')),
+      );
+    }
+  }
+
+  String _privacyErrorText(SimpleHttpResponse response) {
+    String? code;
+    int? retryAfter;
+    try {
+      final decoded = jsonDecode(response.body);
+      if (decoded is Map) {
+        code = decoded['error']?.toString();
+        retryAfter = decoded['retryAfterSeconds'] is num
+            ? (decoded['retryAfterSeconds'] as num).toInt()
+            : null;
+      }
+    } catch (_) {
+      // ignore
+    }
+
+    switch (code) {
+      case 'invalid_password':
+        return '密码不正确。';
+      case 'locked_out':
+        return '尝试次数过多，请 ${retryAfter ?? 60} 秒后再试。';
+      case 'not_configured':
+        return '还没有设置隐私密码。';
+      case 'already_configured':
+        return '隐私密码已经设置过了。';
+      case 'password_too_short':
+        return '密码至少 6 个字符。';
+      case 'password_mismatch':
+        return '两次输入的密码不一致。';
+      case 'privacy_unavailable':
+        return '隐私目录暂时不可用。';
+      default:
+        return '隐私操作失败（HTTP ${response.statusCode}）。'
+            '${_compactBody(response.body)}';
+    }
   }
 
   Future<void> _openAgentChatPage() async {
@@ -5223,19 +5569,40 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
       ),
       child: Row(
         children: [
-          Container(
-            width: 36,
-            height: 36,
-            decoration: const BoxDecoration(
-              color: Color(0xFFDCFCE7),
-              shape: BoxShape.circle,
-            ),
-            child: const Icon(
-              Icons.cloud_done_outlined,
-              color: Color(0xFF15803D),
-              size: 20,
+          GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: _handleCloudTap,
+            child: Container(
+              width: 36,
+              height: 36,
+              decoration: BoxDecoration(
+                color: _privacyActive
+                    ? const Color(0xFFFEF3C7)
+                    : const Color(0xFFDCFCE7),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(
+                _privacyActive
+                    ? Icons.lock_open_rounded
+                    : Icons.cloud_done_outlined,
+                color: _privacyActive
+                    ? const Color(0xFFB45309)
+                    : const Color(0xFF15803D),
+                size: 20,
+              ),
             ),
           ),
+          if (_privacyActive) ...[
+            const SizedBox(width: 8),
+            Text(
+              _privacyCountdownLabel(),
+              style: const TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                color: Color(0xFFB45309),
+              ),
+            ),
+          ],
           const Spacer(),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -5605,6 +5972,9 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
   }
 
   Widget _buildRecentTab(ThemeData theme) {
+    final recentVisits = _recentFileVisits
+        .where((visit) => !_isPrivatePath(visit.entry.path))
+        .toList(growable: false);
     return SafeArea(
       child: ListView(
         padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
@@ -5767,16 +6137,16 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
                   ),
                 ),
                 const SizedBox(height: 14),
-                if (_recentFileVisits.isEmpty)
+                if (recentVisits.isEmpty)
                   const Text('还没有访问记录。先打开一个文件，最近页就会出现内容。')
                 else
                   ListView.separated(
                     shrinkWrap: true,
                     physics: const NeverScrollableScrollPhysics(),
-                    itemCount: _recentFileVisits.length,
+                    itemCount: recentVisits.length,
                     separatorBuilder: (_, _) => const Divider(height: 1),
                     itemBuilder: (context, index) {
-                      final visit = _recentFileVisits[index];
+                      final visit = recentVisits[index];
                       final entry = visit.entry;
 
                       return ListTile(
@@ -8057,7 +8427,10 @@ class HostStorageSummary {
 class FileBrowserDirectory {
   const FileBrowserDirectory({required this.path, required this.items});
 
-  factory FileBrowserDirectory.fromJson(Map<String, dynamic> json) {
+  factory FileBrowserDirectory.fromJson(
+    Map<String, dynamic> json, {
+    bool showPrivateDirectory = false,
+  }) {
     final rawItems = json['items'];
     final items = rawItems is List
         ? rawItems
@@ -8066,7 +8439,11 @@ class FileBrowserDirectory {
                 (item) =>
                     FileBrowserEntry.fromJson(Map<String, dynamic>.from(item)),
               )
-              .where((entry) => !(entry.isDir && entry.name.startsWith('.')))
+              .where((entry) =>
+                  !(entry.isDir &&
+                      entry.name.startsWith('.') &&
+                      !(showPrivateDirectory &&
+                          entry.name == _kPrivateDirName)))
               .toList()
         : <FileBrowserEntry>[];
 
