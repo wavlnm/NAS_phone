@@ -42,7 +42,7 @@ class _PickedFolderEntry {
   final bool isDir;
 }
 
-enum EntryMenuAction { delete, move, rename, download, share }
+enum EntryMenuAction { delete, move, rename, compress, download, share }
 
 enum MainTab { home, recent, tools, mine }
 
@@ -2090,6 +2090,8 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
         await _moveEntry(entry);
       case EntryMenuAction.rename:
         await _renameEntry(entry);
+      case EntryMenuAction.compress:
+        await _compressEntry(entry);
       case EntryMenuAction.download:
         await _downloadEntry(entry);
       case EntryMenuAction.share:
@@ -2479,7 +2481,204 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
         '${two(local.hour)}:${two(local.minute)}';
   }
 
-  Future<void> _moveEntry(FileBrowserEntry entry) async {    final baseUri = _baseUri;
+  Future<void> _compressEntry(FileBrowserEntry entry) async {
+    final baseUri = _baseUri;
+    if (baseUri == null) {
+      return;
+    }
+
+    var level = 'normal';
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          title: const Text('压缩为 ZIP'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  entry.name,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+                if (entry.isDir) ...[
+                  const SizedBox(height: 6),
+                  const Text(
+                    '将递归压缩文件夹内所有文件。',
+                    style: TextStyle(fontSize: 13),
+                  ),
+                ],
+                const SizedBox(height: 14),
+                const Text('压缩级别', style: TextStyle(fontSize: 13)),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final preset in const <(String, String)>[
+                      ('fast', '快速'),
+                      ('normal', '标准'),
+                      ('smaller', '更小'),
+                    ])
+                      ChoiceChip(
+                        label: Text(preset.$2),
+                        selected: level == preset.$1,
+                        onSelected: (_) => setDialogState(
+                          () => level = preset.$1,
+                        ),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  entry.isDir ? 'ZIP 会生成在当前目录。' : 'ZIP 会生成在同级目录。',
+                  style: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              child: const Text('开始压缩'),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (!mounted || confirmed != true) {
+      return;
+    }
+
+    setState(() {
+      _busyEntryPath = entry.path;
+      _fileError = null;
+    });
+
+    try {
+      final response = await _sendTextRequest(
+        baseUri.replace(path: '/api/archive/jobs'),
+        method: 'POST',
+        headers: const {'Content-Type': 'application/json'},
+        requestBody: jsonEncode({'path': entry.path, 'level': level}),
+        timeout: const Duration(seconds: 30),
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw NasApiException(_archiveErrorText(response));
+      }
+
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map) {
+        throw const NasApiException('压缩失败：服务端返回格式异常。');
+      }
+      final jobKey = decoded['key']?.toString() ?? '';
+      if (jobKey.isEmpty) {
+        throw const NasApiException('压缩失败：服务端未返回任务号。');
+      }
+
+      if (!mounted) {
+        return;
+      }
+
+      final result = await showDialog<_ArchiveJobResult>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) => _ArchiveProgressDialog(
+          request: (method, path) => _sendTextRequest(
+            baseUri.replace(path: path),
+            method: method,
+          ),
+          jobKey: jobKey,
+        ),
+      );
+
+      if (!mounted || result == null) {
+        return;
+      }
+
+      switch (result.outcome) {
+        case _ArchiveOutcome.ready:
+          await _refreshFiles(showLoading: false);
+          if (!mounted) {
+            return;
+          }
+          var message = '已生成 ${result.outputName ?? 'ZIP 文件'}';
+          if (result.skippedCount > 0) {
+            message += '，部分文件被跳过';
+          }
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(message)));
+        case _ArchiveOutcome.canceled:
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('已取消压缩。')));
+        case _ArchiveOutcome.background:
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('压缩在后台继续，完成后刷新当前目录即可看到 ZIP。')),
+          );
+        case _ArchiveOutcome.failed:
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(result.message ?? '压缩失败。')),
+          );
+      }
+    } on NasApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _fileError = error.message;
+      });
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message)));
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busyEntryPath = null;
+        });
+      }
+    }
+  }
+
+  String _archiveErrorText(SimpleHttpResponse response) {
+    String? code;
+    try {
+      final decoded = jsonDecode(response.body);
+      if (decoded is Map) {
+        code = decoded['error']?.toString();
+      }
+    } catch (_) {
+      // 忽略，使用通用提示
+    }
+
+    const messages = <String, String>{
+      'invalid_path': '无法压缩该位置。',
+      'invalid_level': '压缩级别无效。',
+      'source_not_found': '源文件不存在或已被移动。',
+      'root_not_allowed': '不能压缩共享根目录。',
+      'too_many_files': '文件数量过多，无法压缩。',
+      'source_too_large': '源文件总大小超过限制。',
+      'nothing_to_archive': '源目录为空，没有可压缩的文件。',
+      'archive_queue_full': '压缩任务过多，请稍后再试。',
+      'insufficient_disk_space': '磁盘剩余空间不足。',
+      'invalid_request': '请求无效，请升级手机端后重试。',
+    };
+    final message = code == null ? null : messages[code];
+    return message ??
+        '压缩失败（HTTP ${response.statusCode}）。${_compactBody(response.body)}';
+  }
+
+  Future<void> _moveEntry(FileBrowserEntry entry) async {
+    final baseUri = _baseUri;
     final token = _authToken;
     if (baseUri == null || token == null) {
       return;
@@ -3252,6 +3451,7 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
     String method = 'GET',
     Map<String, String>? headers,
     String? requestBody,
+    Duration timeout = const Duration(seconds: 8),
   }) async {
     // 非云端请求自动注入 NAS 访问鉴权头（secret + 时间戳 + nonce）
     final isCloudApi = uri.host.contains('reportzs.me');
@@ -3263,25 +3463,19 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
       }
     }
 
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+    final client = HttpClient()..connectionTimeout = timeout;
 
     try {
       late HttpClientRequest request;
       switch (method) {
         case 'DELETE':
-          request = await client
-              .deleteUrl(uri)
-              .timeout(const Duration(seconds: 8));
+          request = await client.deleteUrl(uri).timeout(timeout);
           break;
         case 'GET':
-          request = await client
-              .getUrl(uri)
-              .timeout(const Duration(seconds: 8));
+          request = await client.getUrl(uri).timeout(timeout);
           break;
         default:
-          request = await client
-              .openUrl(method, uri)
-              .timeout(const Duration(seconds: 8));
+          request = await client.openUrl(method, uri).timeout(timeout);
       }
 
       effectiveHeaders.forEach(request.headers.set);
@@ -3290,12 +3484,9 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
         request.contentLength = bytes.length;
         request.add(bytes);
       }
-      final response = await request.close().timeout(
-        const Duration(seconds: 8),
-      );
-      final responseBody = await utf8
-          .decodeStream(response)
-          .timeout(const Duration(seconds: 8));
+      final response = await request.close().timeout(timeout);
+      final responseBody =
+          await utf8.decodeStream(response).timeout(timeout);
       return SimpleHttpResponse(response.statusCode, responseBody);
     } on TimeoutException {
       throw const NasApiException('请求超时，请确认电脑仍然在线。');
@@ -3704,6 +3895,7 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
                 (EntryMenuAction.download, '下载', Icons.download_outlined),
               if (!entry.isDir)
                 (EntryMenuAction.share, '分享', Icons.share_outlined),
+              (EntryMenuAction.compress, '压缩', Icons.archive_outlined),
               (EntryMenuAction.move, '移动', Icons.drive_file_move_outline),
               (EntryMenuAction.rename, '重命名', Icons.drive_file_rename_outline),
               (EntryMenuAction.delete, '删除', Icons.delete_outline),
@@ -5238,6 +5430,10 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
                             const PopupMenuItem<EntryMenuAction>(
                               value: EntryMenuAction.rename,
                               child: Text('重命名'),
+                            ),
+                            const PopupMenuItem<EntryMenuAction>(
+                              value: EntryMenuAction.compress,
+                              child: Text('压缩'),
                             ),
                             const PopupMenuItem<EntryMenuAction>(
                               value: EntryMenuAction.download,
@@ -7436,6 +7632,10 @@ class _CategoryEntriesPageState extends State<CategoryEntriesPage> {
                                 const PopupMenuItem<EntryMenuAction>(
                                   value: EntryMenuAction.rename,
                                   child: Text('重命名'),
+                                ),
+                                const PopupMenuItem<EntryMenuAction>(
+                                  value: EntryMenuAction.compress,
+                                  child: Text('压缩'),
                                 ),
                                 const PopupMenuItem<EntryMenuAction>(
                                   value: EntryMenuAction.download,
@@ -10839,5 +11039,267 @@ Future<void> _deleteDirectoryQuietly(Directory directory) async {
     await directory.delete(recursive: true);
   } catch (_) {
     // Ignore temp cleanup failures.
+  }
+}
+
+enum _ArchiveOutcome { ready, failed, canceled, background }
+
+class _ArchiveJobResult {
+  const _ArchiveJobResult(
+    this.outcome, {
+    this.outputName,
+    this.skippedCount = 0,
+    this.message,
+  });
+
+  final _ArchiveOutcome outcome;
+  final String? outputName;
+  final int skippedCount;
+  final String? message;
+}
+
+String _archiveJobErrorText(String? error) {
+  const messages = <String, String>{
+    'io_error': '写入 ZIP 时出错，请确认磁盘空间和文件权限。',
+    'source_missing': '源文件不存在或已被移动。',
+    'archive_failed': '压缩失败，请稍后再试。',
+  };
+  return messages[error] ?? '压缩失败：${error ?? '未知错误'}';
+}
+
+/// 压缩任务进度弹窗：轮询服务端任务状态，可取消或转入后台。
+class _ArchiveProgressDialog extends StatefulWidget {
+  const _ArchiveProgressDialog({required this.request, required this.jobKey});
+
+  final Future<SimpleHttpResponse> Function(String method, String path) request;
+  final String jobKey;
+
+  @override
+  State<_ArchiveProgressDialog> createState() => _ArchiveProgressDialogState();
+}
+
+class _ArchiveProgressDialogState extends State<_ArchiveProgressDialog> {
+  Timer? _timer;
+  bool _polling = false;
+  bool _finished = false;
+  String _status = 'queued';
+  double _progress = 0;
+  String? _statusText;
+  int _failures = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _poll();
+    _startTimer();
+  }
+
+  void _startTimer() {
+    _timer?.cancel();
+    _timer = Timer.periodic(
+      const Duration(milliseconds: 600),
+      (_) => _poll(),
+    );
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _poll() async {
+    if (_polling || _finished || !mounted) {
+      return;
+    }
+
+    _polling = true;
+    try {
+      final response = await widget.request(
+        'GET',
+        '/api/archive/jobs/${widget.jobKey}',
+      );
+      if (!mounted || _finished) {
+        return;
+      }
+
+      if (response.statusCode == 404) {
+        _finish(
+          const _ArchiveJobResult(
+            _ArchiveOutcome.failed,
+            message: '压缩任务不存在，服务可能已重启。',
+          ),
+        );
+        return;
+      }
+
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw NasApiException('压缩状态查询失败（HTTP ${response.statusCode}）。');
+      }
+
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map) {
+        throw const NasApiException('压缩状态返回格式异常。');
+      }
+
+      final data = Map<String, dynamic>.from(decoded);
+      final status = data['status']?.toString() ?? '';
+      final progress = data['progress'] is num
+          ? (data['progress'] as num).toDouble()
+          : 0.0;
+      _failures = 0;
+
+      switch (status) {
+        case 'queued':
+          setState(() {
+            _status = status;
+            _progress = 0;
+            _statusText = '排队中…';
+          });
+        case 'processing':
+          setState(() {
+            _status = status;
+            _progress = progress.clamp(0.0, 1.0);
+            _statusText =
+                '正在压缩 ${(progress * 100).clamp(0, 99).round()}%';
+          });
+        case 'ready':
+          _finish(
+            _ArchiveJobResult(
+              _ArchiveOutcome.ready,
+              outputName: data['outputName']?.toString(),
+              skippedCount: data['skippedCount'] is num
+                  ? (data['skippedCount'] as num).toInt()
+                  : 0,
+            ),
+          );
+        case 'canceled':
+          _finish(const _ArchiveJobResult(_ArchiveOutcome.canceled));
+        case 'failed':
+          _finish(
+            _ArchiveJobResult(
+              _ArchiveOutcome.failed,
+              message: _archiveJobErrorText(data['error']?.toString()),
+            ),
+          );
+        default:
+          setState(() {
+            _statusText = '处理中…';
+          });
+      }
+    } catch (error) {
+      _failures++;
+      if (!mounted || _finished) {
+        return;
+      }
+
+      if (_failures >= 5) {
+        _finish(
+          _ArchiveJobResult(
+            _ArchiveOutcome.failed,
+            message: error is NasApiException ? error.message : '压缩状态查询失败。',
+          ),
+        );
+      } else {
+        setState(() {
+          _statusText = '连接中断，重试中…';
+        });
+      }
+    } finally {
+      _polling = false;
+    }
+  }
+
+  void _finish(_ArchiveJobResult result) {
+    if (_finished) {
+      return;
+    }
+
+    _finished = true;
+    _timer?.cancel();
+    Navigator.of(context).pop(result);
+  }
+
+  Future<void> _cancelJob() async {
+    if (_finished) {
+      return;
+    }
+
+    _timer?.cancel();
+    try {
+      await widget.request(
+        'POST',
+        '/api/archive/jobs/${widget.jobKey}/cancel',
+      );
+    } catch (_) {
+      if (!mounted || _finished) {
+        return;
+      }
+
+      // 网络失败时无法确认取消结果，按后台继续处理。
+      _finish(const _ArchiveJobResult(_ArchiveOutcome.background));
+      return;
+    }
+
+    if (!mounted || _finished) {
+      return;
+    }
+
+    // 取消请求与任务完成可能同时发生：查一次真实状态，
+    // 已完成就按 ready 返回，避免误报“已取消”。
+    await _poll();
+    if (!mounted || _finished) {
+      return;
+    }
+
+    // 取消还没生效，继续轮询直到状态落定。
+    _startTimer();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final queued = _status == 'queued';
+    return PopScope(
+      canPop: false,
+      child: AlertDialog(
+        title: const Text('正在压缩'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            LinearProgressIndicator(value: queued ? null : _progress),
+            const SizedBox(height: 12),
+            Text(_statusText ?? (queued ? '排队中…' : '正在压缩…')),
+            const SizedBox(height: 6),
+            const Text(
+              '关闭弹窗不会中断任务，可稍后刷新目录查看。',
+              style: TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              if (_finished) {
+                return;
+              }
+              _finished = true;
+              _timer?.cancel();
+              Navigator.of(context).pop(
+                const _ArchiveJobResult(_ArchiveOutcome.background),
+              );
+            },
+            child: const Text('后台继续'),
+          ),
+          TextButton(
+            onPressed: _cancelJob,
+            child: const Text(
+              '取消压缩',
+              style: TextStyle(color: Color(0xFFB42318)),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
