@@ -6243,7 +6243,7 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
           _ToolLauncherButton(
             icon: Icons.videocam_outlined,
             title: '监控',
-            subtitle: '看摄像头画面、移动侦测自动录 10 秒、听现场声音。',
+            subtitle: '看摄像头画面、移动侦测持续录像、听现场声音。',
             backgroundColor: const Color(0xFFECFCCB),
             foregroundColor: const Color(0xFF3F6212),
             onTap: () => _openScreenViewPage(monitor: true),
@@ -9215,7 +9215,7 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
               child: Text(
                 widget.monitor
-                    ? '侦测开着时电脑端会一直采集；画面有动就自动录 10 秒存进共享目录的「监控录像」，跨天的自动移入回收站。'
+                    ? '侦测开着时电脑端会一直采集；画面有动就持续录像，静止 5 秒自动结束（单段最长 60 秒），存进共享目录的「监控录像」，跨天的自动移入回收站。'
                     : '自动刷新只在停留本页时生效，退出即停止；电脑端空闲 60 秒后自动结束抓取。',
                 style: theme.textTheme.bodySmall?.copyWith(
                   color: theme.colorScheme.onSurfaceVariant,
@@ -9231,6 +9231,10 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
   /// 监控专属控制条：移动侦测开关、灵敏度、手动录一段、听现场。
   Widget _buildMonitorBar(ThemeData theme) {
     final clips = (_monitorStatus?['clipsToday'] as num?)?.toInt() ?? 0;
+    final worker = _monitorStatus?['worker'];
+    final eventActive = worker is Map && worker['eventActive'] == true;
+    final segmentIndex =
+        worker is Map ? (worker['segmentIndex'] as num?)?.toInt() ?? 0 : 0;
     final cameraOn = _monitorStatus?['camera'] is Map &&
         (_monitorStatus!['camera'] as Map)['running'] == true;
 
@@ -9259,10 +9263,23 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
             onChanged: (value) => _applyDetect(_detectEnabled, value),
           ),
           IconButton(
-            tooltip: _recording ? '正在录像…' : '手动录 10 秒',
+            tooltip: _recording
+                ? (eventActive && segmentIndex > 1
+                    ? '自动录像中（第 $segmentIndex 段）'
+                    : '正在录像…')
+                : '手动录 10 秒',
             onPressed: _recording ? null : _recordNow,
             icon: Icon(_recording ? Icons.fiber_manual_record : Icons.videocam),
           ),
+          if (_recording)
+            Text(
+              eventActive && segmentIndex > 0
+                  ? '自动录像中 · 第 $segmentIndex 段'
+                  : '录像中',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.error,
+              ),
+            ),
           IconButton(
             tooltip: _listening ? '停止听现场' : '听现场',
             onPressed: _toggleListen,
