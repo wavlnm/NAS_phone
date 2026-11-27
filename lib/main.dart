@@ -10,6 +10,8 @@ import 'package:crypto/crypto.dart' as crypto;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:markdown/markdown.dart' as md;
 import 'package:just_audio/just_audio.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:path_provider/path_provider.dart';
@@ -4413,6 +4415,32 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
     );
   }
 
+  Future<void> _openAgentChatPage() async {
+    final baseUri = _baseUri;
+    if (baseUri == null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('请先连接电脑。')));
+      return;
+    }
+
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => AgentChatPage(
+          request: (method, path, body, timeout) => _sendTextRequest(
+            baseUri.replace(path: path),
+            method: method,
+            headers: body == null
+                ? null
+                : const {'Content-Type': 'application/json'},
+            requestBody: body,
+            timeout: timeout,
+          ),
+        ),
+      ),
+    );
+  }
+
   Future<void> _openRecycleBinToolPage() async {
     final baseUri = _baseUri;
     final token = _authToken;
@@ -4449,24 +4477,10 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _openBookkeepingToolPage() async {
-    await Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (context) => const BookkeepingToolPage()),
-    );
-  }
-
   Future<void> _openScheduledDownloadToolPage() async {
     await Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (context) => const ScheduledDownloadToolPage(),
-      ),
-    );
-  }
-
-  Future<void> _openRemoteDesktopToolPage() async {
-    await Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (context) => const RemoteDesktopToolPage(),
       ),
     );
   }
@@ -5844,6 +5858,15 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
           ),
           const SizedBox(height: 14),
           _ToolLauncherButton(
+            icon: Icons.auto_awesome,
+            title: 'AI 助手',
+            subtitle: '多轮对话完成任务；敏感命令需要你在手机上确认。',
+            backgroundColor: const Color(0xFFF5F3FF),
+            foregroundColor: const Color(0xFF6D28D9),
+            onTap: _openAgentChatPage,
+          ),
+          const SizedBox(height: 14),
+          _ToolLauncherButton(
             icon: Icons.delete_outline,
             title: '回收站',
             subtitle: '删除的文件保留 30 天，期间可恢复，到期自动清理。',
@@ -5853,30 +5876,12 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
           ),
           const SizedBox(height: 14),
           _ToolLauncherButton(
-            icon: Icons.receipt_long_outlined,
-            title: '记账',
-            subtitle: '功能接入中，后续可在这里管理日常收支。',
-            backgroundColor: const Color(0xFFFFFBEB),
-            foregroundColor: const Color(0xFFB45309),
-            onTap: _openBookkeepingToolPage,
-          ),
-          const SizedBox(height: 14),
-          _ToolLauncherButton(
             icon: Icons.download_outlined,
             title: '定时下载',
             subtitle: '功能接入中，后续可让电脑按计划下载内容。',
             backgroundColor: const Color(0xFFECFDF5),
             foregroundColor: const Color(0xFF047857),
             onTap: _openScheduledDownloadToolPage,
-          ),
-          const SizedBox(height: 14),
-          _ToolLauncherButton(
-            icon: Icons.desktop_windows_outlined,
-            title: '远程桌面',
-            subtitle: '功能接入中，后续可远程打开并操作你的电脑。',
-            backgroundColor: const Color(0xFFEFF6FF),
-            foregroundColor: const Color(0xFF1D4ED8),
-            onTap: _openRemoteDesktopToolPage,
           ),
           const SizedBox(height: 14),
           _ToolLauncherButton(
@@ -11300,6 +11305,1801 @@ class _ArchiveProgressDialogState extends State<_ArchiveProgressDialog> {
           ),
         ],
       ),
+    );
+  }
+}
+
+String _agentCompactBody(String body) {
+  final singleLine = body.replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (singleLine.isEmpty) {
+    return '';
+  }
+  return singleLine.length <= 160
+      ? singleLine
+      : '${singleLine.substring(0, 160)}...';
+}
+
+typedef AgentHttpRequest = Future<SimpleHttpResponse> Function(
+  String method,
+  String path,
+  String? jsonBody,
+  Duration timeout,
+);
+
+class AgentApi {
+  AgentApi(this._request);
+
+  final AgentHttpRequest _request;
+
+  Future<Map<String, dynamic>> _send(
+    String method,
+    String path, {
+    Object? body,
+    Duration timeout = const Duration(seconds: 8),
+  }) async {
+    final response = await _request(
+      method,
+      path,
+      body == null ? null : jsonEncode(body),
+      timeout,
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw NasApiException(_errorText(response));
+    }
+
+    final decoded = jsonDecode(response.body);
+    if (decoded is Map) {
+      return Map<String, dynamic>.from(decoded);
+    }
+    throw const NasApiException('AI 服务返回格式异常。');
+  }
+
+  String _errorText(SimpleHttpResponse response) {
+    String? code;
+    String? detail;
+    try {
+      final decoded = jsonDecode(response.body);
+      if (decoded is Map) {
+        code = decoded['error']?.toString();
+        detail = decoded['detail']?.toString();
+      }
+    } catch (_) {
+      // ignore
+    }
+
+    const messages = <String, String>{
+      'model_not_configured': '请先在设置里配置模型与 API Key。',
+      'agent_unavailable': 'AI 服务未就绪，请稍后重试或查看电脑端日志。',
+      'session_busy': '当前会话正在运行，请先中断或等待完成。',
+      'invalid_session': '会话不存在或已失效。',
+      'session_not_found': '会话不存在或已失效。',
+      'prompt_too_long': '消息太长。',
+      'invalid_base_url': 'Base URL 无效。',
+      'invalid_model': '模型名称无效。',
+      'provider_error': '模型服务连接失败。',
+      'approval_expired': '审批已超时。',
+      'approval_not_found': '审批请求已失效。',
+    };
+    final mapped = code == null ? null : messages[code];
+    if (mapped != null) {
+      return detail == null || detail.isEmpty ? mapped : '$mapped $detail';
+    }
+
+    return 'AI 请求失败（HTTP ${response.statusCode}）。'
+        '${_agentCompactBody(response.body)}';
+  }
+
+  Future<List<AgentSessionSummary>> listSessions() async {
+    final data = await _send('GET', '/api/agent/sessions');
+    final raw = data['sessions'];
+    if (raw is! List) {
+      return [];
+    }
+
+    return raw
+        .whereType<Map>()
+        .map((item) => AgentSessionSummary.fromJson(
+              Map<String, dynamic>.from(item),
+            ))
+        .toList();
+  }
+
+  Future<AgentSessionSummary> createSession() async {
+    final data = await _send(
+      'POST',
+      '/api/agent/sessions',
+      body: const <String, dynamic>{},
+      timeout: const Duration(seconds: 30),
+    );
+    return AgentSessionSummary(
+      id: data['id']?.toString() ?? '',
+      title: data['title']?.toString() ?? '新对话',
+      updatedAt: DateTime.now().millisecondsSinceEpoch,
+      active: false,
+    );
+  }
+
+  Future<AgentSessionDetail> getSession(String id) async {
+    final data = await _send(
+      'GET',
+      '/api/agent/sessions/${Uri.encodeComponent(id)}',
+    );
+    final sessionRaw = data['session'];
+    final session = sessionRaw is Map
+        ? AgentSessionSummary.fromJson(
+            Map<String, dynamic>.from(sessionRaw),
+          )
+        : AgentSessionSummary(
+            id: id,
+            title: '新对话',
+            updatedAt: 0,
+            active: false,
+          );
+    final messages = <AgentMessage>[];
+    final rawMessages = data['messages'];
+    if (rawMessages is List) {
+      for (final item in rawMessages.whereType<Map>()) {
+        messages.add(AgentMessage.fromJson(
+          Map<String, dynamic>.from(item),
+        ));
+      }
+    }
+
+    final pendingRaw = data['pendingApproval'];
+    final pending = pendingRaw is Map
+        ? AgentPendingApproval.fromJson(
+            Map<String, dynamic>.from(pendingRaw),
+          )
+        : null;
+    return AgentSessionDetail(
+      session: session.copyWith(active: session.active),
+      messages: messages,
+      pendingApproval: pending,
+    );
+  }
+
+  Future<void> sendMessage(String id, String text) async {
+    await _send(
+      'POST',
+      '/api/agent/sessions/${Uri.encodeComponent(id)}/messages',
+      body: {'text': text},
+      timeout: const Duration(seconds: 30),
+    );
+  }
+
+  Future<void> interrupt(String id) async {
+    await _send(
+      'POST',
+      '/api/agent/sessions/${Uri.encodeComponent(id)}/interrupt',
+      body: const <String, dynamic>{},
+      timeout: const Duration(seconds: 15),
+    );
+  }
+
+  Future<void> decideApproval(
+    String sessionId,
+    String approvalId,
+    bool allow,
+  ) async {
+    await _send(
+      'POST',
+      '/api/agent/sessions/${Uri.encodeComponent(sessionId)}'
+          '/approvals/${Uri.encodeComponent(approvalId)}',
+      body: {'decision': allow ? 'allow' : 'deny'},
+      timeout: const Duration(seconds: 15),
+    );
+  }
+
+  Future<bool> getAutonomous() async {
+    final data = await _send('GET', '/api/agent/mode');
+    return data['autonomous'] == true;
+  }
+
+  Future<bool> setAutonomous(bool autonomous) async {
+    final data = await _send(
+      'PUT',
+      '/api/agent/mode',
+      body: {'autonomous': autonomous},
+      timeout: const Duration(seconds: 15),
+    );
+    return data['autonomous'] == true;
+  }
+
+  Future<AgentModelSettings> getModel() async {
+    final data = await _send('GET', '/api/agent/model');
+    return AgentModelSettings.fromJson(data);
+  }
+
+  Future<AgentModelSettings> saveModel({
+    required String providerId,
+    required String baseUrl,
+    required String model,
+    String? apiKey,
+    bool clearKey = false,
+  }) async {
+    final data = await _send(
+      'PUT',
+      '/api/agent/model',
+      body: {
+        'providerId': providerId,
+        'baseUrl': baseUrl,
+        'model': model,
+        if (apiKey != null && apiKey.isNotEmpty) 'apiKey': apiKey,
+        'clearKey': clearKey,
+      },
+      timeout: const Duration(seconds: 60),
+    );
+    return AgentModelSettings.fromJson(data);
+  }
+
+  Future<String> testModel() async {
+    final data = await _send(
+      'POST',
+      '/api/agent/model/test',
+      body: const <String, dynamic>{},
+      timeout: const Duration(seconds: 20),
+    );
+    final latency = data['latencyMs'];
+    return latency is num ? '连接正常（${latency.toInt()} ms）' : '连接正常。';
+  }
+}
+
+class AgentSessionSummary {
+  const AgentSessionSummary({
+    required this.id,
+    required this.title,
+    required this.updatedAt,
+    required this.active,
+  });
+
+  factory AgentSessionSummary.fromJson(Map<String, dynamic> json) {
+    return AgentSessionSummary(
+      id: json['id']?.toString() ?? '',
+      title: json['title']?.toString() ?? '新对话',
+      updatedAt: json['updatedAt'] is num
+          ? (json['updatedAt'] as num).toInt()
+          : 0,
+      active: json['active'] == true,
+    );
+  }
+
+  final String id;
+  final String title;
+  final int updatedAt;
+  final bool active;
+
+  AgentSessionSummary copyWith({String? title, bool? active}) {
+    return AgentSessionSummary(
+      id: id,
+      title: title ?? this.title,
+      updatedAt: updatedAt,
+      active: active ?? this.active,
+    );
+  }
+}
+
+class AgentToolCall {
+  const AgentToolCall({
+    required this.name,
+    required this.status,
+    required this.command,
+    required this.output,
+  });
+
+  factory AgentToolCall.fromJson(Map<String, dynamic> json) {
+    return AgentToolCall(
+      name: json['name']?.toString() ?? 'tool',
+      status: json['status']?.toString() ?? '',
+      command: json['command']?.toString() ?? '',
+      output: json['output']?.toString() ?? '',
+    );
+  }
+
+  final String name;
+  final String status;
+  final String command;
+  final String output;
+}
+
+class AgentMessage {
+  const AgentMessage({
+    required this.id,
+    required this.kind,
+    required this.text,
+    required this.createdAt,
+    required this.tools,
+  });
+
+  factory AgentMessage.fromJson(Map<String, dynamic> json) {
+    final tools = <AgentToolCall>[];
+    final rawTools = json['tools'];
+    if (rawTools is List) {
+      for (final item in rawTools.whereType<Map>()) {
+        tools.add(AgentToolCall.fromJson(
+          Map<String, dynamic>.from(item),
+        ));
+      }
+    }
+
+    return AgentMessage(
+      id: json['id']?.toString() ?? '',
+      kind: json['kind']?.toString() ?? '',
+      text: json['text']?.toString() ?? '',
+      createdAt: json['createdAt'] is num
+          ? (json['createdAt'] as num).toInt()
+          : 0,
+      tools: tools,
+    );
+  }
+
+  final String id;
+  final String kind;
+  final String text;
+  final int createdAt;
+  final List<AgentToolCall> tools;
+
+  bool get isUser => kind == 'user';
+  bool get isCompaction => kind == 'compaction';
+}
+
+class AgentPendingApproval {
+  const AgentPendingApproval({
+    required this.id,
+    required this.command,
+    required this.cwd,
+    required this.matched,
+    required this.expiresAt,
+  });
+
+  factory AgentPendingApproval.fromJson(Map<String, dynamic> json) {
+    return AgentPendingApproval(
+      id: json['id']?.toString() ?? '',
+      command: json['command']?.toString() ?? '',
+      cwd: json['cwd']?.toString() ?? '',
+      matched: json['matched']?.toString(),
+      expiresAt: json['expiresAt']?.toString() ?? '',
+    );
+  }
+
+  final String id;
+  final String command;
+  final String cwd;
+  final String? matched;
+  final String expiresAt;
+}
+
+class AgentSessionDetail {
+  const AgentSessionDetail({
+    required this.session,
+    required this.messages,
+    required this.pendingApproval,
+  });
+
+  final AgentSessionSummary session;
+  final List<AgentMessage> messages;
+  final AgentPendingApproval? pendingApproval;
+}
+
+class AgentModelPreset {
+  const AgentModelPreset({
+    required this.id,
+    required this.display,
+    required this.baseUrl,
+    required this.models,
+  });
+
+  factory AgentModelPreset.fromJson(Map<String, dynamic> json) {
+    final models = <String>[];
+    final rawModels = json['models'];
+    if (rawModels is List) {
+      for (final item in rawModels) {
+        models.add(item.toString());
+      }
+    }
+
+    return AgentModelPreset(
+      id: json['id']?.toString() ?? '',
+      display: json['display']?.toString() ?? '',
+      baseUrl: json['baseUrl']?.toString() ?? '',
+      models: models,
+    );
+  }
+
+  final String id;
+  final String display;
+  final String baseUrl;
+  final List<String> models;
+}
+
+class AgentModelSettings {
+  const AgentModelSettings({
+    required this.providerId,
+    required this.baseUrl,
+    required this.model,
+    required this.hasKey,
+    required this.keyMasked,
+    required this.presets,
+  });
+
+  factory AgentModelSettings.fromJson(Map<String, dynamic> json) {
+    final presets = <AgentModelPreset>[];
+    final rawPresets = json['presets'];
+    if (rawPresets is List) {
+      for (final item in rawPresets.whereType<Map>()) {
+        presets.add(AgentModelPreset.fromJson(
+          Map<String, dynamic>.from(item),
+        ));
+      }
+    }
+
+    return AgentModelSettings(
+      providerId: json['providerId']?.toString() ?? '',
+      baseUrl: json['baseUrl']?.toString() ?? '',
+      model: json['model']?.toString() ?? '',
+      hasKey: json['hasKey'] == true,
+      keyMasked: json['keyMasked']?.toString(),
+      presets: presets,
+    );
+  }
+
+  final String providerId;
+  final String baseUrl;
+  final String model;
+  final bool hasKey;
+  final String? keyMasked;
+  final List<AgentModelPreset> presets;
+}
+
+class AgentChatPage extends StatefulWidget {
+  const AgentChatPage({required this.request, super.key});
+
+  final AgentHttpRequest request;
+
+  @override
+  State<AgentChatPage> createState() => _AgentChatPageState();
+}
+
+class _AgentChatPageState extends State<AgentChatPage> {
+  late final AgentApi _api;
+  final TextEditingController _inputController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
+  Timer? _timer;
+  List<AgentSessionSummary> _sessions = [];
+  List<AgentMessage> _messages = [];
+  AgentSessionSummary? _current;
+  AgentPendingApproval? _pending;
+  String? _error;
+  bool _loading = true;
+  bool _polling = false;
+  bool _sending = false;
+  bool _deciding = false;
+  bool _modelConfigured = true;
+  bool _autonomous = false;
+  int _failures = 0;
+  int _lastMessageCount = 0;
+  final Set<String> _expandedToolBlocks = <String>{};
+
+  @override
+  void initState() {
+    super.initState();
+    _api = AgentApi(widget.request);
+    _bootstrap();
+    _timer = Timer.periodic(
+      const Duration(milliseconds: 800),
+      (_) => _poll(),
+    );
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _inputController.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _bootstrap() async {
+    try {
+      final model = await _api.getModel();
+      _modelConfigured = model.hasKey;
+    } catch (_) {
+      _modelConfigured = false;
+    }
+
+    try {
+      _autonomous = await _api.getAutonomous();
+    } catch (_) {
+      // 保持默认关闭
+    }
+
+    try {
+      final sessions = await _api.listSessions();
+      _sessions = sessions;
+      if (sessions.isNotEmpty && mounted) {
+        await _selectSession(sessions.first.id);
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _error = error is NasApiException ? error.message : '$error';
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _poll() async {
+    final current = _current;
+    if (_polling || current == null) {
+      return;
+    }
+
+    _polling = true;
+    try {
+      final detail = await _api.getSession(current.id);
+      if (!mounted) {
+        return;
+      }
+
+      final messageChanged = detail.messages.length != _lastMessageCount;
+      setState(() {
+        _current = detail.session;
+        _messages = detail.messages;
+        _pending = detail.pendingApproval;
+        _lastMessageCount = detail.messages.length;
+        _failures = 0;
+        _error = null;
+      });
+      final index = _sessions.indexWhere((item) => item.id == current.id);
+      if (index >= 0) {
+        _sessions[index] = detail.session;
+      }
+      if (messageChanged) {
+        _scrollToBottom();
+      }
+    } catch (error) {
+      _failures++;
+      if (mounted && _failures >= 3) {
+        setState(() {
+          _error = error is NasApiException ? error.message : '$error';
+        });
+      }
+    } finally {
+      _polling = false;
+    }
+  }
+
+  Future<void> _selectSession(String id) async {
+    setState(() {
+      _loading = true;
+      _error = null;
+      _messages = [];
+      _pending = null;
+      _lastMessageCount = 0;
+      _expandedToolBlocks.clear();
+    });
+
+    try {
+      final detail = await _api.getSession(id);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _current = detail.session;
+        _messages = detail.messages;
+        _pending = detail.pendingApproval;
+        _lastMessageCount = detail.messages.length;
+        _loading = false;
+      });
+      final index = _sessions.indexWhere((item) => item.id == id);
+      if (index >= 0) {
+        _sessions[index] = detail.session;
+      }
+      _scrollToBottom();
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _loading = false;
+        _error = error is NasApiException ? error.message : '$error';
+      });
+    }
+  }
+
+  Future<void> _newSession() async {
+    if (!_modelConfigured) {
+      await _openModelSettings();
+      if (!_modelConfigured) {
+        return;
+      }
+    }
+
+    try {
+      final session = await _api.createSession();
+      if (!mounted || session.id.isEmpty) {
+        return;
+      }
+      setState(() {
+        _sessions = [session, ..._sessions];
+      });
+      await _selectSession(session.id);
+    } catch (error) {
+      _toast(error is NasApiException ? error.message : '$error');
+    }
+  }
+
+  Future<void> _send() async {
+    final text = _inputController.text.trim();
+    if (text.isEmpty || _sending) {
+      return;
+    }
+
+    if (!_modelConfigured) {
+      await _openModelSettings();
+      if (!_modelConfigured) {
+        return;
+      }
+    }
+
+    if (_current == null) {
+      await _newSession();
+      if (_current == null) {
+        return;
+      }
+    }
+
+    setState(() {
+      _sending = true;
+      _error = null;
+    });
+    try {
+      await _api.sendMessage(_current!.id, text);
+      if (!mounted) {
+        return;
+      }
+      _inputController.clear();
+      await _poll();
+    } catch (error) {
+      _toast(error is NasApiException ? error.message : '$error');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _sending = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _interrupt() async {
+    final current = _current;
+    if (current == null) {
+      return;
+    }
+
+    try {
+      await _api.interrupt(current.id);
+      await _poll();
+    } catch (error) {
+      _toast(error is NasApiException ? error.message : '$error');
+    }
+  }
+
+  Future<void> _decideApproval(bool allow) async {
+    final current = _current;
+    final pending = _pending;
+    if (current == null || pending == null || _deciding) {
+      return;
+    }
+
+    setState(() {
+      _deciding = true;
+    });
+    try {
+      await _api.decideApproval(current.id, pending.id, allow);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _pending = null;
+      });
+      await _poll();
+    } catch (error) {
+      _toast(error is NasApiException ? error.message : '$error');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _deciding = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _openSessions() async {
+    try {
+      final sessions = await _api.listSessions();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _sessions = sessions;
+      });
+
+      final selected = await showModalBottomSheet<String>(
+        context: context,
+        backgroundColor: Colors.white,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+        ),
+        builder: (sheetContext) => SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                leading: const Icon(Icons.add_comment_outlined),
+                title: const Text('新建对话'),
+                onTap: () => Navigator.of(sheetContext).pop('__new__'),
+              ),
+              const Divider(height: 1),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 420),
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: _sessions.length,
+                  itemBuilder: (context, index) {
+                    final session = _sessions[index];
+                    final selected = session.id == _current?.id;
+                    return ListTile(
+                      leading: Icon(
+                        selected ? Icons.chat_bubble : Icons.chat_bubble_outline,
+                        color: selected
+                            ? const Color(0xFF6D28D9)
+                            : const Color(0xFF64748B),
+                      ),
+                      title: Text(
+                        session.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      subtitle: Text(
+                        session.active ? '运行中' : '空闲',
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                      trailing: selected
+                          ? const Icon(Icons.check, color: Color(0xFF6D28D9))
+                          : null,
+                      onTap: () => Navigator.of(sheetContext).pop(session.id),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+
+      if (!mounted || selected == null) {
+        return;
+      }
+      if (selected == '__new__') {
+        await _newSession();
+      } else if (selected != _current?.id) {
+        await _selectSession(selected);
+      }
+    } catch (error) {
+      _toast(error is NasApiException ? error.message : '$error');
+    }
+  }
+
+  Future<void> _openAutonomousSettings() async {
+    var next = _autonomous;
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 64),
+          title: const Text('审批模式'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('完全自主模式'),
+                subtitle: const Text(
+                  '开启后，rm -rf、sudo、网络类等敏感命令也不再弹窗确认，全部直接执行。',
+                ),
+                value: next,
+                onChanged: (value) => setDialogState(() => next = value),
+              ),
+              if (next)
+                const Padding(
+                  padding: EdgeInsets.only(top: 6),
+                  child: Text(
+                    '请确认你信任当前模型与供应商；该模式会关闭所有命令拦截。',
+                    style: TextStyle(fontSize: 12, color: Color(0xFFB42318)),
+                  ),
+                ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(next),
+              child: const Text('保存'),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (!mounted || result == null || result == _autonomous) {
+      return;
+    }
+
+    try {
+      final updated = await _api.setAutonomous(result);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _autonomous = updated;
+        if (updated) {
+          _pending = null;
+        }
+      });
+      _toast(updated ? '已开启完全自主模式。' : '已恢复敏感命令确认。');
+    } catch (error) {
+      _toast(error is NasApiException ? error.message : '$error');
+    }
+  }
+
+  Future<void> _openModelSettings() async {
+    try {
+      final settings = await _api.getModel();
+      if (!mounted) {
+        return;
+      }
+      final updated = await showDialog<AgentModelSettings>(
+        context: context,
+        builder: (dialogContext) => _AgentModelConfigDialog(
+          api: _api,
+          settings: settings,
+        ),
+      );
+      if (!mounted || updated == null) {
+        return;
+      }
+      setState(() {
+        _modelConfigured = updated.hasKey;
+        _error = null;
+      });
+      _toast('模型配置已保存。');
+    } catch (error) {
+      _toast(error is NasApiException ? error.message : '$error');
+    }
+  }
+
+  void _toast(String message) {
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_scrollController.hasClients) {
+        return;
+      }
+      _scrollController.animateTo(
+        _scrollController.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOut,
+      );
+    });
+  }
+
+  String _formatTime(int millis) {
+    if (millis <= 0) {
+      return '';
+    }
+    final time = DateTime.fromMillisecondsSinceEpoch(millis).toLocal();
+    String two(int value) => value.toString().padLeft(2, '0');
+    return '${two(time.hour)}:${two(time.minute)}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final title = _current?.title ?? 'AI 助手';
+    return Scaffold(
+      backgroundColor: const Color(0xFFF6F8FC),
+      appBar: AppBar(
+        title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
+        actions: [
+          IconButton(
+            tooltip: '会话列表',
+            onPressed: _openSessions,
+            icon: const Icon(Icons.forum_outlined),
+          ),
+          IconButton(
+            tooltip: '新建对话',
+            onPressed: _newSession,
+            icon: const Icon(Icons.add_comment_outlined),
+          ),
+          IconButton(
+            tooltip: _autonomous ? '完全自主模式已开启' : '审批模式',
+            onPressed: _openAutonomousSettings,
+            icon: Icon(
+              _autonomous ? Icons.shield : Icons.shield_outlined,
+            ),
+            color: _autonomous ? const Color(0xFFB42318) : null,
+          ),
+          IconButton(
+            tooltip: '模型设置',
+            onPressed: _openModelSettings,
+            icon: const Icon(Icons.settings_outlined),
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: Column(
+          children: [
+            if (!_modelConfigured)
+              Material(
+                color: const Color(0xFFFFFBEB),
+                child: InkWell(
+                  onTap: _openModelSettings,
+                  child: const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                    child: Row(
+                      children: [
+                        Icon(Icons.key_outlined, color: Color(0xFFB45309)),
+                        SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            '还没有配置模型，点这里选择供应商并填写 API Key。',
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: Color(0xFF8A5A00),
+                            ),
+                          ),
+                        ),
+                        Icon(Icons.chevron_right, color: Color(0xFFB45309)),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            if (_error != null)
+              Container(
+                width: double.infinity,
+                color: const Color(0xFFFEF2F2),
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                child: Text(
+                  _error!,
+                  style: const TextStyle(fontSize: 12, color: Color(0xFFB42318)),
+                ),
+              ),
+            if (_autonomous)
+              Material(
+                color: const Color(0xFFFEF2F2),
+                child: InkWell(
+                  onTap: _openAutonomousSettings,
+                  child: const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                    child: Row(
+                      children: [
+                        Icon(Icons.shield, size: 16, color: Color(0xFFB42318)),
+                        SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            '完全自主模式：敏感命令不再弹确认',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Color(0xFFB42318),
+                            ),
+                          ),
+                        ),
+                        Icon(Icons.chevron_right, color: Color(0xFFB42318)),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            Expanded(child: _buildMessages()),
+            if (_pending != null) _buildApprovalCard(_pending!),
+            _buildComposer(),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMessages() {
+    if (_loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    if (_current == null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.auto_awesome, size: 48, color: Color(0xFF6D28D9)),
+              const SizedBox(height: 14),
+              const Text(
+                '让 AI 帮你处理电脑上的文件',
+                style: TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                '可以提问、总结文件、生成内容；敏感命令会先请你确认。',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 13, color: Color(0xFF64748B)),
+              ),
+              const SizedBox(height: 18),
+              FilledButton.icon(
+                onPressed: _newSession,
+                icon: const Icon(Icons.add_comment_outlined),
+                label: const Text('开始新对话'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    final children = <Widget>[];
+    for (final message in _messages) {
+      children.add(_buildMessage(message));
+    }
+    if (_current?.active == true) {
+      children.add(
+        const Padding(
+          padding: EdgeInsets.symmetric(vertical: 12),
+          child: Row(
+            children: [
+              SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+              SizedBox(width: 10),
+              Text(
+                '正在思考或执行命令…',
+                style: TextStyle(fontSize: 13, color: Color(0xFF64748B)),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (children.isEmpty) {
+      return const Center(
+        child: Text(
+          '发一条消息开始对话。',
+          style: TextStyle(color: Color(0xFF64748B)),
+        ),
+      );
+    }
+
+    return ListView(
+      controller: _scrollController,
+      padding: const EdgeInsets.fromLTRB(14, 14, 14, 20),
+      children: children,
+    );
+  }
+
+  Widget _buildMessage(AgentMessage message) {
+    if (message.isCompaction) {
+      return Center(
+        child: Container(
+          margin: const EdgeInsets.symmetric(vertical: 8),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: const Color(0xFFE2E8F0),
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: const Text(
+            '上下文已自动压缩',
+            style: TextStyle(fontSize: 12, color: Color(0xFF475569)),
+          ),
+        ),
+      );
+    }
+
+    if (message.isUser) {
+      return Align(
+        alignment: Alignment.centerRight,
+        child: Container(
+          margin: const EdgeInsets.only(bottom: 10, left: 42),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          decoration: BoxDecoration(
+            color: const Color(0xFF6D28D9),
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: SelectableText(
+            message.text,
+            style: const TextStyle(color: Colors.white, fontSize: 14, height: 1.45),
+          ),
+        ),
+      );
+    }
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12, right: 28),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xFFE6EAF2)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (message.text.isNotEmpty) _buildMarkdown(message.text),
+          for (var index = 0; index < message.tools.length; index++)
+            _buildTool(message, message.tools[index], index),
+          if (message.createdAt > 0)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                _formatTime(message.createdAt),
+                style: const TextStyle(fontSize: 11, color: Color(0xFF94A3B8)),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMarkdown(String data) {
+    final base = MarkdownStyleSheet.fromTheme(Theme.of(context));
+    return MarkdownBody(
+      data: data,
+      selectable: true,
+      softLineBreak: true,
+      extensionSet: md.ExtensionSet.gitHubFlavored,
+      onTapLink: (text, href, title) async {
+        final uri = href == null ? null : Uri.tryParse(href);
+        if (uri != null) {
+          await launchUrl(uri, mode: LaunchMode.externalApplication);
+        }
+      },
+      styleSheet: base.copyWith(
+        p: const TextStyle(fontSize: 14, height: 1.55),
+        h1: const TextStyle(fontSize: 19, fontWeight: FontWeight.w700, height: 1.4),
+        h2: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700, height: 1.4),
+        h3: const TextStyle(fontSize: 15.5, fontWeight: FontWeight.w600, height: 1.4),
+        code: const TextStyle(
+          fontFamily: 'monospace',
+          fontSize: 12.5,
+          backgroundColor: Color(0xFFF1F5F9),
+        ),
+        codeblockDecoration: BoxDecoration(
+          color: const Color(0xFFF8FAFC),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: const Color(0xFFE2E8F0)),
+        ),
+        codeblockPadding: const EdgeInsets.all(10),
+        blockquoteDecoration: BoxDecoration(
+          color: const Color(0xFFF8FAFC),
+          border: const Border(
+            left: BorderSide(color: Color(0xFF6D28D9), width: 3),
+          ),
+        ),
+        blockquotePadding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
+        tableBorder: TableBorder.all(color: const Color(0xFFE2E8F0)),
+        tableCellsPadding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+        tableHead: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700),
+        tableBody: const TextStyle(fontSize: 12.5, height: 1.4),
+        horizontalRuleDecoration: const BoxDecoration(
+          border: Border(top: BorderSide(color: Color(0xFFE2E8F0))),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTool(AgentMessage message, AgentToolCall tool, int index) {
+    final command = tool.command.trim();
+    final output = tool.output.trim();
+    final key = '${message.id}:$index';
+    final expanded = _expandedToolBlocks.contains(key);
+    final statusColor = switch (tool.status) {
+      'completed' => const Color(0xFF34D399),
+      'error' => const Color(0xFFF87171),
+      'running' => const Color(0xFFFBBF24),
+      _ => const Color(0xFF94A3B8),
+    };
+
+    return Container(
+      margin: const EdgeInsets.only(top: 10),
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: const Color(0xFF0B1220),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            onTap: () {
+              setState(() {
+                if (expanded) {
+                  _expandedToolBlocks.remove(key);
+                } else {
+                  _expandedToolBlocks.add(key);
+                }
+              });
+            },
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Icon(
+                    Icons.terminal,
+                    size: 15,
+                    color: Color(0xFF93C5FD),
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                tool.name,
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Color(0xFF93C5FD),
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                            Text(
+                              tool.status,
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: statusColor,
+                              ),
+                            ),
+                          ],
+                        ),
+                        if (!expanded && command.isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 3),
+                            child: Text(
+                              command,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontSize: 11,
+                                color: Color(0xFF94A3B8),
+                                fontFamily: 'monospace',
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Icon(
+                    expanded ? Icons.expand_less : Icons.expand_more,
+                    size: 18,
+                    color: const Color(0xFF94A3B8),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (expanded)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (command.isNotEmpty)
+                    SelectableText(
+                      command,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Color(0xFFE2E8F0),
+                        fontFamily: 'monospace',
+                        height: 1.4,
+                      ),
+                    ),
+                  if (output.isNotEmpty)
+                    Padding(
+                      padding: EdgeInsets.only(
+                        top: command.isNotEmpty ? 8 : 0,
+                      ),
+                      child: Container(
+                        width: double.infinity,
+                        constraints: const BoxConstraints(maxHeight: 260),
+                        child: SingleChildScrollView(
+                          child: SelectableText(
+                            output.length > 4000
+                                ? '${output.substring(0, 4000)}…'
+                                : output,
+                            style: const TextStyle(
+                              fontSize: 11.5,
+                              color: Color(0xFFCBD5E1),
+                              fontFamily: 'monospace',
+                              height: 1.4,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHighlightedCommand(String command, String? matched) {
+    final needle = matched?.trim() ?? '';
+    if (needle.isEmpty) {
+      return SelectableText(
+        command,
+        style: const TextStyle(
+          fontSize: 12,
+          color: Color(0xFFE2E8F0),
+          fontFamily: 'monospace',
+          height: 1.4,
+        ),
+      );
+    }
+
+    final spans = <TextSpan>[];
+    final lowerCommand = command.toLowerCase();
+    final lowerNeedle = needle.toLowerCase();
+    var start = 0;
+    while (start < command.length) {
+      final index = lowerCommand.indexOf(lowerNeedle, start);
+      if (index < 0) {
+        spans.add(TextSpan(text: command.substring(start)));
+        break;
+      }
+      if (index > start) {
+        spans.add(TextSpan(text: command.substring(start, index)));
+      }
+      spans.add(
+        TextSpan(
+          text: command.substring(index, index + needle.length),
+          style: const TextStyle(
+            backgroundColor: Color(0xFFB45309),
+            color: Colors.white,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      );
+      start = index + needle.length;
+    }
+
+    return SelectableText.rich(
+      TextSpan(
+        children: spans,
+        style: const TextStyle(
+          fontSize: 12,
+          color: Color(0xFFE2E8F0),
+          fontFamily: 'monospace',
+          height: 1.4,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildApprovalCard(AgentPendingApproval pending) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 6, 12, 6),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFFFFFBEB),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: const Color(0xFFFDE68A)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.shield_outlined, size: 18, color: Color(0xFFB45309)),
+              SizedBox(width: 8),
+              Text(
+                '需要确认的命令',
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w700,
+                  color: Color(0xFF8A5A00),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: const Color(0xFF0B1220),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: _buildHighlightedCommand(pending.command, pending.matched),
+          ),
+          if ((pending.matched ?? '').isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                '命中：${pending.matched}',
+                style: const TextStyle(
+                  fontSize: 11,
+                  color: Color(0xFFFBBF24),
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          if (pending.cwd.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                '目录：${pending.cwd}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 11, color: Color(0xFF8A5A00)),
+              ),
+            ),
+          const SizedBox(height: 10),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              TextButton(
+                onPressed: _deciding ? null : () => _decideApproval(false),
+                child: const Text('拒绝'),
+              ),
+              const SizedBox(width: 8),
+              FilledButton(
+                onPressed: _deciding ? null : () => _decideApproval(true),
+                child: const Text('允许一次'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildComposer() {
+    final active = _current?.active == true;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+      decoration: const BoxDecoration(
+        color: Colors.white,
+        border: Border(top: BorderSide(color: Color(0xFFE6EAF2))),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          Expanded(
+            child: TextField(
+              controller: _inputController,
+              minLines: 1,
+              maxLines: 4,
+              textInputAction: TextInputAction.newline,
+              enabled: !_sending,
+              decoration: InputDecoration(
+                hintText: '输入消息…',
+                filled: true,
+                fillColor: const Color(0xFFF8FAFC),
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 10,
+                ),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(18),
+                  borderSide: BorderSide.none,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          active
+              ? IconButton.filledTonal(
+                  tooltip: '中断',
+                  onPressed: _interrupt,
+                  icon: const Icon(Icons.stop_circle_outlined),
+                )
+              : IconButton.filled(
+                  tooltip: '发送',
+                  onPressed: _sending ? null : _send,
+                  icon: const Icon(Icons.send),
+                ),
+        ],
+      ),
+    );
+  }
+}
+
+class _AgentModelConfigDialog extends StatefulWidget {
+  const _AgentModelConfigDialog({required this.api, required this.settings});
+
+  final AgentApi api;
+  final AgentModelSettings settings;
+
+  @override
+  State<_AgentModelConfigDialog> createState() => _AgentModelConfigDialogState();
+}
+
+class _AgentModelConfigDialogState extends State<_AgentModelConfigDialog> {
+  late final TextEditingController _baseUrlController;
+  late final TextEditingController _modelController;
+  final TextEditingController _keyController = TextEditingController();
+  late String _providerId;
+  bool _clearKey = false;
+  bool _saving = false;
+  bool _testing = false;
+  String? _status;
+
+  @override
+  void initState() {
+    super.initState();
+    _providerId = widget.settings.providerId;
+    _baseUrlController = TextEditingController(text: widget.settings.baseUrl);
+    _modelController = TextEditingController(text: widget.settings.model);
+  }
+
+  @override
+  void dispose() {
+    _baseUrlController.dispose();
+    _modelController.dispose();
+    _keyController.dispose();
+    super.dispose();
+  }
+
+  void _selectPreset(AgentModelPreset preset) {
+    setState(() {
+      _providerId = preset.id;
+      if (preset.baseUrl.isNotEmpty) {
+        _baseUrlController.text = preset.baseUrl;
+      }
+      if (preset.models.isNotEmpty) {
+        _modelController.text = preset.models.first;
+      }
+    });
+  }
+
+  Future<void> _save() async {
+    final baseUrl = _baseUrlController.text.trim();
+    final model = _modelController.text.trim();
+    final key = _keyController.text.trim();
+    if (baseUrl.isEmpty || model.isEmpty) {
+      setState(() {
+        _status = '请填写 Base URL 和模型名称。';
+      });
+      return;
+    }
+    if (!widget.settings.hasKey && !_clearKey && key.isEmpty) {
+      setState(() {
+        _status = '请填写 API Key。';
+      });
+      return;
+    }
+
+    setState(() {
+      _saving = true;
+      _status = null;
+    });
+    try {
+      final updated = await widget.api.saveModel(
+        providerId: _providerId,
+        baseUrl: baseUrl,
+        model: model,
+        apiKey: key.isEmpty ? null : key,
+        clearKey: _clearKey,
+      );
+      if (!mounted) {
+        return;
+      }
+      Navigator.of(context).pop(updated);
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _status = error is NasApiException ? error.message : '$error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _saving = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _test() async {
+    setState(() {
+      _testing = true;
+      _status = null;
+    });
+    try {
+      final message = await widget.api.testModel();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _status = message;
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _status = error is NasApiException ? error.message : '$error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _testing = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final presets = widget.settings.presets;
+    return AlertDialog(
+      insetPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 32),
+      titlePadding: const EdgeInsets.fromLTRB(20, 18, 20, 0),
+      contentPadding: const EdgeInsets.fromLTRB(20, 12, 20, 8),
+      actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+      title: const Text('模型设置'),
+      content: SizedBox(
+        width: double.maxFinite,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('供应商', style: TextStyle(fontSize: 13)),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  for (final preset in presets)
+                    ChoiceChip(
+                      label: Text(preset.display),
+                      selected: _providerId == preset.id,
+                      onSelected: (_) => _selectPreset(preset),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 14),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    flex: 3,
+                    child: TextField(
+                      controller: _baseUrlController,
+                      decoration: const InputDecoration(
+                        border: OutlineInputBorder(),
+                        isDense: true,
+                        labelText: 'Base URL',
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    flex: 2,
+                    child: TextField(
+                      controller: _modelController,
+                      decoration: const InputDecoration(
+                        border: OutlineInputBorder(),
+                        isDense: true,
+                        labelText: '模型名称',
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                '预设会自动填充 Base URL 和模型名；自定义时手动填写。',
+                style: TextStyle(fontSize: 11, color: Color(0xFF64748B)),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: _keyController,
+                obscureText: true,
+                decoration: InputDecoration(
+                  border: const OutlineInputBorder(),
+                  isDense: true,
+                  labelText: 'API Key',
+                  hintText: widget.settings.hasKey
+                      ? '已保存 ${widget.settings.keyMasked ?? ''}，留空保持不变'
+                      : '输入 API Key',
+                ),
+              ),
+              if (widget.settings.hasKey)
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton(
+                    style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    onPressed: () {
+                      setState(() {
+                        _clearKey = !_clearKey;
+                      });
+                    },
+                    child: Text(_clearKey ? '取消清除 Key' : '清除已保存的 Key'),
+                  ),
+                ),
+              if (_status != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Text(
+                    _status!,
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: _status!.contains('正常') ||
+                              _status!.contains('已保存')
+                          ? const Color(0xFF047857)
+                          : const Color(0xFFB42318),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: _saving ? null : () => Navigator.of(context).pop(),
+          child: const Text('取消'),
+        ),
+        TextButton(
+          onPressed: (_saving || _testing) ? null : _test,
+          child: _testing
+              ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Text('测试连接'),
+        ),
+        FilledButton(
+          onPressed: _saving ? null : _save,
+          child: _saving
+              ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Text('保存'),
+        ),
+      ],
     );
   }
 }
