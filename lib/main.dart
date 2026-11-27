@@ -12066,6 +12066,10 @@ class AgentApi {
       'provider_error': '模型服务连接失败。',
       'approval_expired': '审批已超时。',
       'approval_not_found': '审批请求已失效。',
+      'question_not_found': '该问题已失效，请刷新后重试。',
+      'question_expired': '问题已超时，请重新提问。',
+      'invalid_answer': '回答内容无效。',
+      'invalid_form': '问题标识无效。',
     };
     final mapped = code == null ? null : messages[code];
     if (mapped != null) {
@@ -12138,10 +12142,40 @@ class AgentApi {
             Map<String, dynamic>.from(pendingRaw),
           )
         : null;
+    final questionRaw = data['pendingQuestion'];
+    final pendingQuestion = questionRaw is Map
+        ? AgentPendingQuestion.fromJson(
+            Map<String, dynamic>.from(questionRaw),
+          )
+        : null;
     return AgentSessionDetail(
       session: session.copyWith(active: session.active),
       messages: messages,
       pendingApproval: pending,
+      pendingQuestion: pendingQuestion,
+    );
+  }
+
+  Future<void> replyQuestion(
+    String sessionId,
+    String formId,
+    Map<String, dynamic> answer,
+  ) async {
+    await _send(
+      'POST',
+      '/api/agent/sessions/${Uri.encodeComponent(sessionId)}'
+          '/questions/${Uri.encodeComponent(formId)}',
+      body: {'answer': answer},
+      timeout: const Duration(seconds: 15),
+    );
+  }
+
+  Future<void> cancelQuestion(String sessionId, String formId) async {
+    await _send(
+      'DELETE',
+      '/api/agent/sessions/${Uri.encodeComponent(sessionId)}'
+          '/questions/${Uri.encodeComponent(formId)}',
+      timeout: const Duration(seconds: 15),
     );
   }
 
@@ -12355,16 +12389,110 @@ class AgentPendingApproval {
   final String expiresAt;
 }
 
+class AgentQuestionOption {
+  const AgentQuestionOption({
+    required this.value,
+    required this.label,
+    required this.description,
+  });
+
+  factory AgentQuestionOption.fromJson(Map<String, dynamic> json) {
+    return AgentQuestionOption(
+      value: json['value']?.toString() ?? '',
+      label: json['label']?.toString() ?? json['value']?.toString() ?? '',
+      description: json['description']?.toString() ?? '',
+    );
+  }
+
+  final String value;
+  final String label;
+  final String description;
+}
+
+class AgentQuestion {
+  const AgentQuestion({
+    required this.key,
+    required this.header,
+    required this.question,
+    required this.multiple,
+    required this.custom,
+    required this.required,
+    required this.options,
+  });
+
+  factory AgentQuestion.fromJson(Map<String, dynamic> json) {
+    final options = <AgentQuestionOption>[];
+    final rawOptions = json['options'];
+    if (rawOptions is List) {
+      for (final item in rawOptions.whereType<Map>()) {
+        options.add(AgentQuestionOption.fromJson(
+          Map<String, dynamic>.from(item),
+        ));
+      }
+    }
+
+    return AgentQuestion(
+      key: json['key']?.toString() ?? '',
+      header: json['header']?.toString() ?? '',
+      question: json['question']?.toString() ?? '',
+      multiple: json['multiple'] == true,
+      custom: json['custom'] == true,
+      required: json['required'] == true,
+      options: options,
+    );
+  }
+
+  final String key;
+  final String header;
+  final String question;
+  final bool multiple;
+  final bool custom;
+  final bool required;
+  final List<AgentQuestionOption> options;
+}
+
+class AgentPendingQuestion {
+  const AgentPendingQuestion({
+    required this.formId,
+    required this.title,
+    required this.questions,
+  });
+
+  factory AgentPendingQuestion.fromJson(Map<String, dynamic> json) {
+    final questions = <AgentQuestion>[];
+    final rawQuestions = json['questions'];
+    if (rawQuestions is List) {
+      for (final item in rawQuestions.whereType<Map>()) {
+        questions.add(AgentQuestion.fromJson(
+          Map<String, dynamic>.from(item),
+        ));
+      }
+    }
+
+    return AgentPendingQuestion(
+      formId: json['formId']?.toString() ?? '',
+      title: json['title']?.toString() ?? '',
+      questions: questions,
+    );
+  }
+
+  final String formId;
+  final String title;
+  final List<AgentQuestion> questions;
+}
+
 class AgentSessionDetail {
   const AgentSessionDetail({
     required this.session,
     required this.messages,
     required this.pendingApproval,
+    required this.pendingQuestion,
   });
 
   final AgentSessionSummary session;
   final List<AgentMessage> messages;
   final AgentPendingApproval? pendingApproval;
+  final AgentPendingQuestion? pendingQuestion;
 }
 
 class AgentModelPreset {
@@ -12455,11 +12583,13 @@ class _AgentChatPageState extends State<AgentChatPage> {
   List<AgentMessage> _messages = [];
   AgentSessionSummary? _current;
   AgentPendingApproval? _pending;
+  AgentPendingQuestion? _pendingQuestion;
   String? _error;
   bool _loading = true;
   bool _polling = false;
   bool _sending = false;
   bool _deciding = false;
+  bool _answeringQuestion = false;
   bool _modelConfigured = true;
   bool _autonomous = false;
   int _failures = 0;
@@ -12538,6 +12668,7 @@ class _AgentChatPageState extends State<AgentChatPage> {
         _current = detail.session;
         _messages = detail.messages;
         _pending = detail.pendingApproval;
+        _pendingQuestion = detail.pendingQuestion;
         _lastMessageCount = detail.messages.length;
         _failures = 0;
         _error = null;
@@ -12567,6 +12698,7 @@ class _AgentChatPageState extends State<AgentChatPage> {
       _error = null;
       _messages = [];
       _pending = null;
+      _pendingQuestion = null;
       _lastMessageCount = 0;
       _expandedToolBlocks.clear();
     });
@@ -12580,6 +12712,7 @@ class _AgentChatPageState extends State<AgentChatPage> {
         _current = detail.session;
         _messages = detail.messages;
         _pending = detail.pendingApproval;
+        _pendingQuestion = detail.pendingQuestion;
         _lastMessageCount = detail.messages.length;
         _loading = false;
       });
@@ -12702,6 +12835,91 @@ class _AgentChatPageState extends State<AgentChatPage> {
       if (mounted) {
         setState(() {
           _deciding = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _answerQuestion(Map<String, dynamic> answer) async {
+    final current = _current;
+    final question = _pendingQuestion;
+    if (current == null || question == null || _answeringQuestion) {
+      return;
+    }
+    if (answer.isEmpty) {
+      _toast('请先选择或填写回答。');
+      return;
+    }
+
+    setState(() {
+      _answeringQuestion = true;
+    });
+    try {
+      await _api.replyQuestion(current.id, question.formId, answer);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _pendingQuestion = null;
+      });
+      await _poll();
+    } catch (error) {
+      _toast(error is NasApiException ? error.message : '$error');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _answeringQuestion = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _skipQuestion() async {
+    final current = _current;
+    final question = _pendingQuestion;
+    if (current == null || question == null || _answeringQuestion) {
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('跳过本次提问？'),
+        content: const Text('AI 将按自己的判断继续，或转而向你追问。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('继续回答'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('跳过'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) {
+      return;
+    }
+
+    setState(() {
+      _answeringQuestion = true;
+    });
+    try {
+      await _api.cancelQuestion(current.id, question.formId);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _pendingQuestion = null;
+      });
+      await _poll();
+    } catch (error) {
+      _toast(error is NasApiException ? error.message : '$error');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _answeringQuestion = false;
         });
       }
     }
@@ -13006,6 +13224,14 @@ class _AgentChatPageState extends State<AgentChatPage> {
               ),
             Expanded(child: _buildMessages()),
             if (_pending != null) _buildApprovalCard(_pending!),
+            if (_pendingQuestion != null)
+              _AgentQuestionCard(
+                key: ValueKey(_pendingQuestion!.formId),
+                question: _pendingQuestion!,
+                submitting: _answeringQuestion,
+                onSubmit: _answerQuestion,
+                onSkip: _skipQuestion,
+              ),
             _buildComposer(),
           ],
         ),
@@ -13488,6 +13714,289 @@ class _AgentChatPageState extends State<AgentChatPage> {
                   onPressed: _sending ? null : _send,
                   icon: const Icon(Icons.send),
                 ),
+        ],
+      ),
+    );
+  }
+}
+
+class _AgentQuestionCard extends StatefulWidget {
+  const _AgentQuestionCard({
+    required this.question,
+    required this.submitting,
+    required this.onSubmit,
+    required this.onSkip,
+    super.key,
+  });
+
+  final AgentPendingQuestion question;
+  final bool submitting;
+  final Future<void> Function(Map<String, dynamic> answer) onSubmit;
+  final Future<void> Function() onSkip;
+
+  @override
+  State<_AgentQuestionCard> createState() => _AgentQuestionCardState();
+}
+
+class _AgentQuestionCardState extends State<_AgentQuestionCard> {
+  final Map<String, Set<String>> _selected = {};
+  final Map<String, TextEditingController> _custom = {};
+
+  @override
+  void initState() {
+    super.initState();
+    for (final question in widget.question.questions) {
+      _selected[question.key] = <String>{};
+      _custom[question.key] = TextEditingController();
+    }
+  }
+
+  @override
+  void dispose() {
+    for (final controller in _custom.values) {
+      controller.dispose();
+    }
+    super.dispose();
+  }
+
+  Map<String, dynamic> _buildAnswer() {
+    final answer = <String, dynamic>{};
+    for (final question in widget.question.questions) {
+      final selected = _selected[question.key] ?? const <String>{};
+      final custom = _custom[question.key]?.text.trim() ?? '';
+      if (question.multiple) {
+        final values = <String>[...selected];
+        if (custom.isNotEmpty && !values.contains(custom)) {
+          values.add(custom);
+        }
+        if (values.isNotEmpty) {
+          answer[question.key] = values;
+        }
+      } else {
+        final value = custom.isNotEmpty
+            ? custom
+            : (selected.isEmpty ? '' : selected.first);
+        if (value.isNotEmpty) {
+          answer[question.key] = value;
+        }
+      }
+    }
+    return answer;
+  }
+
+  Future<void> _submit() async {
+    final answer = _buildAnswer();
+    final missing = widget.question.questions
+        .where((question) => question.required && !answer.containsKey(question.key))
+        .toList();
+    if (missing.isNotEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '请回答：${missing.first.header.isEmpty ? missing.first.question : missing.first.header}',
+          ),
+        ),
+      );
+      return;
+    }
+    if (answer.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请先选择或填写回答。')),
+      );
+      return;
+    }
+    await widget.onSubmit(answer);
+  }
+
+  Widget _buildField(AgentQuestion question) {
+    final selected = _selected[question.key] ?? <String>{};
+    final controller = _custom[question.key]!;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (question.header.isNotEmpty)
+            Text(
+              question.required ? '${question.header} *' : question.header,
+              style: const TextStyle(
+                fontSize: 13.5,
+                fontWeight: FontWeight.w700,
+                color: Color(0xFF3B276B),
+              ),
+            ),
+          if (question.question.isNotEmpty)
+            Padding(
+              padding: EdgeInsets.only(top: question.header.isEmpty ? 0 : 3),
+              child: Text(
+                question.question,
+                style: const TextStyle(
+                  fontSize: 12.5,
+                  height: 1.45,
+                  color: Color(0xFF64748B),
+                ),
+              ),
+            ),
+          if (question.options.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Wrap(
+                spacing: 6,
+                runSpacing: 4,
+                children: [
+                  for (final option in question.options)
+                    Tooltip(
+                      message: option.description,
+                      child: question.multiple
+                          ? FilterChip(
+                              label: Text(option.label),
+                              selected: selected.contains(option.value),
+                              onSelected: widget.submitting
+                                  ? null
+                                  : (checked) {
+                                      setState(() {
+                                        final values = _selected.putIfAbsent(
+                                          question.key,
+                                          () => <String>{},
+                                        );
+                                        if (checked) {
+                                          values.add(option.value);
+                                        } else {
+                                          values.remove(option.value);
+                                        }
+                                      });
+                                    },
+                            )
+                          : ChoiceChip(
+                              label: Text(option.label),
+                              selected: selected.contains(option.value),
+                              onSelected: widget.submitting
+                                  ? null
+                                  : (checked) {
+                                      setState(() {
+                                        _selected[question.key] = checked
+                                            ? <String>{option.value}
+                                            : <String>{};
+                                        controller.clear();
+                                      });
+                                    },
+                            ),
+                    ),
+                ],
+              ),
+            ),
+          if (question.custom || question.options.isEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: TextField(
+                controller: controller,
+                enabled: !widget.submitting,
+                textInputAction: TextInputAction.done,
+                onChanged: (value) {
+                  setState(() {
+                    if (value.trim().isNotEmpty && !question.multiple) {
+                      _selected[question.key] = <String>{};
+                    }
+                  });
+                },
+                decoration: InputDecoration(
+                  isDense: true,
+                  hintText: question.options.isEmpty ? '输入回答' : '自定义回答（可选）',
+                  hintStyle: const TextStyle(fontSize: 12.5),
+                  filled: true,
+                  fillColor: Colors.white.withValues(alpha: 0.75),
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 10,
+                  ),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    borderSide: const BorderSide(color: Color(0xFFDDD6FE)),
+                  ),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    borderSide: const BorderSide(color: Color(0xFFDDD6FE)),
+                  ),
+                ),
+                style: const TextStyle(fontSize: 13),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final canSubmit = !widget.submitting && _buildAnswer().isNotEmpty;
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 6, 12, 6),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF5F3FF),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: const Color(0xFFDDD6FE)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Padding(
+            padding: EdgeInsets.fromLTRB(14, 12, 14, 4),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.question_answer_outlined,
+                  size: 18,
+                  color: Color(0xFF6D28D9),
+                ),
+                SizedBox(width: 8),
+                Text(
+                  'AI 需要你的回答',
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                    color: Color(0xFF3B276B),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 250),
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(14, 6, 14, 0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  for (final question in widget.question.questions)
+                    _buildField(question),
+                ],
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(10, 0, 10, 8),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                TextButton(
+                  onPressed: widget.submitting ? null : widget.onSkip,
+                  child: const Text('跳过'),
+                ),
+                const SizedBox(width: 6),
+                FilledButton(
+                  onPressed: canSubmit ? _submit : null,
+                  child: widget.submitting
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('提交回答'),
+                ),
+              ],
+            ),
+          ),
         ],
       ),
     );

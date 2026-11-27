@@ -100,6 +100,35 @@ void main() {
     expect(directory.items.map((entry) => entry.name).toList(), ['照片', '.env']);
   });
 
+  test('parses pending agent question payload', () {
+    final question = AgentPendingQuestion.fromJson({
+      'formId': 'frm_abc123',
+      'title': 'Questions',
+      'questions': [
+        {
+          'key': 'q0',
+          'header': '方向',
+          'question': '接下来先做哪一项？',
+          'multiple': false,
+          'custom': true,
+          'required': true,
+          'options': [
+            {'value': 'A', 'label': '选项 A', 'description': '先做 A'},
+            {'value': 'B', 'label': '选项 B', 'description': ''},
+          ],
+        },
+      ],
+    });
+
+    expect(question.formId, 'frm_abc123');
+    expect(question.questions, hasLength(1));
+    expect(question.questions.first.key, 'q0');
+    expect(question.questions.first.header, '方向');
+    expect(question.questions.first.multiple, isFalse);
+    expect(question.questions.first.options, hasLength(2));
+    expect(question.questions.first.options.first.label, '选项 A');
+  });
+
   testWidgets('renders markdown preview content', (tester) async {
     await tester.pumpWidget(
       MaterialApp(
