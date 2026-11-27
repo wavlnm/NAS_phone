@@ -42,7 +42,7 @@ class _PickedFolderEntry {
   final bool isDir;
 }
 
-enum EntryMenuAction { delete, move, rename, download }
+enum EntryMenuAction { delete, move, rename, download, share }
 
 enum MainTab { home, recent, tools, mine }
 
@@ -2092,6 +2092,8 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
         await _renameEntry(entry);
       case EntryMenuAction.download:
         await _downloadEntry(entry);
+      case EntryMenuAction.share:
+        await _shareEntry(entry);
     }
   }
 
@@ -2189,8 +2191,295 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _moveEntry(FileBrowserEntry entry) async {
+  Future<void> _shareEntry(FileBrowserEntry entry) async {
+    if (entry.isDir) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('仅支持分享单个文件。')));
+      return;
+    }
+
     final baseUri = _baseUri;
+    if (baseUri == null) {
+      return;
+    }
+
+    const expiryPresets = <(int, String)>[
+      (3600, '1 小时'),
+      (21600, '6 小时'),
+      (86400, '24 小时'),
+      (259200, '3 天'),
+      (604800, '7 天'),
+    ];
+    var expirySeconds = 86400;
+    final passwordController = TextEditingController();
+    final limitController = TextEditingController();
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          title: const Text('分享文件'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  entry.name,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+                const SizedBox(height: 16),
+                const Text('有效期', style: TextStyle(fontSize: 13)),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final preset in expiryPresets)
+                      ChoiceChip(
+                        label: Text(preset.$2),
+                        selected: expirySeconds == preset.$1,
+                        onSelected: (_) => setDialogState(
+                          () => expirySeconds = preset.$1,
+                        ),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                TextField(
+                  controller: passwordController,
+                  obscureText: true,
+                  maxLength: 64,
+                  decoration: const InputDecoration(
+                    border: OutlineInputBorder(),
+                    labelText: '访问密码（可选）',
+                    counterText: '',
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: limitController,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    border: OutlineInputBorder(),
+                    labelText: '下载次数上限（可选）',
+                    helperText: '留空表示不限次数',
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              child: const Text('生成链接'),
+            ),
+          ],
+        ),
+      ),
+    );
+    final passwordText = passwordController.text;
+    final limitText = limitController.text.trim();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      passwordController.dispose();
+      limitController.dispose();
+    });
+
+    if (!mounted || confirmed != true) {
+      return;
+    }
+
+    int? maxDownloads;
+    if (limitText.isNotEmpty) {
+      maxDownloads = int.tryParse(limitText);
+      if (maxDownloads == null || maxDownloads < 1 || maxDownloads > 1000) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('下载次数需为 1~1000 的整数。')),
+        );
+        return;
+      }
+    }
+
+    setState(() {
+      _busyEntryPath = entry.path;
+      _fileError = null;
+    });
+
+    try {
+      final requestBody = <String, dynamic>{
+        'path': entry.path,
+        'expiresInSeconds': expirySeconds,
+        if (passwordText.isNotEmpty) 'password': passwordText,
+        'maxDownloads': ?maxDownloads,
+      };
+      final response = await _sendTextRequest(
+        baseUri.replace(path: '/api/shares'),
+        method: 'POST',
+        headers: const {'Content-Type': 'application/json'},
+        requestBody: jsonEncode(requestBody),
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw NasApiException(_shareErrorText(response));
+      }
+
+      final decoded = jsonDecode(response.body);
+      if (decoded is! Map) {
+        throw const NasApiException('分享失败：服务端返回格式异常。');
+      }
+      final payload = Map<String, dynamic>.from(decoded);
+      final url = payload['url']?.toString() ?? '';
+      if (url.isEmpty) {
+        throw const NasApiException('分享失败：服务端未返回链接。');
+      }
+
+      if (!mounted) {
+        return;
+      }
+
+      await _showShareResultDialog(
+        url: url,
+        expiresAt: DateTime.tryParse(payload['expiresAt']?.toString() ?? ''),
+        hasPassword: payload['hasPassword'] == true,
+        maxDownloads: payload['maxDownloads'] is num
+            ? (payload['maxDownloads'] as num).toInt()
+            : null,
+      );
+    } on NasApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _fileError = error.message;
+      });
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message)));
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busyEntryPath = null;
+        });
+      }
+    }
+  }
+
+  Future<void> _showShareResultDialog({
+    required String url,
+    DateTime? expiresAt,
+    required bool hasPassword,
+    int? maxDownloads,
+  }) async {
+    final expiryText = expiresAt == null ? null : _formatShareExpiry(expiresAt);
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('分享链接已生成'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('把下面的链接发给对方，无需安装客户端即可打开：'),
+              const SizedBox(height: 10),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF6F8FC),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: const Color(0xFFE6EAF2)),
+                ),
+                child: SelectableText(
+                  url,
+                  style: const TextStyle(fontSize: 13, height: 1.5),
+                ),
+              ),
+              if (expiryText != null) ...[
+                const SizedBox(height: 10),
+                Text('有效期至 $expiryText', style: const TextStyle(fontSize: 13)),
+              ],
+              if (hasPassword) ...[
+                const SizedBox(height: 4),
+                const Text('已设置访问密码。', style: TextStyle(fontSize: 13)),
+              ],
+              if (maxDownloads != null) ...[
+                const SizedBox(height: 4),
+                Text(
+                  '下载次数上限：$maxDownloads 次',
+                  style: const TextStyle(fontSize: 13),
+                ),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('关闭'),
+          ),
+          FilledButton.icon(
+            onPressed: () async {
+              await Clipboard.setData(ClipboardData(text: url));
+              if (!dialogContext.mounted) {
+                return;
+              }
+              Navigator.of(dialogContext).pop();
+              if (!mounted) {
+                return;
+              }
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('链接已复制。')),
+              );
+            },
+            icon: const Icon(Icons.copy_outlined),
+            label: const Text('复制链接'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _shareErrorText(SimpleHttpResponse response) {
+    String? code;
+    try {
+      final decoded = jsonDecode(response.body);
+      if (decoded is Map) {
+        code = decoded['error']?.toString();
+      }
+    } catch (_) {
+      // 忽略，使用通用提示
+    }
+
+    const messages = <String, String>{
+      'invalid_path': '文件路径无效。',
+      'directory_not_allowed': '仅支持分享单个文件。',
+      'file_not_found': '文件不存在或已被移动。',
+      'invalid_expiry': '有效期设置无效。',
+      'invalid_password': '密码无效，最多 64 个字符。',
+      'invalid_max_downloads': '下载次数需为 1~1000 的整数。',
+      'too_many_shares': '分享数量已达上限，请先撤销一些旧分享。',
+      'invalid_request': '请求无效，请升级手机端后重试。',
+    };
+    final message = code == null ? null : messages[code];
+    return message ??
+        '分享失败（HTTP ${response.statusCode}）。${_compactBody(response.body)}';
+  }
+
+  String _formatShareExpiry(DateTime value) {
+    final local = value.toLocal();
+    String two(int number) => number.toString().padLeft(2, '0');
+    return '${local.year}-${two(local.month)}-${two(local.day)} '
+        '${two(local.hour)}:${two(local.minute)}';
+  }
+
+  Future<void> _moveEntry(FileBrowserEntry entry) async {    final baseUri = _baseUri;
     final token = _authToken;
     if (baseUri == null || token == null) {
       return;
@@ -3413,6 +3702,8 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
             for (final item in [
               if (!entry.isDir)
                 (EntryMenuAction.download, '下载', Icons.download_outlined),
+              if (!entry.isDir)
+                (EntryMenuAction.share, '分享', Icons.share_outlined),
               (EntryMenuAction.move, '移动', Icons.drive_file_move_outline),
               (EntryMenuAction.rename, '重命名', Icons.drive_file_rename_outline),
               (EntryMenuAction.delete, '删除', Icons.delete_outline),
@@ -4935,23 +5226,28 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
                           tooltip: '更多操作',
                           onSelected: (action) =>
                               _handleEntryAction(entry, action),
-                          itemBuilder: (context) => const [
-                            PopupMenuItem<EntryMenuAction>(
+                          itemBuilder: (context) => [
+                            const PopupMenuItem<EntryMenuAction>(
                               value: EntryMenuAction.delete,
                               child: Text('删除'),
                             ),
-                            PopupMenuItem<EntryMenuAction>(
+                            const PopupMenuItem<EntryMenuAction>(
                               value: EntryMenuAction.move,
                               child: Text('移动'),
                             ),
-                            PopupMenuItem<EntryMenuAction>(
+                            const PopupMenuItem<EntryMenuAction>(
                               value: EntryMenuAction.rename,
                               child: Text('重命名'),
                             ),
-                            PopupMenuItem<EntryMenuAction>(
+                            const PopupMenuItem<EntryMenuAction>(
                               value: EntryMenuAction.download,
                               child: Text('下载'),
                             ),
+                            if (!entry.isDir)
+                              const PopupMenuItem<EntryMenuAction>(
+                                value: EntryMenuAction.share,
+                                child: Text('分享'),
+                              ),
                           ],
                           icon: const Icon(Icons.more_horiz),
                         ),
@@ -7128,23 +7424,28 @@ class _CategoryEntriesPageState extends State<CategoryEntriesPage> {
                               tooltip: '更多操作',
                               onSelected: (action) =>
                                   _runEntryAction(entry, action),
-                              itemBuilder: (context) => const [
-                                PopupMenuItem<EntryMenuAction>(
+                              itemBuilder: (context) => [
+                                const PopupMenuItem<EntryMenuAction>(
                                   value: EntryMenuAction.delete,
                                   child: Text('删除'),
                                 ),
-                                PopupMenuItem<EntryMenuAction>(
+                                const PopupMenuItem<EntryMenuAction>(
                                   value: EntryMenuAction.move,
                                   child: Text('移动'),
                                 ),
-                                PopupMenuItem<EntryMenuAction>(
+                                const PopupMenuItem<EntryMenuAction>(
                                   value: EntryMenuAction.rename,
                                   child: Text('重命名'),
                                 ),
-                                PopupMenuItem<EntryMenuAction>(
+                                const PopupMenuItem<EntryMenuAction>(
                                   value: EntryMenuAction.download,
                                   child: Text('下载'),
                                 ),
+                                if (!entry.isDir)
+                                  const PopupMenuItem<EntryMenuAction>(
+                                    value: EntryMenuAction.share,
+                                    child: Text('分享'),
+                                  ),
                               ],
                               icon: const Icon(Icons.more_horiz),
                             ),
