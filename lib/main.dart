@@ -3018,13 +3018,54 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
       return;
     }
 
+    if (entry.isPreviewableMarkdown) {
+      if (entry.size > markdownPreviewMaxBytes) {
+        if (!mounted) {
+          return;
+        }
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Markdown 文件超过 2 MB，暂不支持预览，请下载后查看。')),
+        );
+        return;
+      }
+
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (context) => MarkdownPreviewPage(
+            title: entry.name,
+            loadMarkdown: () async {
+              final response = await _sendTextRequest(
+                _buildRawResourceUri(baseUri, entry.path),
+                headers: {
+                  'X-Auth': token,
+                  HttpHeaders.acceptHeader:
+                      'text/markdown, text/plain;q=0.9, */*;q=0.1',
+                },
+                timeout: const Duration(seconds: 20),
+              );
+              if (response.statusCode < 200 || response.statusCode >= 300) {
+                throw NasApiException(
+                  '读取 Markdown 失败：${response.statusCode}。${_compactBody(response.body)}',
+                );
+              }
+              return response.body;
+            },
+          ),
+        ),
+      );
+      return;
+    }
+
     if (!mounted) {
       return;
     }
 
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('当前支持图片、音频和视频。视频会在浏览器中打开播放。')));
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('当前支持图片、音频、视频和 Markdown。视频会在浏览器中打开播放。'),
+      ),
+    );
   }
 
   Future<void> _openVideoExternally(FileBrowserEntry entry) async {
@@ -8519,6 +8560,7 @@ class FileBrowserEntry {
   bool get isPreviewableImage => !isDir && isPreviewableImagePath(name);
   bool get isPreviewableAudio => !isDir && isPreviewableAudioPath(name);
   bool get isPreviewableVideo => !isDir && isPreviewableVideoPath(name);
+  bool get isPreviewableMarkdown => !isDir && isPreviewableMarkdownPath(name);
   bool get isCommonDocument => !isDir && isCommonDocumentPath(name);
 }
 
@@ -8614,6 +8656,227 @@ class ImagePreviewPage extends StatelessWidget {
       ),
     );
   }
+}
+
+class MarkdownPreviewPage extends StatefulWidget {
+  const MarkdownPreviewPage({
+    required this.title,
+    required this.loadMarkdown,
+    super.key,
+  });
+
+  final String title;
+  final Future<String> Function() loadMarkdown;
+
+  @override
+  State<MarkdownPreviewPage> createState() => _MarkdownPreviewPageState();
+}
+
+class _MarkdownPreviewPageState extends State<MarkdownPreviewPage> {
+  static const _tooLargeMessage = 'Markdown 文件超过 2 MB，暂不支持预览，请下载后查看。';
+
+  String? _content;
+  String? _error;
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    try {
+      var text = await widget.loadMarkdown();
+      if (!mounted) {
+        return;
+      }
+      if (text.startsWith('\uFEFF')) {
+        text = text.substring(1);
+      }
+      if (text.length > markdownPreviewMaxBytes) {
+        throw const NasApiException(_tooLargeMessage);
+      }
+      setState(() {
+        _content = text;
+        _loading = false;
+      });
+    } on NasApiException catch (error) {
+      _showError(error.message);
+    } on FormatException {
+      _showError('文件不是有效的 UTF-8 文本，可能为 GBK 编码。');
+    } catch (error) {
+      _showError('读取 Markdown 失败：$error');
+    }
+  }
+
+  void _showError(String message) {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _content = null;
+      _error = message;
+      _loading = false;
+    });
+  }
+
+  Widget _buildBody(ThemeData theme) {
+    if (_loading) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const CircularProgressIndicator(),
+            const SizedBox(height: 14),
+            Text(
+              '正在读取 Markdown...',
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: const Color(0xFF64748B),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (_error != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.description_outlined,
+                size: 52,
+                color: Color(0xFF94A3B8),
+              ),
+              const SizedBox(height: 14),
+              Text(
+                _error!,
+                textAlign: TextAlign.center,
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: const Color(0xFFB42318),
+                  height: 1.5,
+                ),
+              ),
+              const SizedBox(height: 16),
+              FilledButton.tonalIcon(
+                onPressed: _load,
+                icon: const Icon(Icons.refresh, size: 18),
+                label: const Text('重试'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    final content = _content ?? '';
+    if (content.trim().isEmpty) {
+      return Center(
+        child: Text(
+          '文件为空。',
+          style: theme.textTheme.bodyMedium?.copyWith(
+            color: const Color(0xFF64748B),
+          ),
+        ),
+      );
+    }
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
+      child: MarkdownBody(
+        data: content,
+        selectable: true,
+        softLineBreak: true,
+        extensionSet: md.ExtensionSet.gitHubFlavored,
+        styleSheet: buildNasMarkdownStyle(context),
+        onTapLink: (text, href, title) async {
+          final uri = href == null ? null : Uri.tryParse(href);
+          final scheme = uri?.scheme.toLowerCase();
+          if (uri != null &&
+              (scheme == 'http' || scheme == 'https' || scheme == 'mailto')) {
+            await launchUrl(uri, mode: LaunchMode.externalApplication);
+            return;
+          }
+          if (!mounted) {
+            return;
+          }
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('暂不支持打开该链接。')));
+        },
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(
+          widget.title,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        actions: [
+          IconButton(
+            tooltip: '刷新',
+            onPressed: _loading ? null : _load,
+            icon: const Icon(Icons.refresh),
+          ),
+        ],
+      ),
+      body: SafeArea(child: _buildBody(theme)),
+    );
+  }
+}
+
+MarkdownStyleSheet buildNasMarkdownStyle(BuildContext context) {
+  final base = MarkdownStyleSheet.fromTheme(Theme.of(context));
+  return base.copyWith(
+    p: const TextStyle(fontSize: 14, height: 1.55),
+    h1: const TextStyle(fontSize: 19, fontWeight: FontWeight.w700, height: 1.4),
+    h2: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700, height: 1.4),
+    h3: const TextStyle(
+      fontSize: 15.5,
+      fontWeight: FontWeight.w600,
+      height: 1.4,
+    ),
+    code: const TextStyle(
+      fontFamily: 'monospace',
+      fontSize: 12.5,
+      backgroundColor: Color(0xFFF1F5F9),
+    ),
+    codeblockDecoration: BoxDecoration(
+      color: const Color(0xFFF8FAFC),
+      borderRadius: BorderRadius.circular(8),
+      border: Border.all(color: const Color(0xFFE2E8F0)),
+    ),
+    codeblockPadding: const EdgeInsets.all(10),
+    blockquoteDecoration: BoxDecoration(
+      color: const Color(0xFFF8FAFC),
+      border: const Border(
+        left: BorderSide(color: Color(0xFF6D28D9), width: 3),
+      ),
+    ),
+    blockquotePadding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
+    tableBorder: TableBorder.all(color: const Color(0xFFE2E8F0)),
+    tableCellsPadding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+    tableHead: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700),
+    tableBody: const TextStyle(fontSize: 12.5, height: 1.4),
+    horizontalRuleDecoration: const BoxDecoration(
+      border: Border(top: BorderSide(color: Color(0xFFE2E8F0))),
+    ),
+  );
 }
 
 /// 清晰度档：直接暴露参数，不做"高清/流畅"之类命名。
@@ -11255,6 +11518,13 @@ bool isPreviewableVideoPath(String path) {
       normalized.endsWith('.m2ts');
 }
 
+const markdownPreviewMaxBytes = 2 * 1024 * 1024;
+
+bool isPreviewableMarkdownPath(String path) {
+  final normalized = path.toLowerCase();
+  return normalized.endsWith('.md') || normalized.endsWith('.markdown');
+}
+
 bool isCommonDocumentPath(String path) {
   final normalized = path.toLowerCase();
   return normalized.endsWith('.pdf') ||
@@ -11266,6 +11536,7 @@ bool isCommonDocumentPath(String path) {
       normalized.endsWith('.pptx') ||
       normalized.endsWith('.txt') ||
       normalized.endsWith('.md') ||
+      normalized.endsWith('.markdown') ||
       normalized.endsWith('.csv') ||
       normalized.endsWith('.rtf') ||
       normalized.endsWith('.odt') ||
@@ -12884,7 +13155,6 @@ class _AgentChatPageState extends State<AgentChatPage> {
   }
 
   Widget _buildMarkdown(String data) {
-    final base = MarkdownStyleSheet.fromTheme(Theme.of(context));
     return MarkdownBody(
       data: data,
       selectable: true,
@@ -12896,37 +13166,7 @@ class _AgentChatPageState extends State<AgentChatPage> {
           await launchUrl(uri, mode: LaunchMode.externalApplication);
         }
       },
-      styleSheet: base.copyWith(
-        p: const TextStyle(fontSize: 14, height: 1.55),
-        h1: const TextStyle(fontSize: 19, fontWeight: FontWeight.w700, height: 1.4),
-        h2: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700, height: 1.4),
-        h3: const TextStyle(fontSize: 15.5, fontWeight: FontWeight.w600, height: 1.4),
-        code: const TextStyle(
-          fontFamily: 'monospace',
-          fontSize: 12.5,
-          backgroundColor: Color(0xFFF1F5F9),
-        ),
-        codeblockDecoration: BoxDecoration(
-          color: const Color(0xFFF8FAFC),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: const Color(0xFFE2E8F0)),
-        ),
-        codeblockPadding: const EdgeInsets.all(10),
-        blockquoteDecoration: BoxDecoration(
-          color: const Color(0xFFF8FAFC),
-          border: const Border(
-            left: BorderSide(color: Color(0xFF6D28D9), width: 3),
-          ),
-        ),
-        blockquotePadding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
-        tableBorder: TableBorder.all(color: const Color(0xFFE2E8F0)),
-        tableCellsPadding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-        tableHead: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700),
-        tableBody: const TextStyle(fontSize: 12.5, height: 1.4),
-        horizontalRuleDecoration: const BoxDecoration(
-          border: Border(top: BorderSide(color: Color(0xFFE2E8F0))),
-        ),
-      ),
+      styleSheet: buildNasMarkdownStyle(context),
     );
   }
 

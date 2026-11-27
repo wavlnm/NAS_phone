@@ -1,3 +1,4 @@
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:nas_phone/main.dart';
@@ -24,10 +25,18 @@ void main() {
     expect(isPreviewableVideoPath('/notes.txt'), isFalse);
   });
 
+  test('detects previewable markdown paths', () {
+    expect(isPreviewableMarkdownPath('/README.MD'), isTrue);
+    expect(isPreviewableMarkdownPath('/guide.markdown'), isTrue);
+    expect(isPreviewableMarkdownPath('/notes.txt'), isFalse);
+    expect(isPreviewableMarkdownPath('/photo.png'), isFalse);
+  });
+
   test('detects common document paths', () {
     expect(isCommonDocumentPath('/report.PDF'), isTrue);
     expect(isCommonDocumentPath('/sheet.xlsx'), isTrue);
     expect(isCommonDocumentPath('/slides.pptx'), isTrue);
+    expect(isCommonDocumentPath('/README.markdown'), isTrue);
     expect(isCommonDocumentPath('/movie.mp4'), isFalse);
     expect(isCommonDocumentPath('/archive.zip'), isFalse);
   });
@@ -89,6 +98,21 @@ void main() {
     });
 
     expect(directory.items.map((entry) => entry.name).toList(), ['照片', '.env']);
+  });
+
+  testWidgets('renders markdown preview content', (tester) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: MarkdownPreviewPage(
+          title: 'README.md',
+          loadMarkdown: () async => '# 标题\n\n正文',
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('标题', findRichText: true), findsOneWidget);
+    expect(find.textContaining('正文', findRichText: true), findsOneWidget);
   });
 
   testWidgets('renders NAS host probe shell', (tester) async {
