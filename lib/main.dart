@@ -7742,6 +7742,9 @@ const List<_ScreenQuality> _cameraQualities = [
   _ScreenQuality(320, 60, 'jpeg'),
 ];
 
+/// 默认档下标：桌面 1280 q60、摄像头 640 q60（公网带宽也扛得住）。
+const int _defaultQualityIndex = 3;
+
 /// 侦测灵敏度：值越低越迟钝（只报大动作），越高越灵敏（也更容易被光线变化误报）。
 const List<String> _sensitivityOptions = ['low', 'mid', 'high'];
 
@@ -7781,7 +7784,7 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
   bool _failed = false;
   Timer? _timer;
   double _autoFps = 0;
-  _ScreenQuality _quality = _screenQualities[3];
+  _ScreenQuality _quality = _screenQualities[_defaultQualityIndex];
 
   /// 画面缩放/平移状态；放大后靠双指或拖动看细节。
   final TransformationController _transform = TransformationController();
@@ -7804,6 +7807,7 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
   bool _listening = false;
   String? _listenError;
   final AudioPlayer _listenPlayer = AudioPlayer();
+  StreamSubscription<PlayerState>? _listenStateSub;
 
   List<_ScreenQuality> get _qualities =>
       widget.monitor ? _cameraQualities : _screenQualities;
@@ -7820,6 +7824,18 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
         const Duration(seconds: 5),
         (_) => _refreshMonitorStatus(),
       );
+      // 服务端到点会自己断流，播放器进入 idle/completed 后必须把"听现场"按钮复位，
+      // 否则图标一直亮着、也点不回监听状态。
+      _listenStateSub = _listenPlayer.playerStateStream.listen((state) {
+        if (state.processingState != ProcessingState.idle &&
+            state.processingState != ProcessingState.completed) {
+          return;
+        }
+        if (!mounted || !_listening) {
+          return;
+        }
+        setState(() => _listening = false);
+      });
     }
   }
 
@@ -7827,6 +7843,7 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
   void dispose() {
     _timer?.cancel();
     _statusTimer?.cancel();
+    _listenStateSub?.cancel();
     _client.close(force: true);
     _transform.dispose();
     _listenPlayer.dispose();
@@ -7872,8 +7889,7 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
   }
 
   Future<void> _loadPrefs() async {
-    // 默认档：桌面 1280 q60，摄像头 640 q60（公网也扛得住）
-    _quality = _qualities[widget.monitor ? 3 : 3];
+    _quality = _qualities[_defaultQualityIndex];
     try {
       final prefs = await SharedPreferences.getInstance();
       final saved = prefs.getString(_qualityPrefsKey);
@@ -8312,7 +8328,6 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
     final clips = (_monitorStatus?['clipsToday'] as num?)?.toInt() ?? 0;
     final cameraOn = _monitorStatus?['camera'] is Map &&
         (_monitorStatus!['camera'] as Map)['running'] == true;
-    final sensitivityItems = _sensitivityOptions;
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
@@ -8334,7 +8349,7 @@ class _ScreenViewPageState extends State<ScreenViewPage> {
           _buildDropdown<String>(
             label: '灵敏度',
             value: _sensitivity,
-            items: sensitivityItems,
+            items: _sensitivityOptions,
             text: _sensitivityLabel,
             onChanged: (value) => _applyDetect(_detectEnabled, value),
           ),
