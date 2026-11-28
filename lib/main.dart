@@ -4489,6 +4489,27 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
     );
   }
 
+  Future<void> _openGomokuToolPage() async {
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('请先连接电脑。')));
+      return;
+    }
+
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => GomokuToolPage(
+          baseUri: baseUri,
+          authToken: token,
+          authHeaders: _buildNasAuthHeaders,
+        ),
+      ),
+    );
+  }
+
   Future<void> _openScreenViewPage({bool monitor = false}) async {
     final baseUri = _baseUri;
     final token = _authToken;
@@ -6270,6 +6291,15 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
             backgroundColor: const Color(0xFFF1F5F9),
             foregroundColor: const Color(0xFF334155),
             onTap: _openTerminalCommandPage,
+          ),
+          const SizedBox(height: 14),
+          _ToolLauncherButton(
+            icon: Icons.grid_on_outlined,
+            title: '五子棋',
+            subtitle: '创建房间邀请好友对弈；可设置每步限时，关闭最后一个房间即停止进程。',
+            backgroundColor: const Color(0xFFFFF7ED),
+            foregroundColor: const Color(0xFF9A3412),
+            onTap: _openGomokuToolPage,
           ),
           const SizedBox(height: 14),
           _ToolLauncherButton(
@@ -10554,6 +10584,915 @@ String _formatDateTime(DateTime value) {
 }
 
 /// 音频转码兜底配置：直连播放失败时，请求电脑上的 ffmpeg 转成 MP3 再播。
+/// 五子棋房间管理页：创建房间、设置落子超时与有效期、复制链接/二维码、关闭房间。
+class GomokuToolPage extends StatefulWidget {
+  const GomokuToolPage({
+    required this.baseUri,
+    required this.authToken,
+    required this.authHeaders,
+    super.key,
+  });
+
+  final Uri baseUri;
+  final String authToken;
+  final Future<Map<String, String>> Function() authHeaders;
+
+  @override
+  State<GomokuToolPage> createState() => _GomokuToolPageState();
+}
+
+class _GomokuToolPageState extends State<GomokuToolPage> {
+  static const String _appId = 'gomoku';
+
+  final TextEditingController _timeoutController = TextEditingController(
+    text: '60',
+  );
+  final Map<String, Uint8List> _qrCache = <String, Uint8List>{};
+  final Set<String> _closingTokens = <String>{};
+
+  bool _loading = true;
+  bool _creating = false;
+  bool _running = false;
+  String? _error;
+  int _maxRooms = 8;
+  int _lifetimeHours = 6;
+  int _defaultLifetimeHours = 6;
+  int _maxLifetimeHours = 24;
+  List<_GomokuRoomInfo> _rooms = const <_GomokuRoomInfo>[];
+  Timer? _refreshTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+    _refreshTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => _load(silent: true),
+    );
+  }
+
+  @override
+  void dispose() {
+    _refreshTimer?.cancel();
+    _timeoutController.dispose();
+    super.dispose();
+  }
+
+  Future<Map<String, String>> _authHeaders() async {
+    final headers = await widget.authHeaders();
+    headers['X-Auth'] = widget.authToken;
+    return headers;
+  }
+
+  Uri _uri(String path) => widget.baseUri.replace(path: path);
+
+  Future<SimpleHttpResponse> _request(
+    String method,
+    String path, {
+    Map<String, dynamic>? body,
+    Duration timeout = const Duration(seconds: 15),
+  }) async {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 8);
+    try {
+      late HttpClientRequest request;
+      if (method == 'GET') {
+        request = await client.getUrl(_uri(path)).timeout(timeout);
+      } else if (method == 'DELETE') {
+        request = await client.deleteUrl(_uri(path)).timeout(timeout);
+      } else {
+        request = await client.postUrl(_uri(path)).timeout(timeout);
+      }
+
+      final headers = await _authHeaders();
+      headers.forEach(request.headers.set);
+
+      if (body != null) {
+        request.headers.contentType = ContentType(
+          'application',
+          'json',
+          charset: 'utf-8',
+        );
+        final payload = utf8.encode(jsonEncode(body));
+        request.contentLength = payload.length;
+        request.add(payload);
+      }
+
+      final response = await request.close().timeout(timeout);
+      final responseBody = await utf8
+          .decoder
+          .bind(response)
+          .join()
+          .timeout(timeout);
+      return SimpleHttpResponse(response.statusCode, responseBody);
+    } on TimeoutException {
+      throw const NasApiException('请求超时，请确认电脑仍然在线。');
+    } on SocketException catch (error) {
+      throw NasApiException('无法连接电脑：${error.message}');
+    } on HttpException catch (error) {
+      throw NasApiException('请求失败：${error.message}');
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> _load({bool silent = false}) async {
+    if (!silent && mounted) {
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
+    }
+
+    try {
+      final response = await _request(
+        'GET',
+        '/api/apps/$_appId/rooms',
+        timeout: const Duration(seconds: 12),
+      );
+      if (response.statusCode >= 300) {
+        throw NasApiException(
+          response.statusCode == 404
+              ? '电脑端还没有启用五子棋应用，请先更新电脑端。'
+              : _errorMessage(response.body, '读取房间列表失败。'),
+        );
+      }
+
+      final decoded = jsonDecode(response.body);
+      final data = decoded is Map
+          ? Map<String, dynamic>.from(decoded)
+          : <String, dynamic>{};
+      final rawRooms = data['rooms'];
+      final rooms = <_GomokuRoomInfo>[];
+      if (rawRooms is List) {
+        for (final item in rawRooms) {
+          if (item is Map) {
+            rooms.add(
+              _GomokuRoomInfo.fromJson(Map<String, dynamic>.from(item)),
+            );
+          }
+        }
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = null;
+        _running = data['running'] == true;
+        _maxRooms = (data['maxRooms'] as num?)?.toInt() ?? 8;
+        _defaultLifetimeHours =
+            (data['defaultRoomLifetimeHours'] as num?)?.toInt() ?? 6;
+        _maxLifetimeHours =
+            (data['maxRoomLifetimeHours'] as num?)?.toInt() ?? 24;
+        if (_maxLifetimeHours < 1) _maxLifetimeHours = 1;
+        if (_lifetimeHours > _maxLifetimeHours) {
+          _lifetimeHours = _maxLifetimeHours;
+        }
+        _rooms = rooms;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      if (silent && _rooms.isNotEmpty) {
+        return;
+      }
+      setState(() {
+        _loading = false;
+        _error = error is NasApiException
+            ? error.message
+            : '无法读取五子棋房间，请确认已连接电脑。';
+      });
+    }
+  }
+
+  List<int> get _lifetimeChoices {
+    final values = <int>{
+      1,
+      2,
+      4,
+      6,
+      12,
+      24,
+      _defaultLifetimeHours,
+      _maxLifetimeHours,
+    }.where((hours) => hours >= 1 && hours <= _maxLifetimeHours).toList()
+      ..sort();
+    if (values.isEmpty) {
+      values.add(1);
+    }
+    return values;
+  }
+
+  Future<void> _createRoom() async {
+    if (_creating) return;
+
+    final timeout = int.tryParse(_timeoutController.text.trim());
+    if (timeout == null || timeout < 15 || timeout > 600) {
+      _showSnack('落子超时时间需在 15–600 秒之间。');
+      return;
+    }
+
+    setState(() {
+      _creating = true;
+      _error = null;
+    });
+
+    try {
+      final response = await _request(
+        'POST',
+        '/api/apps/$_appId/rooms',
+        body: {
+          'expiresInSeconds': _lifetimeHours * 3600,
+          'options': {'moveTimeoutSeconds': timeout},
+        },
+        // 首次创建需要启动应用进程，给足启动时间。
+        timeout: const Duration(seconds: 50),
+      );
+
+      if (response.statusCode >= 300) {
+        throw NasApiException(
+          _errorMessage(response.body, '创建房间失败（${response.statusCode}）。'),
+        );
+      }
+
+      final decoded = jsonDecode(response.body);
+      final room = _GomokuRoomInfo.fromJson(
+        decoded is Map
+            ? Map<String, dynamic>.from(decoded)
+            : <String, dynamic>{},
+      );
+
+      if (!mounted) return;
+      setState(() => _creating = false);
+      await _load(silent: true);
+      if (!mounted) return;
+      await _showCreatedDialog(room);
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _creating = false);
+      _showSnack(
+        error is NasApiException ? error.message : '创建房间失败，请稍后重试。',
+      );
+    }
+  }
+
+  Future<void> _showCreatedDialog(_GomokuRoomInfo room) async {
+    final action = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('房间已创建'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              '先以房主身份进入房间（你执黑），再把分享链接发给好友。',
+              style: TextStyle(height: 1.6),
+            ),
+            const SizedBox(height: 12),
+            SelectableText(
+              room.url,
+              style: const TextStyle(fontSize: 12, height: 1.5),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              '每步限时 ${_timeoutController.text.trim()} 秒 · 有效期 $_lifetimeHours 小时',
+              style: TextStyle(
+                fontSize: 12,
+                color: Theme.of(dialogContext).colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop('copy'),
+            child: const Text('复制分享链接'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop('open'),
+            child: const Text('打开房主链接'),
+          ),
+        ],
+      ),
+    );
+
+    if (!mounted || action == null) return;
+    if (action == 'copy') {
+      await _copyText(room.url, '房间链接已复制');
+    } else if (action == 'open') {
+      await _openUrl(room.ownerUrl);
+    }
+  }
+
+  Future<void> _closeRoom(_GomokuRoomInfo room) async {
+    if (_closingTokens.contains(room.token)) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('关闭房间'),
+        content: const Text(
+          '关闭后链接立即失效。如果这是最后一个房间，五子棋应用进程也会停止。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('关闭房间'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    setState(() => _closingTokens.add(room.token));
+    try {
+      final response = await _request(
+        'DELETE',
+        '/api/apps/$_appId/rooms/${room.token}',
+        timeout: const Duration(seconds: 15),
+      );
+      if (response.statusCode >= 300 && response.statusCode != 404) {
+        throw NasApiException(
+          _errorMessage(response.body, '关闭房间失败（${response.statusCode}）。'),
+        );
+      }
+      if (!mounted) return;
+      _showSnack('房间已关闭');
+      await _load(silent: true);
+    } catch (error) {
+      if (!mounted) return;
+      _showSnack(
+        error is NasApiException ? error.message : '关闭房间失败，请稍后重试。',
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _closingTokens.remove(room.token));
+      }
+    }
+  }
+
+  Future<void> _openRoom(_GomokuRoomInfo room) => _openUrl(room.ownerUrl);
+
+  Future<void> _openUrl(String url) async {
+    final uri = Uri.tryParse(url);
+    if (uri == null) {
+      _showSnack('房间链接无效。');
+      return;
+    }
+
+    final launched = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!launched && mounted) {
+      _showSnack('无法打开浏览器，请复制链接后手动打开。');
+    }
+  }
+
+  Future<void> _copyText(String text, String message) async {
+    await Clipboard.setData(ClipboardData(text: text));
+    if (mounted) {
+      _showSnack(message);
+    }
+  }
+
+  void _showSnack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message), behavior: SnackBarBehavior.floating),
+    );
+  }
+
+  Future<Uint8List> _loadQr(String token) async {
+    final cached = _qrCache[token];
+    if (cached != null) return cached;
+
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 8);
+    try {
+      final request = await client
+          .getUrl(_uri('/api/apps/$_appId/rooms/$token/qr.png'))
+          .timeout(const Duration(seconds: 10));
+      final headers = await _authHeaders();
+      headers.forEach(request.headers.set);
+      final response = await request.close().timeout(
+        const Duration(seconds: 20),
+      );
+      if (response.statusCode >= 300) {
+        throw NasApiException('二维码加载失败：${response.statusCode}');
+      }
+
+      final builder = BytesBuilder(copy: false);
+      await for (final chunk in response) {
+        builder.add(chunk);
+      }
+      final bytes = builder.takeBytes();
+      _qrCache[token] = bytes;
+      return bytes;
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  void _showQrDialog(_GomokuRoomInfo room) {
+    final future = _loadQr(room.token);
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('房间二维码'),
+        content: SizedBox(
+          width: 280,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              FutureBuilder<Uint8List>(
+                future: future,
+                builder: (context, snapshot) {
+                  if (snapshot.connectionState != ConnectionState.done) {
+                    return const SizedBox(
+                      height: 240,
+                      child: Center(child: CircularProgressIndicator()),
+                    );
+                  }
+                  if (snapshot.hasError) {
+                    return SizedBox(
+                      height: 240,
+                      child: Center(
+                        child: Text(
+                          '${snapshot.error}',
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                    );
+                  }
+                  return ClipRRect(
+                    borderRadius: BorderRadius.circular(12),
+                    child: Image.memory(
+                      snapshot.data!,
+                      width: 240,
+                      height: 240,
+                      filterQuality: FilterQuality.medium,
+                    ),
+                  );
+                },
+              ),
+              const SizedBox(height: 12),
+              SelectableText(
+                room.url,
+                textAlign: TextAlign.center,
+                style: const TextStyle(fontSize: 12, height: 1.5),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _errorMessage(String body, String fallback) {
+    try {
+      final decoded = jsonDecode(body);
+      if (decoded is Map) {
+        final detail = decoded['detail']?.toString().trim();
+        if (detail != null && detail.isNotEmpty) {
+          return detail;
+        }
+        final code = decoded['error']?.toString();
+        if (code != null && code.isNotEmpty) {
+          return switch (code) {
+            'too_many_rooms' => '房间数量已达上限，请先关闭一个房间。',
+            'invalid_expiry' => '房间有效期不合法。',
+            'app_start_failed' => '应用启动失败，请查看电脑端日志。',
+            'app_room_create_failed' => '应用拒绝创建房间。',
+            'app_not_found' => '电脑端还没有安装五子棋应用。',
+            'room_not_found' => '房间不存在或已关闭。',
+            _ => '操作失败：$code',
+          };
+        }
+      }
+    } catch (_) {
+      // 忽略非 JSON 响应
+    }
+    return fallback;
+  }
+
+  String _remainingText(DateTime? expiresAt) {
+    if (expiresAt == null) return '有效期未知';
+    final remaining = expiresAt.difference(DateTime.now().toUtc());
+    if (remaining.isNegative) return '已过期';
+    if (remaining.inHours >= 1) {
+      return '剩余 ${remaining.inHours} 小时 ${remaining.inMinutes % 60} 分';
+    }
+    return '剩余 ${remaining.inMinutes} 分';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('五子棋'),
+        actions: [
+          IconButton(
+            tooltip: '刷新',
+            onPressed: _loading ? null : () => _load(),
+            icon: const Icon(Icons.refresh),
+          ),
+        ],
+      ),
+      body: RefreshIndicator(
+        onRefresh: () => _load(),
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.fromLTRB(18, 14, 18, 32),
+          children: [
+            _buildStatusCard(theme, colorScheme),
+            const SizedBox(height: 14),
+            _buildCreateCard(theme, colorScheme),
+            const SizedBox(height: 22),
+            Row(
+              children: [
+                Text(
+                  '我的房间',
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const Spacer(),
+                Text(
+                  '${_rooms.length} / $_maxRooms',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            if (_loading && _rooms.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 36),
+                child: Center(child: CircularProgressIndicator()),
+              )
+            else if (_error != null && _rooms.isEmpty)
+              _buildErrorCard(theme, colorScheme)
+            else if (_rooms.isEmpty)
+              _buildEmptyRooms(theme, colorScheme)
+            else
+              ..._rooms.map((room) => _buildRoomCard(room, theme, colorScheme)),
+            const SizedBox(height: 18),
+            Text(
+              '说明：只有手机端能创建房间；公开链接只用于加入已存在的房间。'
+              '关闭最后一个房间会停止五子棋进程，对局结束不会自动停止。',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+                height: 1.7,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStatusCard(ThemeData theme, ColorScheme colorScheme) {
+    final statusColor = _running ? const Color(0xFF1AA268) : colorScheme.outline;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
+      decoration: BoxDecoration(
+        color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.45),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 10,
+            height: 10,
+            decoration: BoxDecoration(
+              color: statusColor,
+              shape: BoxShape.circle,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              _running ? '五子棋进程运行中' : '五子棋进程未运行',
+              style: theme.textTheme.bodyMedium?.copyWith(
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          Text(
+            _running ? '运行中' : '空闲',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: statusColor,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCreateCard(ThemeData theme, ColorScheme colorScheme) {
+    final timeoutText = _timeoutController.text.trim();
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: colorScheme.surface,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: colorScheme.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '创建房间',
+            style: theme.textTheme.titleMedium?.copyWith(
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  '每步落子限时',
+                  style: theme.textTheme.bodyMedium,
+                ),
+              ),
+              SizedBox(
+                width: 86,
+                child: TextField(
+                  controller: _timeoutController,
+                  keyboardType: TextInputType.number,
+                  inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                  textAlign: TextAlign.center,
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    border: OutlineInputBorder(),
+                    contentPadding: EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 10,
+                    ),
+                  ),
+                  onChanged: (_) => setState(() {}),
+                ),
+              ),
+              const SizedBox(width: 8),
+              const Text('秒'),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 6,
+            children: [
+              for (final seconds in const [30, 60, 120, 300])
+                ChoiceChip(
+                  label: Text('$seconds 秒'),
+                  selected: timeoutText == '$seconds',
+                  onSelected: (_) {
+                    _timeoutController.text = '$seconds';
+                    setState(() {});
+                  },
+                ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              Expanded(
+                child: Text('房间有效期', style: theme.textTheme.bodyMedium),
+              ),
+              DropdownButton<int>(
+                value: _lifetimeChoices.contains(_lifetimeHours)
+                    ? _lifetimeHours
+                    : _lifetimeChoices.first,
+                underline: const SizedBox.shrink(),
+                items: [
+                  for (final hours in _lifetimeChoices)
+                    DropdownMenuItem(value: hours, child: Text('$hours 小时')),
+                ],
+                onChanged: (value) {
+                  if (value != null) {
+                    setState(() => _lifetimeHours = value);
+                  }
+                },
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              onPressed: _creating ? null : _createRoom,
+              icon: _creating
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.add_circle_outline),
+              label: Text(_creating ? '正在启动应用…' : '创建房间'),
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            '首次创建会启动五子棋进程，可能需要几秒。',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildErrorCard(ThemeData theme, ColorScheme colorScheme) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: colorScheme.errorContainer.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            _error!,
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: colorScheme.onErrorContainer,
+            ),
+          ),
+          const SizedBox(height: 10),
+          TextButton.icon(
+            onPressed: () => _load(),
+            icon: const Icon(Icons.refresh),
+            label: const Text('重试'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEmptyRooms(ThemeData theme, ColorScheme colorScheme) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 28),
+      decoration: BoxDecoration(
+        color: colorScheme.surfaceContainerHighest.withValues(alpha: 0.35),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Column(
+        children: [
+          Icon(
+            Icons.grid_on_outlined,
+            size: 34,
+            color: colorScheme.onSurfaceVariant,
+          ),
+          const SizedBox(height: 10),
+          Text(
+            '还没有房间',
+            style: theme.textTheme.titleSmall?.copyWith(
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '创建后把链接发给好友，对方打开即可加入。',
+            textAlign: TextAlign.center,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildRoomCard(
+    _GomokuRoomInfo room,
+    ThemeData theme,
+    ColorScheme colorScheme,
+  ) {
+    final closing = _closingTokens.contains(room.token);
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+      decoration: BoxDecoration(
+        color: colorScheme.surface,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: colorScheme.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.meeting_room_outlined, size: 18),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  '房间 ${room.shortToken}',
+                  style: theme.textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              Text(
+                closing ? '正在关闭…' : _remainingText(room.expiresAt),
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          SelectableText(
+            room.url,
+            maxLines: 1,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 6,
+            runSpacing: 2,
+            children: [
+              TextButton.icon(
+                onPressed: closing
+                    ? null
+                    : () => _copyText(room.url, '房间链接已复制'),
+                icon: const Icon(Icons.copy, size: 17),
+                label: const Text('复制链接'),
+              ),
+              TextButton.icon(
+                onPressed: closing ? null : () => _openRoom(room),
+                icon: const Icon(Icons.open_in_new, size: 17),
+                label: const Text('打开'),
+              ),
+              TextButton.icon(
+                onPressed: closing ? null : () => _showQrDialog(room),
+                icon: const Icon(Icons.qr_code_2, size: 18),
+                label: const Text('二维码'),
+              ),
+              TextButton.icon(
+                onPressed: closing ? null : () => _closeRoom(room),
+                style: TextButton.styleFrom(
+                  foregroundColor: colorScheme.error,
+                ),
+                icon: const Icon(Icons.delete_outline, size: 17),
+                label: Text(closing ? '关闭中…' : '关闭房间'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _GomokuRoomInfo {
+  const _GomokuRoomInfo({
+    required this.token,
+    required this.url,
+    required this.ownerUrl,
+    required this.expiresAt,
+  });
+
+  factory _GomokuRoomInfo.fromJson(Map<String, dynamic> json) {
+    final token = json['token']?.toString() ?? '';
+    final url = json['url']?.toString() ?? '';
+    final ownerUrl = json['ownerUrl']?.toString() ?? url;
+    final expiresText = json['expiresAt']?.toString();
+    return _GomokuRoomInfo(
+      token: token,
+      url: url,
+      ownerUrl: ownerUrl,
+      expiresAt: expiresText == null ? null : DateTime.tryParse(expiresText),
+    );
+  }
+
+  final String token;
+  final String url;
+  final String ownerUrl;
+  final DateTime? expiresAt;
+
+  String get shortToken => token.length <= 6
+      ? token.toUpperCase()
+      : token.substring(0, 6).toUpperCase();
+}
+
 class AudioTranscodeSource {
   const AudioTranscodeSource({
     required this.baseUri,
