@@ -10607,7 +10607,6 @@ class _GomokuToolPageState extends State<GomokuToolPage> {
   final TextEditingController _timeoutController = TextEditingController(
     text: '60',
   );
-  final Map<String, Uint8List> _qrCache = <String, Uint8List>{};
   final Set<String> _closingTokens = <String>{};
 
   bool _loading = true;
@@ -10822,16 +10821,18 @@ class _GomokuToolPageState extends State<GomokuToolPage> {
       );
 
       if (!mounted) return;
-      setState(() => _creating = false);
       await _load(silent: true);
       if (!mounted) return;
       await _showCreatedDialog(room);
     } catch (error) {
       if (!mounted) return;
-      setState(() => _creating = false);
       _showSnack(
         error is NasApiException ? error.message : '创建房间失败，请稍后重试。',
       );
+    } finally {
+      if (mounted) {
+        setState(() => _creating = false);
+      }
     }
   }
 
@@ -10845,12 +10846,12 @@ class _GomokuToolPageState extends State<GomokuToolPage> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              '先以房主身份进入房间（你执黑），再把分享链接发给好友。',
+              '先以房主身份进入房间（你执黑），进入后到列表里复制分享链接发给好友。',
               style: TextStyle(height: 1.6),
             ),
             const SizedBox(height: 12),
             SelectableText(
-              room.url,
+              room.ownerUrl,
               style: const TextStyle(fontSize: 12, height: 1.5),
             ),
             const SizedBox(height: 10),
@@ -10866,7 +10867,7 @@ class _GomokuToolPageState extends State<GomokuToolPage> {
         actions: [
           TextButton(
             onPressed: () => Navigator.of(dialogContext).pop('copy'),
-            child: const Text('复制分享链接'),
+            child: const Text('复制房主链接'),
           ),
           FilledButton(
             onPressed: () => Navigator.of(dialogContext).pop('open'),
@@ -10878,7 +10879,7 @@ class _GomokuToolPageState extends State<GomokuToolPage> {
 
     if (!mounted || action == null) return;
     if (action == 'copy') {
-      await _copyText(room.url, '房间链接已复制');
+      await _copyText(room.ownerUrl, '房主链接已复制');
     } else if (action == 'open') {
       await _openUrl(room.ownerUrl);
     }
@@ -10966,9 +10967,6 @@ class _GomokuToolPageState extends State<GomokuToolPage> {
   }
 
   Future<Uint8List> _loadQr(String token) async {
-    final cached = _qrCache[token];
-    if (cached != null) return cached;
-
     final client = HttpClient()
       ..connectionTimeout = const Duration(seconds: 8);
     try {
@@ -10988,9 +10986,7 @@ class _GomokuToolPageState extends State<GomokuToolPage> {
       await for (final chunk in response) {
         builder.add(chunk);
       }
-      final bytes = builder.takeBytes();
-      _qrCache[token] = bytes;
-      return bytes;
+      return builder.takeBytes();
     } finally {
       client.close(force: true);
     }
@@ -13513,7 +13509,8 @@ class AgentChatPage extends StatefulWidget {
   State<AgentChatPage> createState() => _AgentChatPageState();
 }
 
-class _AgentChatPageState extends State<AgentChatPage> {
+class _AgentChatPageState extends State<AgentChatPage>
+    with WidgetsBindingObserver {
   late final AgentApi _api;
   final TextEditingController _inputController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
@@ -13527,6 +13524,10 @@ class _AgentChatPageState extends State<AgentChatPage> {
   bool _loading = true;
   bool _polling = false;
   bool _sending = false;
+  DateTime? _pollStartedAt;
+  DateTime? _sendStartedAt;
+  int _pollToken = 0;
+  int _sendToken = 0;
   bool _deciding = false;
   bool _answeringQuestion = false;
   bool _modelConfigured = true;
@@ -13538,8 +13539,23 @@ class _AgentChatPageState extends State<AgentChatPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _api = AgentApi(widget.request);
     _bootstrap();
+    _startPollingTimer();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _timer?.cancel();
+    _inputController.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _startPollingTimer() {
+    _timer?.cancel();
     _timer = Timer.periodic(
       const Duration(milliseconds: 800),
       (_) => _poll(),
@@ -13547,11 +13563,28 @@ class _AgentChatPageState extends State<AgentChatPage> {
   }
 
   @override
-  void dispose() {
-    _timer?.cancel();
-    _inputController.dispose();
-    _scrollController.dispose();
-    super.dispose();
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed || !mounted) {
+      return;
+    }
+
+    final now = DateTime.now();
+    if (_sending &&
+        (_sendStartedAt == null ||
+            now.difference(_sendStartedAt!) > const Duration(seconds: 10))) {
+      _sendToken++;
+      _sendStartedAt = null;
+      setState(() {
+        _sending = false;
+      });
+    }
+
+    _startPollingTimer();
+    if (_current == null) {
+      _bootstrap();
+    } else {
+      _poll(force: true);
+    }
   }
 
   Future<void> _bootstrap() async {
@@ -13589,16 +13622,28 @@ class _AgentChatPageState extends State<AgentChatPage> {
     }
   }
 
-  Future<void> _poll() async {
+  Future<void> _poll({bool force = false}) async {
     final current = _current;
-    if (_polling || current == null) {
+    if (current == null) {
       return;
     }
 
+    final now = DateTime.now();
+    if (_polling) {
+      final startedAt = _pollStartedAt;
+      final stale = startedAt != null &&
+          now.difference(startedAt) > const Duration(seconds: 12);
+      if (!force && !stale) {
+        return;
+      }
+    }
+
+    final token = ++_pollToken;
     _polling = true;
+    _pollStartedAt = now;
     try {
       final detail = await _api.getSession(current.id);
-      if (!mounted) {
+      if (!mounted || token != _pollToken) {
         return;
       }
 
@@ -13620,6 +13665,9 @@ class _AgentChatPageState extends State<AgentChatPage> {
         _scrollToBottom();
       }
     } catch (error) {
+      if (token != _pollToken) {
+        return;
+      }
       _failures++;
       if (mounted && _failures >= 3) {
         setState(() {
@@ -13627,8 +13675,19 @@ class _AgentChatPageState extends State<AgentChatPage> {
         });
       }
     } finally {
-      _polling = false;
+      if (token == _pollToken) {
+        _polling = false;
+        _pollStartedAt = null;
+      }
     }
+  }
+
+  Future<void> _refreshChat() async {
+    if (_current == null) {
+      await _bootstrap();
+      return;
+    }
+    await _poll(force: true);
   }
 
   Future<void> _selectSession(String id) async {
@@ -13659,7 +13718,7 @@ class _AgentChatPageState extends State<AgentChatPage> {
       if (index >= 0) {
         _sessions[index] = detail.session;
       }
-      _scrollToBottom();
+      _jumpToLatest();
     } catch (error) {
       if (!mounted) {
         return;
@@ -13695,8 +13754,17 @@ class _AgentChatPageState extends State<AgentChatPage> {
 
   Future<void> _send() async {
     final text = _inputController.text.trim();
-    if (text.isEmpty || _sending) {
+    if (text.isEmpty) {
       return;
+    }
+
+    final now = DateTime.now();
+    if (_sending) {
+      final startedAt = _sendStartedAt;
+      if (startedAt == null ||
+          now.difference(startedAt) < const Duration(seconds: 20)) {
+        return;
+      }
     }
 
     if (!_modelConfigured) {
@@ -13713,24 +13781,31 @@ class _AgentChatPageState extends State<AgentChatPage> {
       }
     }
 
+    final token = ++_sendToken;
+    _sendStartedAt = now;
     setState(() {
       _sending = true;
       _error = null;
     });
     try {
       await _api.sendMessage(_current!.id, text);
-      if (!mounted) {
+      if (!mounted || token != _sendToken) {
         return;
       }
       _inputController.clear();
-      await _poll();
+      await _poll(force: true);
     } catch (error) {
-      _toast(error is NasApiException ? error.message : '$error');
+      if (token == _sendToken) {
+        _toast(error is NasApiException ? error.message : '$error');
+      }
     } finally {
-      if (mounted) {
-        setState(() {
-          _sending = false;
-        });
+      if (token == _sendToken) {
+        _sendStartedAt = null;
+        if (mounted) {
+          setState(() {
+            _sending = false;
+          });
+        }
       }
     }
   }
@@ -14054,6 +14129,24 @@ class _AgentChatPageState extends State<AgentChatPage> {
     });
   }
 
+  /// 刚进入会话时 ListView 还没测量完，maxScrollExtent 会偏小；
+  /// 连续几帧跳到底部，等 Markdown / 工具块完成布局后再落位。
+  Future<void> _jumpToLatest() async {
+    for (var attempt = 0; attempt < 8; attempt++) {
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted || !_scrollController.hasClients) {
+        return;
+      }
+      final target = _scrollController.position.maxScrollExtent;
+      if ((_scrollController.offset - target).abs() > 0.5) {
+        _scrollController.jumpTo(target);
+      }
+      if (attempt < 7) {
+        await Future<void>.delayed(const Duration(milliseconds: 120));
+      }
+    }
+  }
+
   String _formatTime(int millis) {
     if (millis <= 0) {
       return '';
@@ -14071,6 +14164,11 @@ class _AgentChatPageState extends State<AgentChatPage> {
       appBar: AppBar(
         title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
         actions: [
+          IconButton(
+            tooltip: '刷新对话',
+            onPressed: _refreshChat,
+            icon: const Icon(Icons.refresh),
+          ),
           IconButton(
             tooltip: '会话列表',
             onPressed: _openSessions,
@@ -14126,13 +14224,43 @@ class _AgentChatPageState extends State<AgentChatPage> {
                 ),
               ),
             if (_error != null)
-              Container(
-                width: double.infinity,
+              Material(
                 color: const Color(0xFFFEF2F2),
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                child: Text(
-                  _error!,
-                  style: const TextStyle(fontSize: 12, color: Color(0xFFB42318)),
+                child: InkWell(
+                  onTap: _refreshChat,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 8,
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.refresh,
+                          size: 14,
+                          color: Color(0xFFB42318),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            _error!,
+                            style: const TextStyle(
+                              fontSize: 12,
+                              color: Color(0xFFB42318),
+                            ),
+                          ),
+                        ),
+                        const Text(
+                          '点此重试',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Color(0xFFB42318),
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
                 ),
               ),
             if (_autonomous)
