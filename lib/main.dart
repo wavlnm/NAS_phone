@@ -3000,14 +3000,9 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
             audioUri: _buildRawDownloadUri(baseUri, entry.path),
             authToken: token,
             authHeaders: _buildNasAuthHeaders,
-            // 直连失败时（例如 FLAC）自动改走服务端转码；FLAC 直接转码省一次等待
-            transcode: AudioTranscodeSource(
-              baseUri: baseUri,
-              path: entry.path,
-              authToken: token,
-              authHeaders: _buildNasAuthHeaders,
-              transcodeFirst: entry.name.toLowerCase().endsWith('.flac'),
-            ),
+            baseUri: baseUri,
+            resourcePath: entry.path,
+            directoryPath: _parentDirectoryPath(entry.path),
           ),
         ),
       );
@@ -11699,13 +11694,40 @@ class AudioTranscodeSource {
   final bool transcodeFirst;
 }
 
+class _AudioTrack {
+  const _AudioTrack({required this.name, required this.path});
+
+  final String name;
+  final String path;
+}
+
+enum _PlaybackMode { sequential, repeatAll, repeatOne, shuffle }
+
+extension on _PlaybackMode {
+  String get label => switch (this) {
+        _PlaybackMode.sequential => '顺序播放',
+        _PlaybackMode.repeatAll => '列表循环',
+        _PlaybackMode.repeatOne => '单曲循环',
+        _PlaybackMode.shuffle => '随机播放',
+      };
+
+  IconData get icon => switch (this) {
+        _PlaybackMode.sequential => Icons.playlist_play_rounded,
+        _PlaybackMode.repeatAll => Icons.repeat_rounded,
+        _PlaybackMode.repeatOne => Icons.repeat_one_rounded,
+        _PlaybackMode.shuffle => Icons.shuffle_rounded,
+      };
+}
+
 class AudioPreviewPage extends StatefulWidget {
   const AudioPreviewPage({
     required this.title,
     required this.audioUri,
     required this.authToken,
     required this.authHeaders,
-    this.transcode,
+    required this.baseUri,
+    required this.resourcePath,
+    required this.directoryPath,
     super.key,
   });
 
@@ -11713,7 +11735,9 @@ class AudioPreviewPage extends StatefulWidget {
   final Uri audioUri;
   final String authToken;
   final Future<Map<String, String>> Function() authHeaders;
-  final AudioTranscodeSource? transcode;
+  final Uri baseUri;
+  final String resourcePath;
+  final String directoryPath;
 
   @override
   State<AudioPreviewPage> createState() => _AudioPreviewPageState();
@@ -11739,10 +11763,35 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
   String? _lyricsError;
   bool _lyricsLoading = false;
   bool _positionRestored = false;
+  late _AudioTrack _currentTrack;
+  List<_AudioTrack> _playlist = [];
+  int _playlistIndex = 0;
+  bool _playlistLoading = true;
+  _PlaybackMode _mode = _PlaybackMode.repeatAll;
+  bool _handlingCompletion = false;
+
+  String get _currentName => _currentTrack.name;
+
+  Uri _rawUriFor(_AudioTrack track) => widget.baseUri.replace(
+    path: '/api/filebrowser/raw${_encodeResourcePath(track.path)}',
+  );
+
+  AudioTranscodeSource _transcodeFor(_AudioTrack track) => AudioTranscodeSource(
+    baseUri: widget.baseUri,
+    path: track.path,
+    authToken: widget.authToken,
+    authHeaders: widget.authHeaders,
+    transcodeFirst: track.name.toLowerCase().endsWith('.flac'),
+  );
 
   @override
   void initState() {
     super.initState();
+    _currentTrack = _AudioTrack(
+      name: widget.title,
+      path: widget.resourcePath,
+    );
+    _playlist = [_currentTrack];
 
     _positionSubscription = _player.positionStream.listen((position) {
       if (!mounted || _dragValueMs != null) {
@@ -11766,8 +11815,12 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
 
     _playerStateSubscription = _player.playerStateStream.listen((state) {
       if (state.processingState == ProcessingState.completed) {
-        unawaited(_player.pause());
-        unawaited(_player.seek(Duration.zero));
+        if (!_handlingCompletion) {
+          _handlingCompletion = true;
+          unawaited(_handleCompleted());
+        }
+      } else {
+        _handlingCompletion = false;
       }
 
       if (!mounted) {
@@ -11779,10 +11832,9 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
       });
     });
 
-    unawaited(
-      _initializeAudio().then((_) => _restorePositionFromNas()),
-    );
+    unawaited(_initializeAudio(_currentTrack).then((_) => _restorePositionFromNas()));
     unawaited(_loadLocalLyrics());
+    unawaited(_loadPlaylist());
   }
 
   Future<Map<String, String>> _nasHeaders() async {
@@ -11791,11 +11843,11 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
     return headers;
   }
 
-  Uri _nasRawUri(String resourcePath) => widget.audioUri.replace(
+  Uri _nasRawUri(String resourcePath) => widget.baseUri.replace(
     path: '/api/filebrowser/raw${_encodeResourcePath(resourcePath)}',
   );
 
-  Uri _nasResourceUri(String resourcePath) => widget.audioUri.replace(
+  Uri _nasResourceUri(String resourcePath) => widget.baseUri.replace(
     path: '/api/filebrowser/resources${_encodeResourcePath(resourcePath)}',
     queryParameters: const {'override': 'true'},
   );
@@ -11867,10 +11919,11 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
   }
 
   Future<void> _loadLocalLyrics() async {
+    final track = _currentTrack;
     try {
-      for (final key in lyricsKeysForFileName(widget.title)) {
+      for (final key in lyricsKeysForFileName(track.name)) {
         final existing = await _readNasText(lyricsResourcePathForKey(key));
-        if (!mounted) {
+        if (!mounted || !identical(_currentTrack, track)) {
           return;
         }
         if (existing != null && isUsableLyrics(existing)) {
@@ -11889,13 +11942,14 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
     if (_lyricsLoading) {
       return;
     }
+    final track = _currentTrack;
     setState(() {
       _lyricsLoading = true;
       _lyricsError = null;
     });
     try {
       final result = await _fetchLyricsFromLrclib();
-      if (!mounted) {
+      if (!mounted || !identical(_currentTrack, track)) {
         return;
       }
       setState(() {
@@ -11908,19 +11962,19 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
         // 歌词可以先展示，写入失败不阻塞
       }
     } on NasApiException catch (error) {
-      if (mounted) {
+      if (mounted && identical(_currentTrack, track)) {
         setState(() {
           _lyricsError = error.message;
         });
       }
     } catch (error) {
-      if (mounted) {
+      if (mounted && identical(_currentTrack, track)) {
         setState(() {
           _lyricsError = '歌词获取失败：$error';
         });
       }
     } finally {
-      if (mounted) {
+      if (mounted && identical(_currentTrack, track)) {
         setState(() {
           _lyricsLoading = false;
         });
@@ -11929,7 +11983,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
   }
 
   Future<LyricsFetchResult> _fetchLyricsFromLrclib() async {
-    final queries = lyricsQueriesForFileName(widget.title);
+    final queries = lyricsQueriesForFileName(_currentName);
     final client = HttpClient()
       ..connectionTimeout = const Duration(seconds: 10);
     LyricsFetchResult? best;
@@ -11951,7 +12005,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
         }
 
         try {
-          final uri = widget.audioUri.replace(
+          final uri = widget.baseUri.replace(
             path: '/api/music/lyrics/search',
             queryParameters: params,
           );
@@ -12087,14 +12141,18 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
     if (_positionRestored || _duration <= Duration.zero) {
       return;
     }
+    final track = _currentTrack;
     _positionRestored = true;
     try {
       final text = await _readNasText('/音乐播放器/player.json');
+      if (!mounted || !identical(_currentTrack, track)) {
+        return;
+      }
       if (text == null || text.trim().isEmpty) {
         return;
       }
       final data = jsonDecode(text);
-      if (data is! Map || data['title']?.toString() != widget.title) {
+      if (data is! Map || data['title']?.toString() != track.name) {
         return;
       }
       final seconds = (data['position'] as num?)?.toDouble() ?? 0;
@@ -12106,7 +12164,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
         return;
       }
       await _player.seek(target);
-      if (mounted) {
+      if (mounted && identical(_currentTrack, track)) {
         setState(() {
           _position = target;
         });
@@ -12125,7 +12183,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
       position = Duration.zero;
     }
     final payload = jsonEncode({
-      'title': widget.title,
+      'title': _currentName,
       'position': position.inMilliseconds / 1000.0,
     });
     try {
@@ -12135,23 +12193,320 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
     }
   }
 
-  Future<void> _initializeAudio() async {
-    final transcode = widget.transcode;
-    if (transcode != null && transcode.transcodeFirst && !_triedTranscode) {
-      _triedTranscode = true;
-      await _initializeTranscoded();
+  Future<FileBrowserDirectory> _fetchPlaylistDirectory() async {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10);
+    try {
+      final uri = widget.baseUri.replace(
+        path:
+            '/api/filebrowser/resources${_encodeResourcePath(widget.directoryPath)}',
+      );
+      final request = await client
+          .getUrl(uri)
+          .timeout(const Duration(seconds: 15));
+      (await _nasHeaders()).forEach(request.headers.set);
+      final response = await request.close().timeout(
+        const Duration(seconds: 20),
+      );
+      final text = await utf8.decodeStream(response).timeout(
+        const Duration(seconds: 20),
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw NasApiException('读取播放列表失败：${response.statusCode}。');
+      }
+      final decoded = jsonDecode(text);
+      if (decoded is! Map) {
+        throw const NasApiException('播放列表接口返回了无法解析的内容。');
+      }
+      return FileBrowserDirectory.fromJson(
+        Map<String, dynamic>.from(decoded),
+      );
+    } on TimeoutException {
+      throw const NasApiException('读取播放列表超时。');
+    } on SocketException catch (error) {
+      throw NasApiException('无法连接电脑：${error.message}');
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> _loadPlaylist() async {
+    try {
+      final directory = await _fetchPlaylistDirectory();
+      final tracks = directory.items
+          .where((entry) => entry.isPreviewableAudio)
+          .map((entry) => _AudioTrack(name: entry.name, path: entry.path))
+          .toList()
+        ..sort(
+          (left, right) =>
+              left.name.toLowerCase().compareTo(right.name.toLowerCase()),
+        );
+      if (tracks.isEmpty) {
+        tracks.add(_currentTrack);
+      }
+      var index = tracks.indexWhere((track) => track.path == _currentTrack.path);
+      if (index < 0) {
+        tracks.insert(0, _currentTrack);
+        index = 0;
+      }
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _playlist = tracks;
+        _playlistIndex = index;
+        _playlistLoading = false;
+      });
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _playlistLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _playTrackAt(int index, {bool autoplay = true}) async {
+    if (_isPreparing || index < 0 || index >= _playlist.length) {
       return;
+    }
+    final track = _playlist[index];
+    if (_playlistIndex == index &&
+        _currentTrack.path == track.path &&
+        !_isPreparing &&
+        _error == null) {
+      if (autoplay && !_isPlaying) {
+        if (_player.processingState == ProcessingState.completed) {
+          await _player.seek(Duration.zero);
+        }
+        await _player.play();
+      }
+      return;
+    }
+
+    setState(() {
+      _isPreparing = true;
+    });
+    unawaited(_savePlayerState());
+    await _player.stop();
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _playlistIndex = index;
+      _currentTrack = track;
+      _position = Duration.zero;
+      _duration = Duration.zero;
+      _dragValueMs = null;
+      _isPreparing = true;
+      _isPlaying = false;
+      _error = null;
+      _preparingLabel = null;
+      _triedTranscode = false;
+      _positionRestored = false;
+      _lyricsText = null;
+      _lyricsError = null;
+      _lyricsLoading = false;
+    });
+    unawaited(_loadLocalLyrics());
+
+    final ready = await _initializeAudio(track);
+    if (!mounted || !identical(_currentTrack, track) || !ready) {
+      return;
+    }
+    if (autoplay) {
+      await _player.play();
+    }
+  }
+
+  Future<void> _handleCompleted() async {
+    try {
+      if (!mounted) {
+        return;
+      }
+      if (_mode == _PlaybackMode.repeatOne) {
+        await _player.seek(Duration.zero);
+        await _player.play();
+        return;
+      }
+      final next = _nextIndex(auto: true);
+      if (next == null) {
+        await _player.pause();
+        await _player.seek(Duration.zero);
+        return;
+      }
+      if (next == _playlistIndex) {
+        await _player.seek(Duration.zero);
+        await _player.play();
+        return;
+      }
+      await _playTrackAt(next);
+    } finally {
+      _handlingCompletion = false;
+    }
+  }
+
+  int? _nextIndex({required bool auto}) {
+    if (_playlist.isEmpty) {
+      return null;
+    }
+    final length = _playlist.length;
+    switch (_mode) {
+      case _PlaybackMode.sequential:
+        return _playlistIndex + 1 < length ? _playlistIndex + 1 : null;
+      case _PlaybackMode.repeatAll:
+        return length == 1 ? 0 : (_playlistIndex + 1) % length;
+      case _PlaybackMode.repeatOne:
+        if (auto) {
+          return null;
+        }
+        return _playlistIndex + 1 < length ? _playlistIndex + 1 : null;
+      case _PlaybackMode.shuffle:
+        if (length == 1) {
+          return 0;
+        }
+        var next = _playlistIndex;
+        while (next == _playlistIndex) {
+          next = Random().nextInt(length);
+        }
+        return next;
+    }
+  }
+
+  Future<void> _playPrevious() async {
+    if (_playlist.length <= 1) {
+      await _player.seek(Duration.zero);
+      return;
+    }
+    if (_position >= const Duration(seconds: 3)) {
+      await _player.seek(Duration.zero);
+      return;
+    }
+    var index = _playlistIndex - 1;
+    if (index < 0) {
+      if (_mode == _PlaybackMode.repeatAll ||
+          _mode == _PlaybackMode.shuffle) {
+        index = _playlist.length - 1;
+      } else {
+        return;
+      }
+    }
+    await _playTrackAt(index);
+  }
+
+  Future<void> _playNext() async {
+    final next = _nextIndex(auto: false);
+    if (next == null) {
+      return;
+    }
+    if (next == _playlistIndex) {
+      await _player.seek(Duration.zero);
+      await _player.play();
+      return;
+    }
+    await _playTrackAt(next);
+  }
+
+  void _cycleMode() {
+    final values = _PlaybackMode.values;
+    final next = values[(_mode.index + 1) % values.length];
+    setState(() {
+      _mode = next;
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('播放模式：${next.label}')),
+    );
+  }
+
+  Future<void> _showPlaylist() async {
+    final tracks = List<_AudioTrack>.of(_playlist);
+    final currentIndex = _playlistIndex;
+    final selected = await showModalBottomSheet<int>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.white,
+      builder: (sheetContext) => SizedBox(
+        height: MediaQuery.sizeOf(sheetContext).height * 0.62,
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 10, 8, 8),
+              child: Row(
+                children: [
+                  const Icon(Icons.queue_music_rounded, size: 20),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      '播放列表${_playlistLoading ? '（读取中…）' : ' · ${tracks.length} 首'}',
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: '关闭',
+                    onPressed: () => Navigator.of(sheetContext).pop(),
+                    icon: const Icon(Icons.close),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            Expanded(
+              child: ListView.builder(
+                itemCount: tracks.length,
+                itemBuilder: (context, index) {
+                  final active = index == currentIndex;
+                  return ListTile(
+                    selected: active,
+                    leading: Icon(
+                      active
+                          ? Icons.graphic_eq_rounded
+                          : Icons.music_note_outlined,
+                      color: active ? const Color(0xFF6D28D9) : null,
+                    ),
+                    title: Text(
+                      tracks[index].name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    onTap: () => Navigator.of(sheetContext).pop(index),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (selected == null || !mounted || selected == _playlistIndex) {
+      return;
+    }
+    await _playTrackAt(selected);
+  }
+
+  bool _isCurrentTrack(_AudioTrack track) =>
+      mounted && identical(_currentTrack, track);
+
+  Future<bool> _initializeAudio(_AudioTrack track) async {
+    final transcode = _transcodeFor(track);
+    if (transcode.transcodeFirst && !_triedTranscode) {
+      _triedTranscode = true;
+      return _initializeTranscoded(track);
     }
 
     try {
       final duration = Platform.isWindows
-          ? await _loadWindowsAudioFromTempFile()
+          ? await _loadWindowsAudioFromTempFile(track)
           : await _player.setUrl(
-              widget.audioUri.toString(),
+              _rawUriFor(track).toString(),
               headers: {'X-Auth': widget.authToken},
             );
-      if (!mounted) {
-        return;
+      if (!_isCurrentTrack(track)) {
+        return false;
       }
 
       setState(() {
@@ -12160,16 +12515,16 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
         _error = null;
         _preparingLabel = null;
       });
+      return true;
     } catch (error) {
-      if (!mounted) {
-        return;
+      if (!_isCurrentTrack(track)) {
+        return false;
       }
 
       // 直连失败（解码器不认、内容类型被拒等）：改走服务端转码
-      if (transcode != null && !_triedTranscode) {
+      if (!_triedTranscode) {
         _triedTranscode = true;
-        await _initializeTranscoded();
-        return;
+        return _initializeTranscoded(track);
       }
 
       setState(() {
@@ -12177,14 +12532,15 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
         _preparingLabel = null;
         _error = _describeAudioError(error, fallback: '音频加载失败，请稍后重试。');
       });
+      return false;
     }
   }
 
   /// 请求电脑把当前音频转成 MP3（缓存复用），再播放转码结果。
-  Future<void> _initializeTranscoded() async {
-    final source = widget.transcode;
-    if (source == null) {
-      return;
+  Future<bool> _initializeTranscoded(_AudioTrack track) async {
+    final source = _transcodeFor(track);
+    if (!_isCurrentTrack(track)) {
+      return false;
     }
 
     try {
@@ -12201,14 +12557,17 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
         '/api/system/audio-transcode',
         body: {'path': source.path},
       );
+      if (!_isCurrentTrack(track)) {
+        return false;
+      }
       var status = data['status']?.toString() ?? 'processing';
       var progress = (data['progress'] as num?)?.toDouble() ?? 0;
       final key = data['key']?.toString();
 
       var guard = 0;
       while (status == 'processing' && guard < 600) {
-        if (!mounted) {
-          return;
+        if (!_isCurrentTrack(track)) {
+          return false;
         }
         setState(() {
           _preparingLabel = progress > 0
@@ -12216,10 +12575,16 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
               : '正在转码音频...';
         });
         await Future.delayed(const Duration(milliseconds: 600));
+        if (!_isCurrentTrack(track)) {
+          return false;
+        }
         final polled = await _sendTranscodeRequest(
           source,
           '/api/system/audio-transcode/status/$key',
         );
+        if (!_isCurrentTrack(track)) {
+          return false;
+        }
         status = polled['status']?.toString() ?? status;
         progress = (polled['progress'] as num?)?.toDouble() ?? progress;
         if (status == 'failed') {
@@ -12234,11 +12599,11 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
 
       final playUri = source.baseUri.replace(
         path:
-            '/api/system/audio-cache/$key/${Uri.encodeComponent(widget.title)}',
+            '/api/system/audio-cache/$key/${Uri.encodeComponent(track.name)}',
       );
       final duration = await _player.setUrl(playUri.toString());
-      if (!mounted) {
-        return;
+      if (!_isCurrentTrack(track)) {
+        return false;
       }
 
       setState(() {
@@ -12247,9 +12612,10 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
         _preparingLabel = null;
         _error = null;
       });
+      return true;
     } catch (error) {
-      if (!mounted) {
-        return;
+      if (!_isCurrentTrack(track)) {
+        return false;
       }
 
       setState(() {
@@ -12260,6 +12626,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
           fallback: '音频转码播放失败，请稍后重试。',
         );
       });
+      return false;
     }
   }
 
@@ -12314,17 +12681,21 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
     }
   }
 
-  Future<Duration?> _loadWindowsAudioFromTempFile() async {
+  Future<Duration?> _loadWindowsAudioFromTempFile(_AudioTrack track) async {
     final tempDirectory = await Directory.systemTemp.createTemp(
       'nas_phone_audio_',
     );
     final localFilePath = _joinLocalPath(
       tempDirectory.path,
-      _safeLocalFileName(widget.title),
+      _safeLocalFileName(track.name),
     );
     final localFile = File(localFilePath);
 
-    await _downloadAudioToLocalFile(localFile);
+    await _downloadAudioToLocalFile(track, localFile);
+    if (!_isCurrentTrack(track)) {
+      await _deleteDirectoryQuietly(tempDirectory);
+      return null;
+    }
 
     final previousTempDirectory = _tempAudioDirectory;
     _tempAudioDirectory = tempDirectory;
@@ -12335,13 +12706,16 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
     return _player.setFilePath(localFile.path);
   }
 
-  Future<void> _downloadAudioToLocalFile(File localFile) async {
+  Future<void> _downloadAudioToLocalFile(
+    _AudioTrack track,
+    File localFile,
+  ) async {
     final client = HttpClient()
       ..connectionTimeout = const Duration(seconds: 15);
 
     try {
       final request = await client
-          .getUrl(widget.audioUri)
+          .getUrl(_rawUriFor(track))
           .timeout(const Duration(seconds: 15));
       request.headers.set('X-Auth', widget.authToken);
 
@@ -12526,7 +12900,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
                             crossAxisAlignment: CrossAxisAlignment.stretch,
                             children: [
                               Text(
-                                widget.title,
+                                _currentName,
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                                 textAlign: TextAlign.center,
@@ -12609,10 +12983,10 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
                                     width: 48,
                                     height: 48,
                                     child: IconButton(
-                                      tooltip: '播放模式',
-                                      onPressed: () {},
-                                      icon: const Icon(
-                                        Icons.repeat_rounded,
+                                      tooltip: _mode.label,
+                                      onPressed: _cycleMode,
+                                      icon: Icon(
+                                        _mode.icon,
                                         size: 24,
                                         color: Colors.white,
                                       ),
@@ -12624,7 +12998,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
                                     height: 48,
                                     child: IconButton(
                                       tooltip: '上一曲',
-                                      onPressed: () {},
+                                      onPressed: _isPreparing ? null : _playPrevious,
                                       icon: const Icon(
                                         Icons.skip_previous_rounded,
                                         size: 30,
@@ -12658,7 +13032,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
                                     height: 48,
                                     child: IconButton(
                                       tooltip: '下一曲',
-                                      onPressed: () {},
+                                      onPressed: _isPreparing ? null : _playNext,
                                       icon: const Icon(
                                         Icons.skip_next_rounded,
                                         size: 30,
@@ -12667,7 +13041,19 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
                                     ),
                                   ),
                                   const SizedBox(width: 12),
-                                  const SizedBox(width: 48, height: 48),
+                                  SizedBox(
+                                    width: 48,
+                                    height: 48,
+                                    child: IconButton(
+                                      tooltip: '播放列表',
+                                      onPressed: _isPreparing ? null : _showPlaylist,
+                                      icon: const Icon(
+                                        Icons.queue_music_rounded,
+                                        size: 24,
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                  ),
                                 ],
                               ),
                             ],
