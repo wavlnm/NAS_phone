@@ -12474,20 +12474,6 @@ String lyricsKeyFromFileName(String fileName) {
   return key.isEmpty ? '未命名' : key;
 }
 
-class LyricsQuery {
-  const LyricsQuery(this.title, this.artist);
-
-  final String title;
-  final String? artist;
-}
-
-class LyricsFetchResult {
-  const LyricsFetchResult(this.lyrics, this.title);
-
-  final String lyrics;
-  final String title;
-}
-
 String _sanitizeLyricsKey(String value) {
   final key = value
       .replaceAll(RegExp(r'[/\\\x00]'), '_')
@@ -12510,51 +12496,6 @@ List<String> lyricsKeysForFileName(String fileName) {
     }
   }
   return keys;
-}
-
-List<String> _artistVariants(String value) {
-  final parts = value
-      .split(RegExp(r'\s*(?:&|、|,|，|/|•|feat\.?|ft\.?)\s*', caseSensitive: false))
-      .map((part) => _sanitizeLyricsKey(part))
-      .where((part) => part.isNotEmpty && part != '未命名')
-      .toList();
-  return parts.isEmpty ? [_sanitizeLyricsKey(value)] : parts;
-}
-
-List<LyricsQuery> lyricsQueriesForFileName(String fileName) {
-  final base = lyricsKeyFromFileName(fileName);
-  final queries = <LyricsQuery>[];
-  void add(LyricsQuery query) {
-    if (query.title.trim().isEmpty) {
-      return;
-    }
-    if (!queries.any((item) =>
-        item.title == query.title && item.artist == query.artist)) {
-      queries.add(query);
-    }
-  }
-
-  // 优先级 1：整串。
-  add(LyricsQuery(base, null));
-
-  final match = _lyricsSeparator.firstMatch(base);
-  if (match != null) {
-    final left = _sanitizeLyricsKey(match.group(1) ?? '');
-    final right = _sanitizeLyricsKey(match.group(2) ?? '');
-    if (left != right) {
-      // 优先级 2：歌名/歌手两种顺序。
-      add(LyricsQuery(left, right));
-      add(LyricsQuery(right, left));
-      // 优先级 3：歌手本身是多人时，再按单人依次尝试。
-      for (final artist in _artistVariants(right).take(3)) {
-        add(LyricsQuery(left, artist));
-      }
-      for (final artist in _artistVariants(left).take(3)) {
-        add(LyricsQuery(right, artist));
-      }
-    }
-  }
-  return queries;
 }
 
 String lyricsResourcePathForKey(String key) =>
@@ -12964,23 +12905,67 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
       return;
     }
     final track = _currentTrack;
+    final trackName = _currentName;
     setState(() {
       _lyricsLoading = true;
       _lyricsError = null;
     });
+
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10);
     try {
-      final result = await _fetchLyricsFromLrclib();
+      final params = <String, String>{'name': trackName};
+      if (_duration > Duration.zero) {
+        params['duration'] =
+            (_duration.inMilliseconds / 1000.0).toStringAsFixed(2);
+      }
+      final uri = widget.baseUri.replace(
+        path: '/api/music/lyrics/best',
+        queryParameters: params,
+      );
+      final request = await client
+          .getUrl(uri)
+          .timeout(const Duration(seconds: 12));
+      (await _nasHeaders()).forEach(request.headers.set);
+      final response = await request.close().timeout(
+        const Duration(seconds: 25),
+      );
       if (!mounted || !identical(_currentTrack, track)) {
         return;
       }
+      if (response.statusCode == 404) {
+        throw const NasApiException('没有找到歌词。');
+      }
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw NasApiException('歌词服务返回 ${response.statusCode}。');
+      }
+
+      final text = await utf8.decodeStream(response).timeout(
+        const Duration(seconds: 25),
+      );
+      if (!mounted || !identical(_currentTrack, track)) {
+        return;
+      }
+      final decoded = jsonDecode(text);
+      if (decoded is! Map) {
+        throw const NasApiException('歌词服务返回了无法识别的数据。');
+      }
+      final lyrics = decoded['lyrics']?.toString().trim() ?? '';
+      if (!isUsableLyrics(lyrics)) {
+        throw const NasApiException('没有找到歌词。');
+      }
+
       setState(() {
-        _lyricsText = result.lyrics;
+        _lyricsText = lyrics;
       });
-      try {
-        final key = lyricsKeyFromFileName(result.title);
-        await _writeNasText(lyricsResourcePathForKey(key), result.lyrics);
-      } catch (_) {
-        // 歌词可以先展示，写入失败不阻塞
+      // 电脑端已把歌词写入共享目录；只有它写入失败时手机再补一份。
+      if (decoded['saved'] != true) {
+        try {
+          final key = lyricsKeyFromFileName(trackName);
+          await _writeNasText(lyricsResourcePathForKey(key), lyrics);
+        } catch (_) {
+          // 缓存写入失败不影响展示
+        }
       }
     } on NasApiException catch (error) {
       if (mounted && identical(_currentTrack, track)) {
@@ -12995,167 +12980,13 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
         });
       }
     } finally {
+      client.close(force: true);
       if (mounted && identical(_currentTrack, track)) {
         setState(() {
           _lyricsLoading = false;
         });
       }
     }
-  }
-
-  Future<LyricsFetchResult> _fetchLyricsFromLrclib() async {
-    final queries = lyricsQueriesForFileName(_currentName);
-    final client = HttpClient()
-      ..connectionTimeout = const Duration(seconds: 10);
-    LyricsFetchResult? best;
-    var bestScore = 1 << 30;
-    var bestSynced = false;
-    var bestLineCount = 0;
-    Object? lastError;
-    final deadline = DateTime.now().add(const Duration(seconds: 15));
-    try {
-      for (final query in queries) {
-        if (DateTime.now().isAfter(deadline)) {
-          lastError ??= const NasApiException('歌词获取超时，请稍后重试。');
-          break;
-        }
-        final params = <String, String>{'track': query.title};
-        final artist = query.artist?.trim();
-        if (artist != null && artist.isNotEmpty) {
-          params['artist'] = artist;
-        }
-
-        try {
-          final uri = widget.baseUri.replace(
-            path: '/api/music/lyrics/search',
-            queryParameters: params,
-          );
-          final request = await client
-              .getUrl(uri)
-              .timeout(const Duration(seconds: 12));
-          (await _nasHeaders()).forEach(request.headers.set);
-          final response = await request.close().timeout(
-            const Duration(seconds: 15),
-          );
-          final text = await utf8.decodeStream(response).timeout(
-            const Duration(seconds: 15),
-          );
-          if (response.statusCode < 200 || response.statusCode >= 300) {
-            lastError = NasApiException('歌词服务返回 ${response.statusCode}。');
-            continue;
-          }
-
-          final decoded = jsonDecode(text);
-          if (decoded is! List) {
-            lastError = const NasApiException('歌词服务返回了无法识别的数据。');
-            continue;
-          }
-
-          for (final item in decoded.whereType<Map>()) {
-            final synced = item['syncedLyrics']?.toString().trim() ?? '';
-            final plain = item['plainLyrics']?.toString().trim() ?? '';
-            final lyrics = synced.isNotEmpty ? synced : plain;
-            if (lyrics.isEmpty) {
-              continue;
-            }
-            final lineCount = lyricLineCount(lyrics);
-            if (lineCount < 3) {
-              continue;
-            }
-
-            final track = item['trackName']?.toString().trim() ?? '';
-            final score = _scoreLyricsCandidate(
-              query,
-              item,
-              synced.isNotEmpty,
-              lineCount,
-            );
-            if (score < bestScore) {
-              bestScore = score;
-              bestSynced = synced.isNotEmpty;
-              bestLineCount = lineCount;
-              best = LyricsFetchResult(
-                lyrics,
-                track.isEmpty ? query.title : track,
-              );
-            }
-          }
-          // 歌名、歌手精确命中，且有足够多的同步歌词时才提前停止。
-          if (best != null &&
-              bestScore < 50 &&
-              bestSynced &&
-              bestLineCount >= 5) {
-            break;
-          }
-        } catch (error) {
-          lastError = error;
-        }
-      }
-    } finally {
-      client.close(force: true);
-    }
-
-    if (best != null) {
-      return best;
-    }
-    if (lastError is NasApiException) {
-      throw lastError;
-    }
-    if (lastError != null) {
-      throw NasApiException('歌词获取失败：$lastError');
-    }
-    throw const NasApiException('没有找到歌词。');
-  }
-
-  int _scoreLyricsCandidate(
-    LyricsQuery query,
-    Map item,
-    bool synced,
-    int lineCount,
-  ) {
-    String normalize(String? value) => (value ?? '')
-        .toLowerCase()
-        .replaceAll(RegExp(r'\s+'), '')
-        .replaceAll(RegExp(r'[（）()\[\]【】]'), '');
-
-    final track = normalize(item['trackName']?.toString());
-    final artist = normalize(item['artistName']?.toString());
-    final title = normalize(query.title);
-    var score = 0;
-    if (track == title) {
-      score -= 40;
-    } else if (track.contains(title) || title.contains(track)) {
-      score += 40;
-    } else {
-      score += 300;
-    }
-
-    final wantedArtist = normalize(query.artist);
-    if (wantedArtist.isNotEmpty) {
-      if (artist.contains(wantedArtist)) {
-        score -= 30;
-      } else {
-        score += 300;
-      }
-    } else {
-      score += 80;
-    }
-
-    if (!synced) {
-      score += 100;
-      if (lineCount < 8) {
-        score += 60;
-      }
-    } else {
-      score -= lineCount.clamp(0, 40) ~/ 4;
-    }
-    final duration = (item['duration'] as num?)?.toDouble();
-    if (duration != null && _duration.inSeconds > 0) {
-      score += (duration - _duration.inSeconds).abs().round();
-    } else {
-      score += 50;
-    }
-    return score;
   }
 
   Future<void> _restorePositionFromNas() async {

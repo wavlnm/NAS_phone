@@ -151,26 +151,6 @@ void main() {
       lyricsKeysForFileName('出山-花粥.mp3'),
       ['出山-花粥', '出山', '花粥'],
     );
-    final queries = lyricsQueriesForFileName('周杰伦 - 晴天.mp3');
-    expect(
-      queries.any((item) => item.title == '晴天' && item.artist == '周杰伦'),
-      isTrue,
-    );
-    expect(
-      lyricsQueriesForFileName('可不可以-张紫豪.mp3').any(
-        (item) => item.title == '可不可以' && item.artist == '张紫豪',
-      ),
-      isTrue,
-    );
-    final multiArtist = lyricsQueriesForFileName('出山-花粥&王胜娚.mp3');
-    expect(multiArtist.first.title, '出山-花粥&王胜娚');
-    expect(multiArtist.first.artist, isNull);
-    expect(
-      multiArtist.any(
-        (item) => item.title == '出山' && item.artist == '花粥',
-      ),
-      isTrue,
-    );
     expect(lyricLineCount('[00:01.00]一句'), 1);
     expect(isUsableLyrics('[00:01.00]一句'), isFalse);
   });
