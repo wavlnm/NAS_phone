@@ -129,6 +129,25 @@ void main() {
     expect(question.questions.first.options.first.label, '选项 A');
   });
 
+  test('builds shared lyrics key and display text', () {
+    expect(lyricsKeyFromFileName('01 - 晴天.flac'), '晴天');
+    expect(lyricsKeyFromFileName('02 夜曲.mp3'), '夜曲');
+    expect(lyricsKeyFromFileName('7 Rings.mp3'), '7 Rings');
+    expect(
+      lyricsResourcePath('01 - 晴天.flac'),
+      '/音乐播放器/lyrics/晴天.lrc',
+    );
+    expect(
+      stripLrcForDisplay('[ti:晴天]\n[00:01.00]Hello\n[00:03.50]世界\n'),
+      'Hello\n世界',
+    );
+
+    final lines = parseLyrics('[00:01.00]第一行\n[00:03.50]第二行\n');
+    expect(lines, hasLength(2));
+    expect(lines.first.time, const Duration(seconds: 1));
+    expect(lines.last.text, '第二行');
+  });
+
   testWidgets('renders markdown preview content', (tester) async {
     await tester.pumpWidget(
       MaterialApp(

@@ -2999,6 +2999,7 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
             title: entry.name,
             audioUri: _buildRawDownloadUri(baseUri, entry.path),
             authToken: token,
+            authHeaders: _buildNasAuthHeaders,
             // 直连失败时（例如 FLAC）自动改走服务端转码；FLAC 直接转码省一次等待
             transcode: AudioTranscodeSource(
               baseUri: baseUri,
@@ -11489,6 +11490,97 @@ class _GomokuRoomInfo {
       : token.substring(0, 6).toUpperCase();
 }
 
+String lyricsKeyFromFileName(String fileName) {
+  var key = fileName;
+  final dot = key.lastIndexOf('.');
+  if (dot > 0) {
+    key = key.substring(0, dot);
+  }
+  key = key.replaceFirst(RegExp(r'^\s*\d{1,3}\s*[-._]\s+'), '');
+  key = key.replaceFirst(RegExp(r'^\s*\d{2,3}\s+'), '');
+  key = key.replaceAll(RegExp(r'[/\\\x00]'), '_').trim();
+  return key.isEmpty ? '未命名' : key;
+}
+
+String lyricsResourcePath(String fileName) =>
+    '/音乐播放器/lyrics/${lyricsKeyFromFileName(fileName)}.lrc';
+
+class LyricLine {
+  const LyricLine(this.time, this.text);
+
+  final Duration time;
+  final String text;
+}
+
+final RegExp _lrcTimePattern = RegExp(r'\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]');
+
+List<LyricLine> parseLyrics(String text) {
+  final offsetMatch = RegExp(
+    r'\[offset:([+-]?\d+)\]',
+    caseSensitive: false,
+  ).firstMatch(text);
+  final offsetMs = int.tryParse(offsetMatch?.group(1) ?? '') ?? 0;
+  final timed = <LyricLine>[];
+  var hasTimedLines = false;
+
+  for (final raw in text.split(RegExp(r'\r?\n'))) {
+    final matches = _lrcTimePattern.allMatches(raw).toList();
+    final clean = raw.replaceAll(_lrcTimePattern, '').trim();
+    if (clean.isEmpty ||
+        RegExp(r'^\[[a-zA-Z]+:[^\]]*\]$').hasMatch(clean)) {
+      continue;
+    }
+    if (matches.isEmpty) {
+      continue;
+    }
+
+    hasTimedLines = true;
+    for (final match in matches) {
+      final minutes = int.parse(match.group(1)!);
+      final seconds = int.parse(match.group(2)!);
+      final fraction = (match.group(3) ?? '0').padRight(3, '0').substring(0, 3);
+      final millis =
+          minutes * 60000 + seconds * 1000 + int.parse(fraction) + offsetMs;
+      timed.add(LyricLine(Duration(milliseconds: millis), clean));
+    }
+  }
+
+  if (!hasTimedLines) {
+    final plain = stripLrcForDisplay(text);
+    return plain.isEmpty ? const [] : [LyricLine(Duration.zero, plain)];
+  }
+
+  timed.sort((left, right) => left.time.compareTo(right.time));
+  return timed;
+}
+
+String stripLrcForDisplay(String text) {
+  final output = <String>[];
+  for (final raw in text.split(RegExp(r'\r?\n'))) {
+    final trimmed = raw.trim();
+    if (RegExp(r'^\[[a-zA-Z]+:[^\]]*\]$').hasMatch(trimmed)) {
+      continue;
+    }
+    if (trimmed.isEmpty) {
+      if (output.isNotEmpty && output.last.isNotEmpty) {
+        output.add('');
+      }
+      continue;
+    }
+    final line = trimmed.replaceFirst(
+      RegExp(r'^(?:\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\])+'),
+      '',
+    );
+    if (line.trim().isNotEmpty) {
+      output.add(line.trimRight());
+    }
+  }
+  while (output.isNotEmpty && output.last.isEmpty) {
+    output.removeLast();
+  }
+  return output.join('\n');
+}
+
 class AudioTranscodeSource {
   const AudioTranscodeSource({
     required this.baseUri,
@@ -11510,6 +11602,7 @@ class AudioPreviewPage extends StatefulWidget {
     required this.title,
     required this.audioUri,
     required this.authToken,
+    required this.authHeaders,
     this.transcode,
     super.key,
   });
@@ -11517,6 +11610,7 @@ class AudioPreviewPage extends StatefulWidget {
   final String title;
   final Uri audioUri;
   final String authToken;
+  final Future<Map<String, String>> Function() authHeaders;
   final AudioTranscodeSource? transcode;
 
   @override
@@ -11539,6 +11633,10 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
   String? _error;
   String? _preparingLabel;
   bool _triedTranscode = false;
+  String? _lyricsText;
+  String? _lyricsError;
+  bool _lyricsLoading = true;
+  bool _positionRestored = false;
 
   @override
   void initState() {
@@ -11579,7 +11677,275 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
       });
     });
 
-    unawaited(_initializeAudio());
+    unawaited(
+      _initializeAudio().then((_) => _restorePositionFromNas()),
+    );
+    unawaited(_loadLocalLyrics());
+  }
+
+  String get _songKey => lyricsKeyFromFileName(widget.title);
+
+  Future<Map<String, String>> _nasHeaders() async {
+    final headers = Map<String, String>.from(await widget.authHeaders());
+    headers['X-Auth'] = widget.authToken;
+    return headers;
+  }
+
+  Uri _nasRawUri(String resourcePath) => widget.audioUri.replace(
+    path: '/api/filebrowser/raw${_encodeResourcePath(resourcePath)}',
+  );
+
+  Uri _nasResourceUri(String resourcePath) => widget.audioUri.replace(
+    path: '/api/filebrowser/resources${_encodeResourcePath(resourcePath)}',
+    queryParameters: const {'override': 'true'},
+  );
+
+  Future<String?> _readNasText(String resourcePath) async {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10);
+    try {
+      final request = await client
+          .getUrl(_nasRawUri(resourcePath))
+          .timeout(const Duration(seconds: 15));
+      (await _nasHeaders()).forEach(request.headers.set);
+      final response = await request.close().timeout(
+        const Duration(seconds: 20),
+      );
+      final text = await utf8.decodeStream(response).timeout(
+        const Duration(seconds: 20),
+      );
+      if (response.statusCode == 404) {
+        return null;
+      }
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw NasApiException('读取共享文件失败：${response.statusCode}。');
+      }
+      return text;
+    } on TimeoutException {
+      throw const NasApiException('读取共享文件超时。');
+    } on SocketException catch (error) {
+      throw NasApiException('无法连接电脑：${error.message}');
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> _writeNasText(String resourcePath, String text) async {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10);
+    try {
+      final request = await client
+          .postUrl(_nasResourceUri(resourcePath))
+          .timeout(const Duration(seconds: 15));
+      (await _nasHeaders()).forEach(request.headers.set);
+      request.headers.contentType = ContentType(
+        'text',
+        'plain',
+        charset: 'utf-8',
+      );
+      final bytes = utf8.encode(text);
+      request.contentLength = bytes.length;
+      request.add(bytes);
+      final response = await request.close().timeout(
+        const Duration(seconds: 30),
+      );
+      final body = await utf8.decodeStream(response).timeout(
+        const Duration(seconds: 30),
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw NasApiException(
+          '保存共享文件失败：${response.statusCode}。${_compactAudioErrorBody(body)}',
+        );
+      }
+    } on TimeoutException {
+      throw const NasApiException('保存共享文件超时。');
+    } on SocketException catch (error) {
+      throw NasApiException('无法连接电脑：${error.message}');
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> _loadLocalLyrics() async {
+    try {
+      final existing = await _readNasText(lyricsResourcePath(widget.title));
+      if (!mounted) {
+        return;
+      }
+      if (existing != null && existing.trim().isNotEmpty) {
+        setState(() {
+          _lyricsText = existing;
+        });
+      }
+    } catch (_) {
+      // 本地无歌词或读取失败时保留“获取歌词”入口
+    } finally {
+      if (mounted) {
+        setState(() {
+          _lyricsLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _fetchLyrics() async {
+    if (_lyricsLoading) {
+      return;
+    }
+    setState(() {
+      _lyricsLoading = true;
+      _lyricsError = null;
+    });
+    try {
+      final lyrics = await _fetchLyricsFromLrclib();
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _lyricsText = lyrics;
+      });
+      try {
+        await _writeNasText(lyricsResourcePath(widget.title), lyrics);
+      } catch (_) {
+        // 歌词可以先展示，写入失败不阻塞
+      }
+    } on NasApiException catch (error) {
+      if (mounted) {
+        setState(() {
+          _lyricsError = error.message;
+        });
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _lyricsError = '歌词获取失败：$error';
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _lyricsLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<String> _fetchLyricsFromLrclib() async {
+    final query = Uri.encodeQueryComponent(_songKey);
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10);
+    try {
+      final request = await client
+          .getUrl(Uri.parse('https://lrclib.net/api/search?track_name=$query'))
+          .timeout(const Duration(seconds: 15));
+      request.headers.set('User-Agent', 'nas-phone/1.0');
+      final response = await request.close().timeout(
+        const Duration(seconds: 20),
+      );
+      final text = await utf8.decodeStream(response).timeout(
+        const Duration(seconds: 20),
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw NasApiException('歌词服务返回 ${response.statusCode}。');
+      }
+
+      final decoded = jsonDecode(text);
+      if (decoded is! List) {
+        throw const NasApiException('歌词服务返回了无法识别的数据。');
+      }
+
+      String? bestLyrics;
+      var bestScore = 1 << 30;
+      final targetSeconds = _duration.inSeconds;
+      for (final item in decoded.whereType<Map>()) {
+        final synced = item['syncedLyrics']?.toString().trim() ?? '';
+        final plain = item['plainLyrics']?.toString().trim() ?? '';
+        final lyrics = synced.isNotEmpty ? synced : plain;
+        if (lyrics.isEmpty) {
+          continue;
+        }
+
+        final track = item['trackName']?.toString() ?? '';
+        final duration = (item['duration'] as num?)?.toDouble();
+        var score = 0;
+        if (track.toLowerCase() != _songKey.toLowerCase()) {
+          score += 1000;
+        }
+        if (synced.isEmpty) {
+          score += 100;
+        }
+        if (duration != null && targetSeconds > 0) {
+          score += (duration - targetSeconds).abs().round();
+        }
+        if (score < bestScore) {
+          bestScore = score;
+          bestLyrics = lyrics;
+        }
+      }
+
+      if (bestLyrics == null) {
+        throw const NasApiException('没有找到歌词。');
+      }
+      return bestLyrics;
+    } on TimeoutException {
+      throw const NasApiException('歌词获取超时，请稍后重试。');
+    } on SocketException catch (error) {
+      throw NasApiException('歌词获取失败：${error.message}');
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> _restorePositionFromNas() async {
+    if (_positionRestored || _duration <= Duration.zero) {
+      return;
+    }
+    _positionRestored = true;
+    try {
+      final text = await _readNasText('/音乐播放器/player.json');
+      if (text == null || text.trim().isEmpty) {
+        return;
+      }
+      final data = jsonDecode(text);
+      if (data is! Map || data['title']?.toString() != widget.title) {
+        return;
+      }
+      final seconds = (data['position'] as num?)?.toDouble() ?? 0;
+      if (seconds <= 1) {
+        return;
+      }
+      final target = Duration(milliseconds: (seconds * 1000).round());
+      if (target >= _duration - const Duration(seconds: 2)) {
+        return;
+      }
+      await _player.seek(target);
+      if (mounted) {
+        setState(() {
+          _position = target;
+        });
+      }
+    } catch (_) {
+      // 播放数据损坏或不可用时从 0 开始
+    }
+  }
+
+  Future<void> _savePlayerState() async {
+    if (_duration <= Duration.zero) {
+      return;
+    }
+    var position = _position;
+    if (position >= _duration - const Duration(seconds: 2)) {
+      position = Duration.zero;
+    }
+    final payload = jsonEncode({
+      'title': widget.title,
+      'position': position.inMilliseconds / 1000.0,
+    });
+    try {
+      await _writeNasText('/音乐播放器/player.json', payload);
+    } catch (_) {
+      // 进度保存失败不影响播放
+    }
   }
 
   Future<void> _initializeAudio() async {
@@ -11827,6 +12193,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
     try {
       if (_isPlaying) {
         await _player.pause();
+        unawaited(_savePlayerState());
         return;
       }
 
@@ -11875,6 +12242,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
     _positionSubscription?.cancel();
     _durationSubscription?.cancel();
     _playerStateSubscription?.cancel();
+    unawaited(_savePlayerState());
     final tempAudioDirectory = _tempAudioDirectory;
     if (tempAudioDirectory != null) {
       unawaited(_deleteDirectoryQuietly(tempAudioDirectory));
@@ -11989,6 +12357,14 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
                                 ),
                               ),
                               const SizedBox(height: 10),
+                              _LyricsPanel(
+                                lyrics: _lyricsText,
+                                loading: _lyricsLoading,
+                                error: _lyricsError,
+                                onFetch: _fetchLyrics,
+                                position: _position,
+                              ),
+                              const SizedBox(height: 10),
                               SliderTheme(
                                 data: SliderTheme.of(context).copyWith(
                                   activeTrackColor: Colors.white,
@@ -12038,30 +12414,74 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
                                   ),
                                 ],
                               ),
-                              const SizedBox(height: 10),
-                              Center(
-                                child: IconButton.filled(
-                                  onPressed: _error == null && !_isPreparing
-                                      ? _togglePlayback
-                                      : null,
-                                  style: IconButton.styleFrom(
-                                    backgroundColor: Colors.white.withValues(
-                                      alpha: 0.92,
+                              const SizedBox(height: 8),
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  SizedBox(
+                                    width: 48,
+                                    height: 48,
+                                    child: IconButton(
+                                      tooltip: '播放模式',
+                                      onPressed: () {},
+                                      icon: const Icon(
+                                        Icons.repeat_rounded,
+                                        size: 24,
+                                        color: Colors.white,
+                                      ),
                                     ),
-                                    foregroundColor: const Color(0xFF0F172A),
-                                    disabledBackgroundColor:
-                                        Colors.white.withValues(alpha: 0.36),
-                                    disabledForegroundColor:
-                                        Colors.white.withValues(alpha: 0.72),
-                                    fixedSize: const Size(52, 52),
                                   ),
-                                  iconSize: 30,
-                                  icon: Icon(
-                                    _isPlaying
-                                        ? Icons.pause_rounded
-                                        : Icons.play_arrow_rounded,
+                                  const SizedBox(width: 12),
+                                  SizedBox(
+                                    width: 48,
+                                    height: 48,
+                                    child: IconButton(
+                                      tooltip: '上一曲',
+                                      onPressed: () {},
+                                      icon: const Icon(
+                                        Icons.skip_previous_rounded,
+                                        size: 30,
+                                        color: Colors.white,
+                                      ),
+                                    ),
                                   ),
-                                ),
+                                  const SizedBox(width: 10),
+                                  SizedBox(
+                                    width: 52,
+                                    height: 52,
+                                    child: IconButton(
+                                      tooltip: _isPlaying ? '暂停' : '播放',
+                                      onPressed: _error == null && !_isPreparing
+                                          ? _togglePlayback
+                                          : null,
+                                      icon: Icon(
+                                        _isPlaying
+                                            ? Icons.pause_rounded
+                                            : Icons.play_arrow_rounded,
+                                        size: 40,
+                                        color: _error == null && !_isPreparing
+                                            ? Colors.white
+                                            : Colors.white54,
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 10),
+                                  SizedBox(
+                                    width: 48,
+                                    height: 48,
+                                    child: IconButton(
+                                      tooltip: '下一曲',
+                                      onPressed: () {},
+                                      icon: const Icon(
+                                        Icons.skip_next_rounded,
+                                        size: 30,
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 12),
+                                  const SizedBox(width: 48, height: 48),
+                                ],
                               ),
                             ],
                           ),
@@ -12074,6 +12494,251 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _LyricsPanel extends StatefulWidget {
+  const _LyricsPanel({
+    required this.lyrics,
+    required this.loading,
+    required this.error,
+    required this.onFetch,
+    required this.position,
+  });
+
+  final String? lyrics;
+  final bool loading;
+  final String? error;
+  final Future<void> Function() onFetch;
+  final Duration position;
+
+  @override
+  State<_LyricsPanel> createState() => _LyricsPanelState();
+}
+
+class _LyricsPanelState extends State<_LyricsPanel> {
+  static const double _height = 180;
+  static const double _lineExtent = 44;
+  final ScrollController _scrollController = ScrollController();
+  List<LyricLine> _lines = const [];
+  bool _synced = false;
+  int _activeIndex = -1;
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshLyrics();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _scrollToActive(animate: false);
+    });
+  }
+
+  @override
+  void didUpdateWidget(covariant _LyricsPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.lyrics != widget.lyrics) {
+      _refreshLyrics();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _scrollToActive(animate: false);
+      });
+    } else if (oldWidget.position != widget.position) {
+      final index = _indexFor(widget.position);
+      if (index != _activeIndex) {
+        _activeIndex = index;
+        _scrollToActive(animate: true);
+      }
+    }
+  }
+
+  void _refreshLyrics() {
+    final text = widget.lyrics;
+    _lines = text == null ? const [] : parseLyrics(text);
+    _synced = _lines.length > 1 ||
+        (_lines.isNotEmpty && _lines.first.time > Duration.zero);
+    _activeIndex = _indexFor(widget.position);
+  }
+
+  int _indexFor(Duration position) {
+    if (!_synced || _lines.isEmpty) {
+      return -1;
+    }
+    if (position < _lines.first.time) {
+      return -1;
+    }
+    var index = 0;
+    for (var i = 0; i < _lines.length; i++) {
+      if (_lines[i].time <= position) {
+        index = i;
+      } else {
+        break;
+      }
+    }
+    return index;
+  }
+
+  void _scrollToActive({required bool animate}) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_synced || !_scrollController.hasClients) {
+        return;
+      }
+      final target = (_activeIndex < 0 ? 0.0 : _activeIndex * _lineExtent)
+          .clamp(0.0, _scrollController.position.maxScrollExtent);
+      if (animate) {
+        _scrollController.animateTo(
+          target,
+          duration: const Duration(milliseconds: 250),
+          curve: Curves.easeOut,
+        );
+      } else {
+        _scrollController.jumpTo(target);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final hasLyrics = _lines.isNotEmpty &&
+        widget.lyrics != null &&
+        widget.lyrics!.trim().isNotEmpty;
+    if (!hasLyrics) {
+      return _buildPlaceholder();
+    }
+    if (!_synced) {
+      return _buildPlainLyrics();
+    }
+    return _buildSyncedLyrics();
+  }
+
+  Widget _buildPlaceholder() {
+    if (widget.loading) {
+      return Container(
+        height: 52,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: Colors.white.withValues(alpha: 0.05),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+            SizedBox(width: 10),
+            Text(
+              '正在加载歌词...',
+              style: TextStyle(fontSize: 12, color: Colors.white70),
+            ),
+          ],
+        ),
+      );
+    }
+
+    final error = widget.error;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 6),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.05),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            error ?? '暂无歌词',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 12,
+              height: 1.4,
+              color: error == null
+                  ? Colors.white54
+                  : const Color(0xFFFCA5A5),
+            ),
+          ),
+          SizedBox(
+            height: 30,
+            child: TextButton(
+              onPressed: widget.onFetch,
+              style: TextButton.styleFrom(
+                foregroundColor: Colors.white.withValues(alpha: 0.88),
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+              ),
+              child: Text(error == null ? '获取歌词' : '重试'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPlainLyrics() {
+    return Container(
+      height: _height,
+      padding: const EdgeInsets.fromLTRB(14, 10, 14, 10),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.05),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: SingleChildScrollView(
+        child: SelectableText(
+          _lines.first.text,
+          style: TextStyle(
+            fontSize: 13.5,
+            height: 1.7,
+            color: Colors.white.withValues(alpha: 0.82),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSyncedLyrics() {
+    return Container(
+      height: _height,
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.05),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: ListView.builder(
+        controller: _scrollController,
+        itemExtent: _lineExtent,
+        padding: const EdgeInsets.symmetric(
+          vertical: (_height - _lineExtent) / 2,
+        ),
+        itemCount: _lines.length,
+        itemBuilder: (context, index) {
+          final active = index == _activeIndex;
+          return Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 14),
+              child: Text(
+                _lines[index].text,
+                textAlign: TextAlign.center,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: active ? 15 : 13,
+                  height: 1.35,
+                  fontWeight: active ? FontWeight.w600 : FontWeight.w400,
+                  color: active
+                      ? Colors.white
+                      : Colors.white.withValues(alpha: 0.45),
+                ),
+              ),
+            ),
+          );
+        },
       ),
     );
   }
