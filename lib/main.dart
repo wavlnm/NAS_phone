@@ -12750,6 +12750,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
   bool _playlistLoading = true;
   _PlaybackMode _mode = _PlaybackMode.repeatAll;
   bool _handlingCompletion = false;
+  DateTime? _lastTrackSwitchAt;
 
   final GlobalKey _currentCardKey = GlobalKey();
   final GlobalKey _lyricsHoleKey = GlobalKey();
@@ -12759,7 +12760,9 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
   Rect? _lyricsHole;
   double _stackOffset = 0;
   bool _settling = false;
+  bool _dragging = false;
   AnimationController? _settleController;
+  Completer<void>? _settleCompleter;
   _AudioTrack? _previewNext;
   _AudioTrack? _previewPrev;
   int? _pendingNextIndex;
@@ -12820,7 +12823,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
 
     _playerStateSubscription = _player.playerStateStream.listen((state) {
       if (state.processingState == ProcessingState.completed) {
-        if (!_handlingCompletion) {
+        if (!_handlingCompletion && _isGenuineCompletion()) {
           _handlingCompletion = true;
           unawaited(_handleCompleted());
         }
@@ -13369,6 +13372,11 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
         _currentTrack.path == track.path &&
         !_isPreparing &&
         _error == null) {
+      if (_stackOffset != 0) {
+        setState(() {
+          _stackOffset = 0;
+        });
+      }
       if (autoplay && !_isPlaying) {
         if (_player.processingState == ProcessingState.completed) {
           await _player.seek(Duration.zero);
@@ -13393,6 +13401,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
       _lyricsText = null;
       _lyricsError = null;
       _lyricsLoading = true;
+      _lastTrackSwitchAt = DateTime.now();
       _refreshPreviews();
     });
     unawaited(_savePlayerState());
@@ -13409,6 +13418,22 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
     if (autoplay) {
       await _player.play();
     }
+  }
+
+  // 切歌瞬间播放器可能补发上一条 completed 事件：刚切换过、或播放位置离结尾还远时忽略。
+  bool _isGenuineCompletion() {
+    if (_isPreparing) {
+      return false;
+    }
+    final switchedAt = _lastTrackSwitchAt;
+    if (switchedAt != null &&
+        DateTime.now().difference(switchedAt) < const Duration(seconds: 1)) {
+      return false;
+    }
+    if (_duration <= Duration.zero) {
+      return true;
+    }
+    return _position >= _duration - const Duration(seconds: 3);
   }
 
   Future<void> _handleCompleted() async {
@@ -13432,7 +13457,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
         await _player.play();
         return;
       }
-      _animateStackTo(-_cardSpacing, commitIndex: next);
+      await _animateStackTo(-_cardSpacing, commitIndex: next);
     } finally {
       _handlingCompletion = false;
     }
@@ -13915,10 +13940,21 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
     _settleController = null;
     _settling = false;
     controller?.dispose();
+    _completeSettle();
   }
 
-  void _animateStackTo(double target, {int? commitIndex}) {
+  void _completeSettle() {
+    final completer = _settleCompleter;
+    _settleCompleter = null;
+    if (completer != null && !completer.isCompleted) {
+      completer.complete();
+    }
+  }
+
+  Future<void> _animateStackTo(double target, {int? commitIndex}) {
     _cancelSettle();
+    final completer = Completer<void>();
+    _settleCompleter = completer;
     final controller = AnimationController(
       duration: const Duration(milliseconds: 260),
       vsync: this,
@@ -13945,21 +13981,36 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
       _settling = false;
       controller.dispose();
       if (!mounted) {
+        _completeSettle();
         return;
       }
       if (commitIndex != null) {
-        // 切歌会同步把偏移归零，卡片交接不会跳变。
-        unawaited(_playTrackAt(commitIndex));
+        unawaited(() async {
+          try {
+            // 切歌会同步把偏移归零，卡片交接不会跳变。
+            await _playTrackAt(commitIndex);
+            if (mounted && _stackOffset != 0) {
+              setState(() {
+                _stackOffset = 0;
+              });
+            }
+          } finally {
+            _completeSettle();
+          }
+        }());
       } else {
         setState(() {
           _stackOffset = 0;
         });
+        _completeSettle();
       }
     });
     controller.forward();
+    return completer.future;
   }
 
   void _handleCardDragStart(DragStartDetails details) {
+    _dragging = true;
     if (_settling) {
       _cancelSettle();
     }
@@ -13982,7 +14033,15 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
     });
   }
 
+  void _handleCardDragCancel() {
+    _dragging = false;
+    if (_stackOffset != 0) {
+      _animateStackTo(0);
+    }
+  }
+
   void _handleCardSwipe(DragEndDetails details) {
+    _dragging = false;
     if (_isPreparing) {
       setState(() {
         _stackOffset = 0;
@@ -14251,6 +14310,8 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
       _screenHeight = screenHeight;
       WidgetsBinding.instance.addPostFrameCallback((_) => _measureCard());
     }
+    // 既不在拖动也不在回弹动画中时，偏移必须归零，避免卡片停留在屏幕外。
+    final stackOffset = (_settling || _dragging) ? _stackOffset : 0.0;
 
     return Scaffold(
       extendBodyBehindAppBar: true,
@@ -14286,6 +14347,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
             onVerticalDragStart: _handleCardDragStart,
             onVerticalDragUpdate: _handleCardDragUpdate,
             onVerticalDragEnd: _handleCardSwipe,
+            onVerticalDragCancel: _handleCardDragCancel,
             child: SafeArea(
               child: Padding(
               padding: const EdgeInsets.fromLTRB(18, 12, 18, 20),
@@ -14305,11 +14367,11 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
                         clipBehavior: Clip.none,
                         alignment: Alignment.center,
                         children: [
-                          if (_stackOffset != 0 && _previewPrev != null)
+                          if (stackOffset != 0 && _previewPrev != null)
                             Transform.translate(
                               offset: Offset(
                                 0,
-                                _stackOffset - _cardSpacing,
+                                stackOffset - _cardSpacing,
                               ),
                               child: IgnorePointer(
                                 child: _buildCard(
@@ -14319,11 +14381,11 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
                                 ),
                               ),
                             ),
-                          if (_stackOffset != 0 && _previewNext != null)
+                          if (stackOffset != 0 && _previewNext != null)
                             Transform.translate(
                               offset: Offset(
                                 0,
-                                _stackOffset + _cardSpacing,
+                                stackOffset + _cardSpacing,
                               ),
                               child: IgnorePointer(
                                 child: _buildCard(
@@ -14337,7 +14399,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
                             child: KeyedSubtree(
                               key: _currentCardKey,
                               child: Transform.translate(
-                                offset: Offset(0, _stackOffset),
+                                offset: Offset(0, stackOffset),
                                 child: _buildCard(context, theme),
                               ),
                             ),
