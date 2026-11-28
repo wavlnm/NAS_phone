@@ -14116,6 +14116,16 @@ class _AgentChatPageState extends State<AgentChatPage>
     );
   }
 
+  Future<void> _copyMessageText(String text) async {
+    if (text.trim().isEmpty) {
+      return;
+    }
+    await Clipboard.setData(ClipboardData(text: text));
+    if (mounted) {
+      _toast('已复制回复。');
+    }
+  }
+
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scrollController.hasClients) {
@@ -14420,26 +14430,71 @@ class _AgentChatPageState extends State<AgentChatPage>
       );
     }
 
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12, right: 28),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: const Color(0xFFE6EAF2)),
-      ),
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12, right: 28),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          if (message.text.isNotEmpty) _buildMarkdown(message.text),
-          for (var index = 0; index < message.tools.length; index++)
-            _buildTool(message, message.tools[index], index),
-          if (message.createdAt > 0)
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: const Color(0xFFE6EAF2)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (message.text.isNotEmpty) _buildMarkdown(message.text),
+                for (var index = 0; index < message.tools.length; index++)
+                  _buildTool(message, message.tools[index], index),
+                if (message.createdAt > 0)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text(
+                      _formatTime(message.createdAt),
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: Color(0xFF94A3B8),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          if (message.text.trim().isNotEmpty)
             Padding(
-              padding: const EdgeInsets.only(top: 6),
-              child: Text(
-                _formatTime(message.createdAt),
-                style: const TextStyle(fontSize: 11, color: Color(0xFF94A3B8)),
+              padding: const EdgeInsets.only(top: 4, left: 4),
+              child: Tooltip(
+                message: '复制回复',
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(6),
+                  onTap: () => _copyMessageText(message.text),
+                  child: const Padding(
+                    padding: EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 4,
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.copy_rounded,
+                          size: 13,
+                          color: Color(0xFF94A3B8),
+                        ),
+                        SizedBox(width: 4),
+                        Text(
+                          '复制',
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: Color(0xFF94A3B8),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
               ),
             ),
         ],
