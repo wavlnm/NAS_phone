@@ -301,7 +301,6 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
   SpaceScope _selectedSpace = SpaceScope.personal;
 
   bool get _hasFileSession => _baseUri != null && _authToken != null;
-  bool get _canGoUp => _hasFileSession && _currentDirectory != '/';
 
   @override
   void initState() {
@@ -1697,12 +1696,13 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _pickAndUploadFiles() async {
+  Future<void> _pickAndUploadFiles({String? rootDirectory}) async {
     final baseUri = _baseUri;
     final token = _authToken;
     if (baseUri == null || token == null || _isUploading) {
       return;
     }
+    final targetRoot = rootDirectory ?? _currentDirectory;
 
     FilePickerResult? pickerResult;
     try {
@@ -1736,14 +1736,14 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
       for (final file in pickerResult.files) {
         final uploadEntry = FileBrowserEntry(
           name: file.name,
-          path: _joinResourcePath(_currentDirectory, file.name),
+          path: _joinResourcePath(targetRoot, file.name),
           isDir: false,
           size: file.size >= 0 ? file.size : 0,
         );
         final taskId = _startTransferTask(
           kind: TransferTaskKind.upload,
           entry: uploadEntry,
-          targetLocation: _currentDirectory,
+          targetLocation: targetRoot,
           totalBytes: file.size >= 0 ? file.size : 0,
         );
 
@@ -1751,7 +1751,7 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
           await _uploadFile(
             baseUri,
             token,
-            _currentDirectory,
+            targetRoot,
             file,
             onBytes: (delta) => _updateTransferTaskBytes(taskId, delta),
           );
@@ -1801,12 +1801,13 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
   }
 
   /// 选择整个文件夹上传，保持原有目录结构（仅 Android）。
-  Future<void> _pickAndUploadFolder() async {
+  Future<void> _pickAndUploadFolder({String? rootDirectory}) async {
     final baseUri = _baseUri;
     final token = _authToken;
     if (baseUri == null || token == null || _isUploading) {
       return;
     }
+    final targetRoot = rootDirectory ?? _currentDirectory;
 
     if (!Platform.isAndroid) {
       const message = '上传文件夹目前只支持 Android 手机端。';
@@ -1900,7 +1901,7 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
           await _createDirectory(
             baseUri,
             token,
-            _joinResourcePath(_currentDirectory, '$directory/'),
+            _joinResourcePath(targetRoot, '$directory/'),
           );
         } on NasApiException {
           // 目录已存在时会被拒绝，忽略后继续
@@ -1914,8 +1915,8 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
             ? '${parts.sublist(0, parts.length - 1).join('/')}/'
             : '';
         final targetDirectory = relativeDirectory.isEmpty
-            ? _currentDirectory
-            : _joinResourcePath(_currentDirectory, relativeDirectory);
+            ? targetRoot
+            : _joinResourcePath(targetRoot, relativeDirectory);
         final taskId = _startTransferTask(
           kind: TransferTaskKind.upload,
           entry: FileBrowserEntry(
@@ -2003,12 +2004,13 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _createFolder() async {
+  Future<void> _createFolder({String? rootDirectory}) async {
     final baseUri = _baseUri;
     final token = _authToken;
     if (baseUri == null || token == null || _isCreatingFolder) {
       return;
     }
+    final targetRoot = rootDirectory ?? _currentDirectory;
 
     final controller = TextEditingController();
     final folderName = await showDialog<String>(
@@ -2066,7 +2068,7 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
       await _createDirectory(
         baseUri,
         token,
-        _joinDirectoryPath(_currentDirectory, folderName),
+        _joinDirectoryPath(targetRoot, folderName),
       );
       if (!mounted) {
         return;
@@ -2967,7 +2969,7 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
 
   Future<void> _openEntry(FileBrowserEntry entry) async {
     if (entry.isDir) {
-      await _refreshFiles(path: entry.path);
+      await _openDirectoryPage(entry.path);
       return;
     }
 
@@ -3782,6 +3784,16 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
   final Set<String> _videoThumbFailed = {};
   int _videoThumbActive = 0;
   static const _kMaxVideoThumbConcurrent = 3;
+  // 子目录浏览页当前展示的条目，用于判断缩略图请求是否仍然可见。
+  final Map<Object, Set<String>> _pageVisiblePaths = {};
+
+  void _setPageVisiblePaths(Object owner, Set<String>? paths) {
+    if (paths == null) {
+      _pageVisiblePaths.remove(owner);
+    } else {
+      _pageVisiblePaths[owner] = paths;
+    }
+  }
 
   Future<void> _loadViewMode() async {
     try {
@@ -3835,7 +3847,10 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
   }
 
   void _pumpVideoThumbQueue() {
-    final visiblePaths = {for (final entry in _entries) entry.path};
+    final visiblePaths = <String>{
+      for (final entry in _entries) entry.path,
+      for (final paths in _pageVisiblePaths.values) ...paths,
+    };
     while (_videoThumbActive < _kMaxVideoThumbConcurrent &&
         _videoThumbQueue.isNotEmpty) {
       final resourcePath = _videoThumbQueue.removeAt(0);
@@ -3904,13 +3919,18 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
     }
   }
 
-  Widget _buildFileGridItem(FileBrowserEntry entry) {
-    final isBusy = _busyEntryPath == entry.path;
+  Widget _buildFileGridItem(
+    FileBrowserEntry entry, {
+    bool busy = false,
+    VoidCallback? onTap,
+    VoidCallback? onLongPress,
+  }) {
+    final isBusy = busy;
     final theme = Theme.of(context);
 
     return InkWell(
-      onTap: () => _openEntry(entry),
-      onLongPress: () => _showEntryActionsSheet(entry),
+      onTap: onTap ?? () => _openEntry(entry),
+      onLongPress: onLongPress ?? () => _showEntryActionsSheet(entry),
       borderRadius: BorderRadius.circular(14),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -3956,7 +3976,63 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
     );
   }
 
-  Future<void> _showEntryActionsSheet(FileBrowserEntry entry) async {
+  Widget _buildFileListTile(
+    FileBrowserEntry entry, {
+    required bool busy,
+    required VoidCallback onTap,
+    required void Function(EntryMenuAction action) onAction,
+  }) {
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: _buildEntryLeading(entry),
+      title: Text(entry.name),
+      subtitle: Text(_buildEntrySubtitle(entry)),
+      onTap: onTap,
+      trailing: busy
+          ? const SizedBox(
+              width: 18,
+              height: 18,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            )
+          : PopupMenuButton<EntryMenuAction>(
+              tooltip: '更多操作',
+              onSelected: onAction,
+              itemBuilder: (context) => [
+                const PopupMenuItem<EntryMenuAction>(
+                  value: EntryMenuAction.delete,
+                  child: Text('删除'),
+                ),
+                const PopupMenuItem<EntryMenuAction>(
+                  value: EntryMenuAction.move,
+                  child: Text('移动'),
+                ),
+                const PopupMenuItem<EntryMenuAction>(
+                  value: EntryMenuAction.rename,
+                  child: Text('重命名'),
+                ),
+                const PopupMenuItem<EntryMenuAction>(
+                  value: EntryMenuAction.compress,
+                  child: Text('压缩'),
+                ),
+                const PopupMenuItem<EntryMenuAction>(
+                  value: EntryMenuAction.download,
+                  child: Text('下载'),
+                ),
+                if (!entry.isDir)
+                  const PopupMenuItem<EntryMenuAction>(
+                    value: EntryMenuAction.share,
+                    child: Text('分享'),
+                  ),
+              ],
+              icon: const Icon(Icons.more_horiz),
+            ),
+    );
+  }
+
+  Future<void> _showEntryActionsSheet(
+    FileBrowserEntry entry, {
+    void Function(EntryMenuAction action)? onAction,
+  }) async {
     final action = await showModalBottomSheet<EntryMenuAction>(
       context: context,
       backgroundColor: Colors.white,
@@ -4009,7 +4085,11 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
     );
 
     if (action != null && mounted) {
-      await _handleEntryAction(entry, action);
+      if (onAction != null) {
+        onAction(action);
+      } else {
+        await _handleEntryAction(entry, action);
+      }
     }
   }
 
@@ -4201,6 +4281,88 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
           buildSubtitle: _buildEntrySubtitle,
           onOpenEntry: _openEntry,
           onHandleEntryAction: _handleEntryAction,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openSearchPage({String? scopePath}) async {
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请先连接电脑。')),
+      );
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => FileSearchPage(
+          baseUri: baseUri,
+          scopePath: scopePath,
+          showPrivate: _privacyActive,
+          loadHeaders: () async {
+            final headers = Map<String, String>.from(
+              await _buildNasAuthHeaders(),
+            );
+            headers['X-Auth'] = token;
+            headers[HttpHeaders.acceptHeader] = 'application/json';
+            return headers;
+          },
+          buildLeading: _buildEntryLeading,
+          onOpenEntry: _openEntry,
+          onOpenDirectory: _openDirectoryPage,
+          onVisiblePathsChanged: _setPageVisiblePaths,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openDirectoryPage(String directoryPath) async {
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null) {
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => FileBrowserPage(
+          directoryPath: directoryPath,
+          loadDirectory: (path) => _fetchDirectory(baseUri, token, path),
+          buildListTile: (
+            entry, {
+            required busy,
+            required onTap,
+            required onAction,
+          }) => _buildFileListTile(
+            entry,
+            busy: busy,
+            onTap: onTap,
+            onAction: onAction,
+          ),
+          buildGridItem: (
+            entry, {
+            required busy,
+            required onTap,
+            required onLongPress,
+          }) => _buildFileGridItem(
+            entry,
+            busy: busy,
+            onTap: onTap,
+            onLongPress: onLongPress,
+          ),
+          onOpenDirectory: _openDirectoryPage,
+          onOpenFile: _openEntry,
+          onOpenSearch: (path) => _openSearchPage(scopePath: path),
+          onHandleEntryAction: _handleEntryAction,
+          onShowEntryActions: (entry, onAction) =>
+              _showEntryActionsSheet(entry, onAction: onAction),
+          onUploadFiles: _pickAndUploadFiles,
+          onUploadFolder: _pickAndUploadFolder,
+          onCreateFolder: _createFolder,
+          onVisiblePathsChanged: _setPageVisiblePaths,
+          initialGrid: _isGridView,
+          onGridChanged: (value) => _setGridView(value),
         ),
       ),
     );
@@ -5868,20 +6030,19 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
                   const SizedBox(width: 8),
                   _buildDirectoryQuickActionButton(canOpenQuickActions),
                   const SizedBox(width: 8),
-                  const Spacer(),
-                  FilledButton.tonalIcon(
-                    onPressed: _canGoUp && !_isLoadingFiles
-                        ? () => _refreshFiles(
-                            path: _parentDirectoryPath(_currentDirectory),
-                          )
-                        : null,
-                    style: FilledButton.styleFrom(
-                      minimumSize: const Size(0, 40),
-                      padding: const EdgeInsets.symmetric(horizontal: 12),
-                      visualDensity: VisualDensity.compact,
+                  Container(
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF1F5F9),
+                      borderRadius: BorderRadius.circular(14),
                     ),
-                    icon: const Icon(Icons.arrow_upward_rounded),
-                    label: const Text('上级目录'),
+                    child: IconButton(
+                      onPressed: _hasFileSession
+                          ? () => _openSearchPage()
+                          : null,
+                      tooltip: '搜索文件',
+                      visualDensity: VisualDensity.compact,
+                      icon: const Icon(Icons.search_rounded),
+                    ),
                   ),
             ],
           ),
@@ -5920,67 +6081,31 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
                   childAspectRatio: 0.78,
                 ),
                 itemCount: _entries.length,
-                itemBuilder: (context, index) =>
-                    _buildFileGridItem(_entries[index]),
+                itemBuilder: (context, index) {
+                  final entry = _entries[index];
+                  return _buildFileGridItem(
+                    entry,
+                    busy: _busyEntryPath == entry.path,
+                    onTap: () => _openEntry(entry),
+                  );
+                },
               )
             else
               ListView.separated(
-              shrinkWrap: true,
-              physics: const NeverScrollableScrollPhysics(),
-              itemCount: _entries.length,
-              separatorBuilder: (_, _) => const Divider(height: 1),
-              itemBuilder: (context, index) {
-                final entry = _entries[index];
-                final isBusy = _busyEntryPath == entry.path;
-
-                return ListTile(
-                  contentPadding: EdgeInsets.zero,
-                  leading: _buildEntryLeading(entry),
-                  title: Text(entry.name),
-                  subtitle: Text(_buildEntrySubtitle(entry)),
-                  onTap: () => _openEntry(entry),
-                  trailing: isBusy
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : PopupMenuButton<EntryMenuAction>(
-                          tooltip: '更多操作',
-                          onSelected: (action) =>
-                              _handleEntryAction(entry, action),
-                          itemBuilder: (context) => [
-                            const PopupMenuItem<EntryMenuAction>(
-                              value: EntryMenuAction.delete,
-                              child: Text('删除'),
-                            ),
-                            const PopupMenuItem<EntryMenuAction>(
-                              value: EntryMenuAction.move,
-                              child: Text('移动'),
-                            ),
-                            const PopupMenuItem<EntryMenuAction>(
-                              value: EntryMenuAction.rename,
-                              child: Text('重命名'),
-                            ),
-                            const PopupMenuItem<EntryMenuAction>(
-                              value: EntryMenuAction.compress,
-                              child: Text('压缩'),
-                            ),
-                            const PopupMenuItem<EntryMenuAction>(
-                              value: EntryMenuAction.download,
-                              child: Text('下载'),
-                            ),
-                            if (!entry.isDir)
-                              const PopupMenuItem<EntryMenuAction>(
-                                value: EntryMenuAction.share,
-                                child: Text('分享'),
-                              ),
-                          ],
-                          icon: const Icon(Icons.more_horiz),
-                        ),
-                );
-              },
-            ),
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                itemCount: _entries.length,
+                separatorBuilder: (_, _) => const Divider(height: 1),
+                itemBuilder: (context, index) {
+                  final entry = _entries[index];
+                  return _buildFileListTile(
+                    entry,
+                    busy: _busyEntryPath == entry.path,
+                    onTap: () => _openEntry(entry),
+                    onAction: (action) => _handleEntryAction(entry, action),
+                  );
+                },
+              ),
           ],
         ],
       ),
@@ -7948,6 +8073,779 @@ class _PlainInfoCard extends StatelessWidget {
                 ),
               ),
             ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class FileSearchPage extends StatefulWidget {
+  const FileSearchPage({
+    required this.baseUri,
+    required this.loadHeaders,
+    required this.buildLeading,
+    required this.onOpenEntry,
+    required this.onOpenDirectory,
+    required this.onVisiblePathsChanged,
+    this.scopePath,
+    this.showPrivate = false,
+    super.key,
+  });
+
+  final Uri baseUri;
+  final Future<Map<String, String>> Function() loadHeaders;
+  final Widget Function(FileBrowserEntry entry) buildLeading;
+  final Future<void> Function(FileBrowserEntry entry) onOpenEntry;
+  final Future<void> Function(String path) onOpenDirectory;
+  final void Function(Object owner, Set<String>? paths) onVisiblePathsChanged;
+
+  // null 表示搜索整个空间，否则只递归搜索这个目录。
+  final String? scopePath;
+  final bool showPrivate;
+
+  @override
+  State<FileSearchPage> createState() => _FileSearchPageState();
+}
+
+class _FileSearchPageState extends State<FileSearchPage> {
+  static const int _maxResults = 200;
+  final Object _visibilityToken = Object();
+  final TextEditingController _controller = TextEditingController();
+  Timer? _debounce;
+  HttpClient? _client;
+  int _requestId = 0;
+  List<FileBrowserEntry> _results = const [];
+  bool _searching = false;
+  String? _error;
+  String _query = '';
+
+  String get _scopeLabel {
+    final scope = widget.scopePath;
+    if (scope == null || scope == '/' || scope.isEmpty) {
+      return '全盘';
+    }
+    return scope;
+  }
+
+  String get _normalizedScope {
+    final scope = widget.scopePath;
+    if (scope == null || scope == '/' || scope.isEmpty) {
+      return '/';
+    }
+    final withLeading = scope.startsWith('/') ? scope : '/$scope';
+    return withLeading.endsWith('/') ? withLeading : '$withLeading/';
+  }
+
+  Uri _searchUri(String query) {
+    // filebrowser 的搜索接口没有尾斜杠会 301 并丢失查询参数。
+    final scopeSegment = _normalizedScope == '/'
+        ? '/'
+        : _encodeResourcePath(_normalizedScope);
+    return widget.baseUri.replace(
+      path: '/api/filebrowser/search$scopeSegment',
+      queryParameters: {'query': query},
+    );
+  }
+
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    _client?.close(force: true);
+    _controller.dispose();
+    widget.onVisiblePathsChanged(_visibilityToken, null);
+    super.dispose();
+  }
+
+  void _onQueryChanged(String value) {
+    final query = value.trim();
+    setState(() {
+      _query = query;
+    });
+    _debounce?.cancel();
+    if (query.isEmpty) {
+      unawaited(_startSearch(''));
+      return;
+    }
+    _debounce = Timer(const Duration(milliseconds: 350), () {
+      unawaited(_startSearch(query));
+    });
+  }
+
+  Future<void> _startSearch(String query) async {
+    final requestId = ++_requestId;
+    _client?.close(force: true);
+    _client = null;
+
+    if (query.isEmpty) {
+      if (!mounted) {
+        return;
+      }
+      widget.onVisiblePathsChanged(_visibilityToken, const {});
+      setState(() {
+        _searching = false;
+        _error = null;
+        _results = const [];
+      });
+      return;
+    }
+
+    widget.onVisiblePathsChanged(_visibilityToken, const {});
+    setState(() {
+      _searching = true;
+      _error = null;
+      _results = const [];
+    });
+
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10);
+    _client = client;
+    var collected = <FileBrowserEntry>[];
+    var pending = <FileBrowserEntry>[];
+    try {
+      final request = await client
+          .getUrl(_searchUri(query))
+          .timeout(const Duration(seconds: 12));
+      (await widget.loadHeaders()).forEach(request.headers.set);
+      final response = await request.close().timeout(
+        const Duration(seconds: 15),
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw NasApiException('搜索失败：${response.statusCode}。');
+      }
+
+      await for (final line
+          in response.transform(utf8.decoder).transform(const LineSplitter())) {
+        if (!mounted || requestId != _requestId) {
+          return;
+        }
+        final text = line.trim();
+        if (text.isEmpty) {
+          continue;
+        }
+        final entry = _parseSearchResult(text);
+        if (entry == null) {
+          continue;
+        }
+        pending.add(entry);
+        if (pending.length >= 20) {
+          collected.addAll(pending);
+          pending = <FileBrowserEntry>[];
+          _flushResults(requestId, collected, searching: true);
+        }
+        if (collected.length + pending.length >= _maxResults) {
+          break;
+        }
+      }
+
+      collected.addAll(pending);
+      _flushResults(requestId, collected, searching: false);
+    } catch (error) {
+      if (!mounted || requestId != _requestId) {
+        return;
+      }
+      setState(() {
+        _searching = false;
+        _error = error is NasApiException
+            ? error.message
+            : '搜索失败，请稍后重试。';
+      });
+    } finally {
+      client.close(force: true);
+      if (identical(_client, client)) {
+        _client = null;
+      }
+    }
+  }
+
+  FileBrowserEntry? _parseSearchResult(String line) {
+    Object? decoded;
+    try {
+      decoded = jsonDecode(line);
+    } on FormatException {
+      return null;
+    }
+    if (decoded is! Map) {
+      return null;
+    }
+    var relativePath = decoded['path']?.toString() ?? '';
+    if (relativePath.isEmpty) {
+      return null;
+    }
+    if (relativePath.startsWith('/')) {
+      relativePath = relativePath.substring(1);
+    }
+    // 搜索返回的是相对搜索起点的路径，需要补回目录前缀。
+    final scope = _normalizedScope;
+    final path = scope == '/' ? '/$relativePath' : '$scope$relativePath';
+    if (!widget.showPrivate && _isPrivatePath(path)) {
+      return null;
+    }
+    final name = path.split('/').last;
+    if (name.isEmpty) {
+      return null;
+    }
+    return FileBrowserEntry(
+      name: name,
+      path: path,
+      isDir: decoded['dir'] == true,
+      size: 0,
+    );
+  }
+
+  void _flushResults(
+    int requestId,
+    List<FileBrowserEntry> results, {
+    required bool searching,
+  }) {
+    if (!mounted || requestId != _requestId) {
+      return;
+    }
+    widget.onVisiblePathsChanged(_visibilityToken, {
+      for (final entry in results) entry.path,
+    });
+    setState(() {
+      _results = List<FileBrowserEntry>.unmodifiable(results);
+      _searching = searching;
+    });
+  }
+
+  Future<void> _openResult(FileBrowserEntry entry) async {
+    if (entry.isDir) {
+      await widget.onOpenDirectory(entry.path);
+      return;
+    }
+    await widget.onOpenEntry(entry);
+  }
+
+  Widget _buildHint(String text) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Text(
+          text,
+          textAlign: TextAlign.center,
+          style: const TextStyle(color: Color(0xFF64748B)),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBody(ThemeData theme) {
+    if (_error != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                _error!,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Color(0xFFB42318)),
+              ),
+              const SizedBox(height: 12),
+              FilledButton.tonal(
+                onPressed: () => unawaited(_startSearch(_query)),
+                child: const Text('重试'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    if (_query.isEmpty) {
+      return _buildHint('输入关键词，搜索个人空间里的文件名。');
+    }
+    if (_results.isEmpty) {
+      if (_searching) {
+        return const SizedBox.shrink();
+      }
+      return _buildHint('没有找到匹配的文件。');
+    }
+    return ListView.separated(
+      padding: const EdgeInsets.fromLTRB(20, 4, 20, 24),
+      itemCount: _results.length,
+      separatorBuilder: (_, _) => const Divider(height: 1),
+      itemBuilder: (context, index) {
+        final entry = _results[index];
+        return ListTile(
+          contentPadding: EdgeInsets.zero,
+          leading: widget.buildLeading(entry),
+          title: Text(entry.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+          subtitle: Text(
+            _parentDirectoryPath(entry.path),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: const Color(0xFF64748B),
+            ),
+          ),
+          trailing: entry.isDir
+              ? const Icon(Icons.chevron_right, color: Color(0xFF94A3B8))
+              : null,
+          onTap: () => unawaited(_openResult(entry)),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Scaffold(
+      appBar: AppBar(
+        title: TextField(
+          controller: _controller,
+          autofocus: true,
+          textInputAction: TextInputAction.search,
+          decoration: InputDecoration(
+            hintText: '搜索文件…',
+            border: InputBorder.none,
+            isDense: true,
+            suffixIconConstraints: const BoxConstraints(minWidth: 40),
+            suffixIcon: _query.isEmpty
+                ? null
+                : IconButton(
+                    tooltip: '清空',
+                    visualDensity: VisualDensity.compact,
+                    icon: const Icon(Icons.close_rounded),
+                    onPressed: () {
+                      _controller.clear();
+                      _onQueryChanged('');
+                    },
+                  ),
+          ),
+          style: theme.textTheme.titleMedium,
+          onChanged: _onQueryChanged,
+          onSubmitted: (value) {
+            _debounce?.cancel();
+            unawaited(_startSearch(value.trim()));
+          },
+        ),
+        actions: [
+          IconButton(
+            tooltip: '搜索',
+            icon: const Icon(Icons.search_rounded),
+            onPressed: () {
+              _debounce?.cancel();
+              unawaited(_startSearch(_controller.text.trim()));
+            },
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (_searching) const LinearProgressIndicator(minHeight: 2),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
+              child: Text(
+                '范围: $_scopeLabel',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: const Color(0xFF64748B),
+                ),
+              ),
+            ),
+            Expanded(child: _buildBody(theme)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class FileBrowserPage extends StatefulWidget {
+  const FileBrowserPage({
+    required this.directoryPath,
+    required this.loadDirectory,
+    required this.buildListTile,
+    required this.buildGridItem,
+    required this.onOpenDirectory,
+    required this.onOpenFile,
+    required this.onOpenSearch,
+    required this.onHandleEntryAction,
+    required this.onShowEntryActions,
+    required this.onUploadFiles,
+    required this.onUploadFolder,
+    required this.onCreateFolder,
+    required this.onVisiblePathsChanged,
+    this.initialGrid = false,
+    this.onGridChanged,
+    super.key,
+  });
+
+  final String directoryPath;
+  final Future<FileBrowserDirectory> Function(String path) loadDirectory;
+  final Widget Function(
+    FileBrowserEntry entry, {
+    required bool busy,
+    required VoidCallback onTap,
+    required void Function(EntryMenuAction action) onAction,
+  })
+  buildListTile;
+  final Widget Function(
+    FileBrowserEntry entry, {
+    required bool busy,
+    required VoidCallback onTap,
+    required VoidCallback onLongPress,
+  })
+  buildGridItem;
+  final Future<void> Function(String path) onOpenDirectory;
+  final Future<void> Function(FileBrowserEntry entry) onOpenFile;
+  final Future<void> Function(String path) onOpenSearch;
+  final Future<void> Function(FileBrowserEntry entry, EntryMenuAction action)
+  onHandleEntryAction;
+  final Future<void> Function(
+    FileBrowserEntry entry,
+    void Function(EntryMenuAction action) onAction,
+  )
+  onShowEntryActions;
+  final Future<void> Function({String? rootDirectory}) onUploadFiles;
+  final Future<void> Function({String? rootDirectory}) onUploadFolder;
+  final Future<void> Function({String? rootDirectory}) onCreateFolder;
+  final void Function(Object owner, Set<String>? paths) onVisiblePathsChanged;
+  final bool initialGrid;
+  final ValueChanged<bool>? onGridChanged;
+
+  @override
+  State<FileBrowserPage> createState() => _FileBrowserPageState();
+}
+
+class _FileBrowserPageState extends State<FileBrowserPage> {
+  final Object _visibilityToken = Object();
+  List<FileBrowserEntry> _entries = const [];
+  bool _isLoading = true;
+  String? _error;
+  bool _isGrid = false;
+  String? _busyEntryPath;
+
+  String get _title {
+    final path = widget.directoryPath;
+    if (path.isEmpty || path == '/') {
+      return '根目录';
+    }
+    final trimmed = path.endsWith('/')
+        ? path.substring(0, path.length - 1)
+        : path;
+    final name = trimmed.split('/').last;
+    return name.isEmpty ? '根目录' : name;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _isGrid = widget.initialGrid;
+    unawaited(_load());
+  }
+
+  @override
+  void dispose() {
+    widget.onVisiblePathsChanged(_visibilityToken, null);
+    super.dispose();
+  }
+
+  Future<void> _load({bool showLoading = true}) async {
+    if (showLoading) {
+      setState(() {
+        _isLoading = true;
+        _error = null;
+      });
+    }
+
+    try {
+      final directory = await widget.loadDirectory(widget.directoryPath);
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _entries = directory.items;
+        _error = null;
+      });
+      widget.onVisiblePathsChanged(_visibilityToken, {
+        for (final entry in directory.items) entry.path,
+      });
+    } on NasApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _error = error.message;
+      });
+    } finally {
+      if (mounted && showLoading) {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _openEntry(FileBrowserEntry entry) async {
+    if (entry.isDir) {
+      await widget.onOpenDirectory(entry.path);
+      return;
+    }
+    await widget.onOpenFile(entry);
+  }
+
+  Future<void> _runAction(
+    FileBrowserEntry entry,
+    EntryMenuAction action,
+  ) async {
+    setState(() {
+      _busyEntryPath = entry.path;
+    });
+    try {
+      await widget.onHandleEntryAction(entry, action);
+      await _load(showLoading: false);
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busyEntryPath = null;
+        });
+      }
+    }
+  }
+
+  Future<void> _runUpload(
+    Future<void> Function({String? rootDirectory}) action,
+  ) async {
+    await action(rootDirectory: widget.directoryPath);
+    if (mounted) {
+      await _load(showLoading: false);
+    }
+  }
+
+  void _toggleGrid() {
+    final next = !_isGrid;
+    setState(() {
+      _isGrid = next;
+    });
+    widget.onGridChanged?.call(next);
+  }
+
+  Widget _toolbarIcon({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback? onPressed,
+  }) {
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFFF1F5F9),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: IconButton(
+        onPressed: onPressed,
+        tooltip: tooltip,
+        visualDensity: VisualDensity.compact,
+        icon: Icon(icon),
+      ),
+    );
+  }
+
+  Widget _buildQuickActions() {
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFFCFF4EA),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: SizedBox(
+        width: 40,
+        height: 40,
+        child: PopupMenuButton<String>(
+          tooltip: '更多操作',
+          padding: EdgeInsets.zero,
+          splashRadius: 20,
+          iconColor: const Color(0xFF0F766E),
+          icon: const Icon(Icons.add_rounded),
+          color: Colors.white,
+          onSelected: (value) {
+            switch (value) {
+              case 'upload':
+                unawaited(_runUpload(widget.onUploadFiles));
+                break;
+              case 'uploadFolder':
+                unawaited(_runUpload(widget.onUploadFolder));
+                break;
+              case 'folder':
+                unawaited(_runUpload(widget.onCreateFolder));
+                break;
+            }
+          },
+          itemBuilder: (context) => const [
+            PopupMenuItem<String>(
+              value: 'upload',
+              child: Row(
+                children: [
+                  Icon(Icons.upload_file_outlined, size: 20),
+                  SizedBox(width: 10),
+                  Text('上传文件'),
+                ],
+              ),
+            ),
+            PopupMenuItem<String>(
+              value: 'uploadFolder',
+              child: Row(
+                children: [
+                  Icon(Icons.drive_folder_upload_outlined, size: 20),
+                  SizedBox(width: 10),
+                  Text('上传文件夹'),
+                ],
+              ),
+            ),
+            PopupMenuItem<String>(
+              value: 'folder',
+              child: Row(
+                children: [
+                  Icon(Icons.create_new_folder_outlined, size: 20),
+                  SizedBox(width: 10),
+                  Text('新建文件夹'),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(_title, maxLines: 1, overflow: TextOverflow.ellipsis),
+        actions: [
+          IconButton(
+            tooltip: '搜索',
+            icon: const Icon(Icons.search_rounded),
+            onPressed: () => unawaited(
+              widget.onOpenSearch(widget.directoryPath),
+            ),
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+          children: [
+            Text(
+              widget.directoryPath,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: const Color(0xFF64748B),
+              ),
+            ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                _toolbarIcon(
+                  icon: _isGrid
+                      ? Icons.view_list_rounded
+                      : Icons.grid_view_rounded,
+                  tooltip: _isGrid ? '切换到列表' : '切换到格子',
+                  onPressed: _toggleGrid,
+                ),
+                const SizedBox(width: 8),
+                _toolbarIcon(
+                  icon: Icons.refresh_rounded,
+                  tooltip: '刷新',
+                  onPressed: _isLoading ? null : _load,
+                ),
+                const SizedBox(width: 8),
+                _buildQuickActions(),
+              ],
+            ),
+            const SizedBox(height: 12),
+            if (_isLoading) ...[
+              const LinearProgressIndicator(minHeight: 3),
+              const SizedBox(height: 12),
+            ],
+            if (_error != null)
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFFEE4E2),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      _error!,
+                      style: const TextStyle(color: Color(0xFFB42318)),
+                    ),
+                    const SizedBox(height: 10),
+                    FilledButton.tonal(
+                      onPressed: _load,
+                      child: const Text('重试'),
+                    ),
+                  ],
+                ),
+              )
+            else if (_entries.isEmpty)
+              Container(
+                padding: const EdgeInsets.all(20),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: const Text('当前目录为空。'),
+              )
+            else if (_isGrid)
+              GridView.builder(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                  crossAxisCount: 3,
+                  mainAxisSpacing: 14,
+                  crossAxisSpacing: 12,
+                  childAspectRatio: 0.78,
+                ),
+                itemCount: _entries.length,
+                itemBuilder: (context, index) {
+                  final entry = _entries[index];
+                  return widget.buildGridItem(
+                    entry,
+                    busy: _busyEntryPath == entry.path,
+                    onTap: () => _openEntry(entry),
+                    onLongPress: () => unawaited(
+                      widget.onShowEntryActions(
+                        entry,
+                        (action) => unawaited(_runAction(entry, action)),
+                      ),
+                    ),
+                  );
+                },
+              )
+            else
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 18),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: ListView.separated(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: _entries.length,
+                  separatorBuilder: (_, _) => const Divider(height: 1),
+                  itemBuilder: (context, index) {
+                    final entry = _entries[index];
+                    return widget.buildListTile(
+                      entry,
+                      busy: _busyEntryPath == entry.path,
+                      onTap: () => _openEntry(entry),
+                      onAction: (action) => _runAction(entry, action),
+                    );
+                  },
+                ),
+              ),
           ],
         ),
       ),
