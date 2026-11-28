@@ -13592,6 +13592,16 @@ class _AgentChatPageState extends State<AgentChatPage> {
   }
 
   Widget _buildApprovalCard(AgentPendingApproval pending) {
+    final screenHeight = MediaQuery.sizeOf(context).height;
+    final baseCommandHeight = (screenHeight * 0.22).clamp(120.0, 220.0);
+    // 问答卡也在同屏时再压缩命令区，避免两张卡叠加把按钮顶出屏幕。
+    final maxCommandHeight = _pendingQuestion == null
+        ? baseCommandHeight.toDouble()
+        : min(baseCommandHeight.toDouble(), 130.0);
+    final commandIsLong =
+        pending.command.length > 600 ||
+        '\n'.allMatches(pending.command).length > 10;
+
     return Container(
       margin: const EdgeInsets.fromLTRB(12, 6, 12, 6),
       padding: const EdgeInsets.all(14),
@@ -13601,6 +13611,7 @@ class _AgentChatPageState extends State<AgentChatPage> {
         border: Border.all(color: const Color(0xFFFDE68A)),
       ),
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const Row(
@@ -13625,8 +13636,24 @@ class _AgentChatPageState extends State<AgentChatPage> {
               color: const Color(0xFF0B1220),
               borderRadius: BorderRadius.circular(8),
             ),
-            child: _buildHighlightedCommand(pending.command, pending.matched),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(maxHeight: maxCommandHeight),
+              child: SingleChildScrollView(
+                child: _buildHighlightedCommand(
+                  pending.command,
+                  pending.matched,
+                ),
+              ),
+            ),
           ),
+          if (commandIsLong)
+            const Padding(
+              padding: EdgeInsets.only(top: 6),
+              child: Text(
+                '命令较长，可在黑色框内上下滑动查看完整内容',
+                style: TextStyle(fontSize: 11, color: Color(0xFF8A5A00)),
+              ),
+            ),
           if ((pending.matched ?? '').isNotEmpty)
             Padding(
               padding: const EdgeInsets.only(top: 6),
