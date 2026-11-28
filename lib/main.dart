@@ -11771,9 +11771,11 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
   bool _handlingCompletion = false;
 
   final GlobalKey _currentCardKey = GlobalKey();
+  final GlobalKey _lyricsHoleKey = GlobalKey();
   double _cardHeight = 0;
   double _screenHeight = 0;
   double _slotTop = 0;
+  Rect? _lyricsHole;
   double _stackOffset = 0;
   bool _settling = false;
   AnimationController? _settleController;
@@ -12826,13 +12828,23 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
       return;
     }
     final height = box.size.height;
-    final top = box.localToGlobal(Offset.zero).dy - _stackOffset;
-    if ((height - _cardHeight).abs() < 0.5 && (top - _slotTop).abs() < 0.5) {
+    final origin = box.localToGlobal(Offset.zero);
+    final top = origin.dy - _stackOffset;
+    Rect? hole;
+    final lyricsBox =
+        _lyricsHoleKey.currentContext?.findRenderObject() as RenderBox?;
+    if (lyricsBox != null && lyricsBox.hasSize) {
+      hole = (lyricsBox.localToGlobal(Offset.zero) - origin) & lyricsBox.size;
+    }
+    if ((height - _cardHeight).abs() < 0.5 &&
+        (top - _slotTop).abs() < 0.5 &&
+        hole == _lyricsHole) {
       return;
     }
     setState(() {
       _cardHeight = height;
       _slotTop = top;
+      _lyricsHole = hole;
     });
   }
 
@@ -12974,24 +12986,41 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
       color: Colors.white.withValues(alpha: 0.88),
     );
 
+    final hole = preview ? null : _lyricsHole;
     return ClipRRect(
       borderRadius: BorderRadius.circular(24),
-      child: BackdropFilter.grouped(
-        filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
-        child: DecoratedBox(
-          decoration: BoxDecoration(
-            color: const Color(0x2A111827),
-            borderRadius: BorderRadius.circular(24),
-            border: Border.all(color: Colors.white.withValues(alpha: 0.2)),
-            boxShadow: const [
-              BoxShadow(
-                color: Color(0x22000000),
-                blurRadius: 24,
-                offset: Offset(0, 12),
+      child: Stack(
+        children: [
+          Positioned.fill(
+            child: ClipPath(
+              clipper: _CardBlurClipper(hole: hole),
+              child: BackdropFilter.grouped(
+                filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+                child: const SizedBox.expand(),
               ),
-            ],
+            ),
           ),
-          child: Padding(
+          if (hole != null)
+            Positioned.fromRect(
+              rect: hole.inflate(1),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(13),
+                child: BackdropFilter.grouped(
+                  filter: ImageFilter.blur(sigmaX: 5, sigmaY: 5),
+                  child: const SizedBox.expand(),
+                ),
+              ),
+            ),
+          Positioned.fill(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: const Color(0x2A111827),
+                borderRadius: BorderRadius.circular(24),
+                border: Border.all(color: Colors.white.withValues(alpha: 0.2)),
+              ),
+            ),
+          ),
+          Padding(
             padding: const EdgeInsets.fromLTRB(18, 14, 18, 16),
             child: Column(
               mainAxisSize: MainAxisSize.min,
@@ -13019,14 +13048,10 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
                 ),
                 const SizedBox(height: 10),
                 SizedBox(
+                  key: preview ? null : _lyricsHoleKey,
                   height: _LyricsPanelState._height,
                   child: preview
-                      ? DecoratedBox(
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.02),
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                        )
+                      ? const SizedBox.shrink()
                       : _LyricsPanel(
                           lyrics: _lyricsText,
                           loading: _lyricsLoading,
@@ -13124,7 +13149,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
               ],
             ),
           ),
-        ),
+        ],
       ),
     );
   }
@@ -13258,6 +13283,36 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
   }
 }
 
+class _CardBlurClipper extends CustomClipper<Path> {
+  const _CardBlurClipper({required this.hole});
+
+  // 歌词区域相对卡片左上角的矩形，用于在毛玻璃上开一个更浅的窗口。
+  final Rect? hole;
+
+  @override
+  Path getClip(Size size) {
+    final card = Path()
+      ..addRRect(
+        RRect.fromRectAndRadius(
+          Offset.zero & size,
+          const Radius.circular(24),
+        ),
+      );
+    final holeRect = hole;
+    if (holeRect == null || holeRect.isEmpty) {
+      return card;
+    }
+    final window = Path()
+      ..addRRect(
+        RRect.fromRectAndRadius(holeRect, const Radius.circular(12)),
+      );
+    return Path.combine(PathOperation.difference, card, window);
+  }
+
+  @override
+  bool shouldReclip(_CardBlurClipper oldClipper) => oldClipper.hole != hole;
+}
+
 class _LyricsPanel extends StatefulWidget {
   const _LyricsPanel({
     required this.lyrics,
@@ -13381,10 +13436,6 @@ class _LyricsPanelState extends State<_LyricsPanel> {
       return Container(
         height: 52,
         alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.02),
-          borderRadius: BorderRadius.circular(12),
-        ),
         child: const Row(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -13406,10 +13457,6 @@ class _LyricsPanelState extends State<_LyricsPanel> {
     final error = widget.error;
     return Container(
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 6),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.02),
-        borderRadius: BorderRadius.circular(12),
-      ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -13444,10 +13491,6 @@ class _LyricsPanelState extends State<_LyricsPanel> {
     return Container(
       height: _height,
       padding: const EdgeInsets.fromLTRB(14, 10, 14, 10),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.02),
-        borderRadius: BorderRadius.circular(12),
-      ),
       child: SingleChildScrollView(
         child: SelectableText(
           _lines.first.text,
@@ -13464,11 +13507,6 @@ class _LyricsPanelState extends State<_LyricsPanel> {
   Widget _buildSyncedLyrics() {
     return Container(
       height: _height,
-      clipBehavior: Clip.antiAlias,
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.02),
-        borderRadius: BorderRadius.circular(12),
-      ),
       child: ListView.builder(
         controller: _scrollController,
         itemExtent: _lineExtent,
