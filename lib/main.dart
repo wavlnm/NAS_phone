@@ -4206,6 +4206,76 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
     );
   }
 
+  Future<Map<String, dynamic>?> _readMusicPlayerState(
+    Uri baseUri,
+    String token,
+  ) async {
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 8);
+    try {
+      final request = await client
+          .getUrl(_buildRawResourceUri(baseUri, '/音乐播放器/player.json'))
+          .timeout(const Duration(seconds: 10));
+      (await _buildNasAuthHeaders()).forEach(request.headers.set);
+      request.headers.set('X-Auth', token);
+      final response = await request
+          .close()
+          .timeout(const Duration(seconds: 10));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        return null;
+      }
+      final text = await utf8.decodeStream(response).timeout(
+        const Duration(seconds: 15),
+      );
+      final decoded = jsonDecode(text);
+      return decoded is Map ? Map<String, dynamic>.from(decoded) : null;
+    } catch (_) {
+      return null;
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> _openMusicPlayerToolPage() async {
+    if (_selectedSpace != SpaceScope.personal) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('音乐播放器只扫描个人空间，请先切换到个人空间。')),
+      );
+      return;
+    }
+    final baseUri = _baseUri;
+    final token = _authToken;
+    if (baseUri == null || token == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请先连接电脑。')),
+      );
+      return;
+    }
+    final state = await _readMusicPlayerState(baseUri, token);
+    if (!mounted) {
+      return;
+    }
+    final savedPath = state?['path']?.toString() ?? '';
+    final savedTitle = state?['title']?.toString() ?? '';
+    final startTitle = savedTitle.trim().isNotEmpty
+        ? savedTitle
+        : (savedPath.isEmpty ? '音乐播放器' : savedPath.split('/').last);
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => AudioPreviewPage(
+          title: startTitle,
+          audioUri: _buildRawDownloadUri(baseUri, savedPath),
+          authToken: token,
+          authHeaders: _buildNasAuthHeaders,
+          baseUri: baseUri,
+          resourcePath: savedPath,
+          directoryPath: _parentDirectoryPath(savedPath),
+          libraryMode: true,
+        ),
+      ),
+    );
+  }
+
   void _recordRecentFileVisit(FileBrowserEntry entry) {
     if (entry.isDir || _isPrivatePath(entry.path)) {
       return;
@@ -6262,6 +6332,15 @@ class _NasHomePageState extends State<NasHomePage> with WidgetsBindingObserver {
             ),
           ),
           const SizedBox(height: 16),
+          _ToolLauncherButton(
+            icon: Icons.library_music_outlined,
+            title: '音乐播放器',
+            subtitle: '浏览电脑上的全部音频，点开即可连续播放。',
+            backgroundColor: const Color(0xFFFFF1F2),
+            foregroundColor: const Color(0xFFBE123C),
+            onTap: _openMusicPlayerToolPage,
+          ),
+          const SizedBox(height: 14),
           _ToolLauncherButton(
             icon: Icons.edit_note_outlined,
             title: '笔记',
@@ -11728,6 +11807,7 @@ class AudioPreviewPage extends StatefulWidget {
     required this.baseUri,
     required this.resourcePath,
     required this.directoryPath,
+    this.libraryMode = false,
     super.key,
   });
 
@@ -11738,6 +11818,9 @@ class AudioPreviewPage extends StatefulWidget {
   final Uri baseUri;
   final String resourcePath;
   final String directoryPath;
+
+  // 全盘音频作为播放列表，从音乐播放器入口进入时使用。
+  final bool libraryMode;
 
   @override
   State<AudioPreviewPage> createState() => _AudioPreviewPageState();
@@ -11856,8 +11939,14 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
       });
     });
 
-    unawaited(_initializeAudio(_currentTrack).then((_) => _restorePositionFromNas()));
-    unawaited(_loadLocalLyrics());
+    if (widget.resourcePath.isNotEmpty) {
+      unawaited(
+        _initializeAudio(_currentTrack).then((_) => _restorePositionFromNas()),
+      );
+      unawaited(_loadLocalLyrics());
+    } else {
+      _lyricsLoading = true;
+    }
     unawaited(_loadPlaylist());
     WidgetsBinding.instance.addPostFrameCallback((_) => _measureCard());
   }
@@ -12216,6 +12305,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
     final payload = jsonEncode({
       'title': _currentName,
       'position': position.inMilliseconds / 1000.0,
+      'path': _currentTrack.path,
     });
     try {
       await _writeNasText('/音乐播放器/player.json', payload);
@@ -12224,13 +12314,15 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
     }
   }
 
-  Future<FileBrowserDirectory> _fetchPlaylistDirectory() async {
+  Future<FileBrowserDirectory> _fetchPlaylistDirectory([
+    String? directoryPath,
+  ]) async {
     final client = HttpClient()
       ..connectionTimeout = const Duration(seconds: 10);
     try {
       final uri = widget.baseUri.replace(
         path:
-            '/api/filebrowser/resources${_encodeResourcePath(widget.directoryPath)}',
+            '/api/filebrowser/resources${_encodeResourcePath(directoryPath ?? widget.directoryPath)}',
       );
       final request = await client
           .getUrl(uri)
@@ -12261,8 +12353,80 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
     }
   }
 
+  Future<List<_AudioTrack>> _fetchLibraryTracks() async {
+    final tracks = <_AudioTrack>[];
+    final visited = <String>{};
+
+    Future<void> visit(String path) async {
+      final normalized = _normalizeDirectoryPath(path);
+      if (!visited.add(normalized)) {
+        return;
+      }
+      final directory = await _fetchPlaylistDirectory(normalized);
+      for (final entry in directory.items) {
+        if (entry.name == _kPrivateDirName) {
+          continue;
+        }
+        if (entry.isDir) {
+          await visit(entry.path);
+          continue;
+        }
+        if (entry.isPreviewableAudio) {
+          tracks.add(_AudioTrack(name: entry.name, path: entry.path));
+        }
+      }
+    }
+
+    await visit('/');
+    tracks.sort((left, right) {
+      final leftParent = _parentDirectoryPath(left.path).toLowerCase();
+      final rightParent = _parentDirectoryPath(right.path).toLowerCase();
+      final byParent = leftParent.compareTo(rightParent);
+      if (byParent != 0) {
+        return byParent;
+      }
+      return left.name.toLowerCase().compareTo(right.name.toLowerCase());
+    });
+    return tracks;
+  }
+
   Future<void> _loadPlaylist() async {
     try {
+      if (widget.libraryMode) {
+        final tracks = await _fetchLibraryTracks();
+        if (!mounted) {
+          return;
+        }
+        if (tracks.isEmpty) {
+          setState(() {
+            _playlistLoading = false;
+            _isPreparing = false;
+            _lyricsLoading = false;
+            _error = '没有找到可播放的音频文件。';
+          });
+          return;
+        }
+        var index = tracks.indexWhere(
+          (track) => track.path == _currentTrack.path,
+        );
+        if (index < 0) {
+          index = 0;
+        }
+        setState(() {
+          _playlist = tracks;
+          _playlistIndex = index;
+          _playlistLoading = false;
+          _refreshPreviews();
+        });
+        if (tracks[index].path != _currentTrack.path) {
+          setState(() {
+            _isPreparing = false;
+          });
+          unawaited(_playTrackAt(index, autoplay: false));
+        }
+        return;
+      }
+
       final directory = await _fetchPlaylistDirectory();
       final tracks = directory.items
           .where((entry) => entry.isPreviewableAudio)
@@ -13020,6 +13184,18 @@ class _AudioPreviewPageState extends State<AudioPreviewPage>
               ),
             ),
           ),
+          if (hole != null)
+            Positioned.fromRect(
+              rect: hole,
+              child: IgnorePointer(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.05),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+              ),
+            ),
           Padding(
             padding: const EdgeInsets.fromLTRB(18, 14, 18, 16),
             child: Column(
@@ -13334,7 +13510,7 @@ class _LyricsPanel extends StatefulWidget {
 
 class _LyricsPanelState extends State<_LyricsPanel> {
   static const double _height = 180;
-  static const double _lineExtent = 44;
+  static const double _lineExtent = 52;
   final ScrollController _scrollController = ScrollController();
   List<LyricLine> _lines = const [];
   bool _synced = false;
@@ -13505,7 +13681,7 @@ class _LyricsPanelState extends State<_LyricsPanel> {
   }
 
   Widget _buildSyncedLyrics() {
-    return Container(
+    return SizedBox(
       height: _height,
       child: ListView.builder(
         controller: _scrollController,
@@ -13525,7 +13701,7 @@ class _LyricsPanelState extends State<_LyricsPanel> {
                 maxLines: 2,
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(
-                  fontSize: active ? 15 : 13,
+                  fontSize: active ? 18 : 13,
                   height: 1.35,
                   fontWeight: active ? FontWeight.w600 : FontWeight.w400,
                   color: active
