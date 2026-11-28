@@ -11743,7 +11743,8 @@ class AudioPreviewPage extends StatefulWidget {
   State<AudioPreviewPage> createState() => _AudioPreviewPageState();
 }
 
-class _AudioPreviewPageState extends State<AudioPreviewPage> {
+class _AudioPreviewPageState extends State<AudioPreviewPage>
+    with SingleTickerProviderStateMixin {
   final AudioPlayer _player = AudioPlayer();
 
   StreamSubscription<Duration>? _positionSubscription;
@@ -11757,7 +11758,6 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
   bool _isPreparing = true;
   bool _isPlaying = false;
   String? _error;
-  String? _preparingLabel;
   bool _triedTranscode = false;
   String? _lyricsText;
   String? _lyricsError;
@@ -11769,6 +11769,28 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
   bool _playlistLoading = true;
   _PlaybackMode _mode = _PlaybackMode.repeatAll;
   bool _handlingCompletion = false;
+
+  final GlobalKey _currentCardKey = GlobalKey();
+  double _cardHeight = 0;
+  double _screenHeight = 0;
+  double _slotTop = 0;
+  double _stackOffset = 0;
+  bool _settling = false;
+  AnimationController? _settleController;
+  _AudioTrack? _previewNext;
+  _AudioTrack? _previewPrev;
+  int? _pendingNextIndex;
+  int? _pendingPrevIndex;
+
+  // 间距取“卡位到屏幕上下边缘”的较大者，保证静止时邻居卡片完全在屏幕外。
+  double get _cardSpacing {
+    if (_cardHeight <= 0 || _screenHeight <= 0) {
+      return 0;
+    }
+    final below = _screenHeight - _slotTop;
+    final above = _slotTop + _cardHeight;
+    return (below > above ? below : above) + 16;
+  }
 
   String get _currentName => _currentTrack.name;
 
@@ -11835,6 +11857,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
     unawaited(_initializeAudio(_currentTrack).then((_) => _restorePositionFromNas()));
     unawaited(_loadLocalLyrics());
     unawaited(_loadPlaylist());
+    WidgetsBinding.instance.addPostFrameCallback((_) => _measureCard());
   }
 
   Future<Map<String, String>> _nasHeaders() async {
@@ -11929,12 +11952,18 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
         if (existing != null && isUsableLyrics(existing)) {
           setState(() {
             _lyricsText = existing;
+            _lyricsLoading = false;
           });
           return;
         }
       }
     } catch (_) {
       // 本地读取失败时保留“获取歌词”入口
+    }
+    if (mounted && identical(_currentTrack, track) && _lyricsLoading) {
+      setState(() {
+        _lyricsLoading = false;
+      });
     }
   }
 
@@ -12256,6 +12285,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
         _playlist = tracks;
         _playlistIndex = index;
         _playlistLoading = false;
+        _refreshPreviews();
       });
     } catch (_) {
       if (mounted) {
@@ -12285,31 +12315,28 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
     }
 
     setState(() {
-      _isPreparing = true;
-    });
-    unawaited(_savePlayerState());
-    await _player.stop();
-    if (!mounted) {
-      return;
-    }
-
-    setState(() {
       _playlistIndex = index;
       _currentTrack = track;
+      _stackOffset = 0;
       _position = Duration.zero;
       _duration = Duration.zero;
       _dragValueMs = null;
       _isPreparing = true;
       _isPlaying = false;
       _error = null;
-      _preparingLabel = null;
       _triedTranscode = false;
       _positionRestored = false;
       _lyricsText = null;
       _lyricsError = null;
-      _lyricsLoading = false;
+      _lyricsLoading = true;
+      _refreshPreviews();
     });
+    unawaited(_savePlayerState());
     unawaited(_loadLocalLyrics());
+    await _player.stop();
+    if (!mounted || !identical(_currentTrack, track)) {
+      return;
+    }
 
     final ready = await _initializeAudio(track);
     if (!mounted || !identical(_currentTrack, track) || !ready) {
@@ -12341,7 +12368,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
         await _player.play();
         return;
       }
-      await _playTrackAt(next);
+      _animateStackTo(-_cardSpacing, commitIndex: next);
     } finally {
       _handlingCompletion = false;
     }
@@ -12374,38 +12401,40 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
     }
   }
 
-  Future<void> _playPrevious() async {
-    if (_playlist.length <= 1) {
-      await _player.seek(Duration.zero);
-      return;
+  int? _prevIndex() {
+    if (_playlist.isEmpty) {
+      return null;
     }
-    if (_position >= const Duration(seconds: 3)) {
-      await _player.seek(Duration.zero);
-      return;
+    final length = _playlist.length;
+    switch (_mode) {
+      case _PlaybackMode.sequential:
+      case _PlaybackMode.repeatOne:
+        return _playlistIndex - 1 >= 0 ? _playlistIndex - 1 : null;
+      case _PlaybackMode.repeatAll:
+        return length == 1 ? 0 : (_playlistIndex - 1 + length) % length;
+      case _PlaybackMode.shuffle:
+        if (length == 1) {
+          return 0;
+        }
+        var prev = _playlistIndex;
+        while (prev == _playlistIndex) {
+          prev = Random().nextInt(length);
+        }
+        return prev;
     }
-    var index = _playlistIndex - 1;
-    if (index < 0) {
-      if (_mode == _PlaybackMode.repeatAll ||
-          _mode == _PlaybackMode.shuffle) {
-        index = _playlist.length - 1;
-      } else {
-        return;
-      }
-    }
-    await _playTrackAt(index);
   }
 
-  Future<void> _playNext() async {
-    final next = _nextIndex(auto: false);
-    if (next == null) {
-      return;
-    }
-    if (next == _playlistIndex) {
-      await _player.seek(Duration.zero);
-      await _player.play();
-      return;
-    }
-    await _playTrackAt(next);
+  void _refreshPreviews() {
+    _pendingNextIndex = _nextIndex(auto: false);
+    _pendingPrevIndex = _prevIndex();
+    _previewNext =
+        _pendingNextIndex != null && _pendingNextIndex != _playlistIndex
+            ? _playlist[_pendingNextIndex!]
+            : null;
+    _previewPrev =
+        _pendingPrevIndex != null && _pendingPrevIndex != _playlistIndex
+            ? _playlist[_pendingPrevIndex!]
+            : null;
   }
 
   void _cycleMode() {
@@ -12413,6 +12442,7 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
     final next = values[(_mode.index + 1) % values.length];
     setState(() {
       _mode = next;
+      _refreshPreviews();
     });
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text('播放模式：${next.label}')),
@@ -12513,7 +12543,6 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
         _duration = duration ?? Duration.zero;
         _isPreparing = false;
         _error = null;
-        _preparingLabel = null;
       });
       return true;
     } catch (error) {
@@ -12529,7 +12558,6 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
 
       setState(() {
         _isPreparing = false;
-        _preparingLabel = null;
         _error = _describeAudioError(error, fallback: '音频加载失败，请稍后重试。');
       });
       return false;
@@ -12548,7 +12576,6 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
         setState(() {
           _isPreparing = true;
           _error = null;
-          _preparingLabel = '正在转码音频...';
         });
       }
 
@@ -12561,7 +12588,6 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
         return false;
       }
       var status = data['status']?.toString() ?? 'processing';
-      var progress = (data['progress'] as num?)?.toDouble() ?? 0;
       final key = data['key']?.toString();
 
       var guard = 0;
@@ -12569,11 +12595,6 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
         if (!_isCurrentTrack(track)) {
           return false;
         }
-        setState(() {
-          _preparingLabel = progress > 0
-              ? '正在转码音频 ${(progress * 100).round()}%'
-              : '正在转码音频...';
-        });
         await Future.delayed(const Duration(milliseconds: 600));
         if (!_isCurrentTrack(track)) {
           return false;
@@ -12586,7 +12607,6 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
           return false;
         }
         status = polled['status']?.toString() ?? status;
-        progress = (polled['progress'] as num?)?.toDouble() ?? progress;
         if (status == 'failed') {
           data = polled;
         }
@@ -12609,7 +12629,6 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
       setState(() {
         _duration = duration ?? Duration.zero;
         _isPreparing = false;
-        _preparingLabel = null;
         _error = null;
       });
       return true;
@@ -12620,7 +12639,6 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
 
       setState(() {
         _isPreparing = false;
-        _preparingLabel = null;
         _error = _describeAudioError(
           error,
           fallback: '音频转码播放失败，请稍后重试。',
@@ -12798,8 +12816,322 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
     }
   }
 
+  void _measureCard() {
+    if (!mounted) {
+      return;
+    }
+    final box =
+        _currentCardKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) {
+      return;
+    }
+    final height = box.size.height;
+    final top = box.localToGlobal(Offset.zero).dy - _stackOffset;
+    if ((height - _cardHeight).abs() < 0.5 && (top - _slotTop).abs() < 0.5) {
+      return;
+    }
+    setState(() {
+      _cardHeight = height;
+      _slotTop = top;
+    });
+  }
+
+  void _cancelSettle() {
+    final controller = _settleController;
+    _settleController = null;
+    _settling = false;
+    controller?.dispose();
+  }
+
+  void _animateStackTo(double target, {int? commitIndex}) {
+    _cancelSettle();
+    final controller = AnimationController(
+      duration: const Duration(milliseconds: 260),
+      vsync: this,
+    );
+    final animation = Tween<double>(begin: _stackOffset, end: target).animate(
+      CurvedAnimation(parent: controller, curve: Curves.easeOutCubic),
+    );
+    _settleController = controller;
+    _settling = true;
+    animation.addListener(() {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _stackOffset = animation.value;
+      });
+    });
+    controller.addStatusListener((status) {
+      if (status != AnimationStatus.completed &&
+          status != AnimationStatus.dismissed) {
+        return;
+      }
+      _settleController = null;
+      _settling = false;
+      controller.dispose();
+      if (!mounted) {
+        return;
+      }
+      if (commitIndex != null) {
+        // 切歌会同步把偏移归零，卡片交接不会跳变。
+        unawaited(_playTrackAt(commitIndex));
+      } else {
+        setState(() {
+          _stackOffset = 0;
+        });
+      }
+    });
+    controller.forward();
+  }
+
+  void _handleCardDragStart(DragStartDetails details) {
+    if (_settling) {
+      _cancelSettle();
+    }
+  }
+
+  void _handleCardDragUpdate(DragUpdateDetails details) {
+    if (_isPreparing) {
+      return;
+    }
+    final upLimit = _previewNext != null ? -_cardSpacing : 0.0;
+    final downLimit = _previewPrev != null ? _cardSpacing : 0.0;
+    if (upLimit >= 0 && downLimit <= 0) {
+      return;
+    }
+    setState(() {
+      _stackOffset = (_stackOffset + details.delta.dy).clamp(
+        upLimit,
+        downLimit,
+      );
+    });
+  }
+
+  void _handleCardSwipe(DragEndDetails details) {
+    if (_isPreparing) {
+      setState(() {
+        _stackOffset = 0;
+      });
+      return;
+    }
+    final velocity = details.primaryVelocity ?? 0;
+    final offset = _stackOffset;
+    int? commit;
+    var target = 0.0;
+    if (offset < 0 &&
+        _previewNext != null &&
+        (velocity < -400 || -offset > 0.35 * _cardSpacing)) {
+      commit = _pendingNextIndex;
+      target = -_cardSpacing;
+    } else if (offset > 0 &&
+        _previewPrev != null &&
+        (velocity > 400 || offset > 0.35 * _cardSpacing)) {
+      commit = _pendingPrevIndex;
+      target = _cardSpacing;
+    }
+    if (commit == null || commit == _playlistIndex) {
+      _animateStackTo(0);
+      return;
+    }
+    _animateStackTo(target, commitIndex: commit);
+  }
+
+  Widget _buildCard(
+    BuildContext context,
+    ThemeData theme, {
+    _AudioTrack? previewTrack,
+  }) {
+    final preview = previewTrack != null;
+    final title = preview ? previewTrack.name : _currentName;
+    final totalMs = preview ? 0.0 : _duration.inMilliseconds.toDouble();
+    final hasKnownDuration = totalMs > 0;
+    final sliderMax = hasKnownDuration ? totalMs : 1.0;
+    final displayedPositionMs = preview
+        ? 0.0
+        : (_dragValueMs ?? _position.inMilliseconds.toDouble());
+    final sliderValue = hasKnownDuration
+        ? displayedPositionMs.clamp(0.0, sliderMax)
+        : 0.0;
+    final canSeek =
+        !preview && !_isPreparing && _error == null && hasKnownDuration;
+    final effectivePosition = Duration(
+      milliseconds: displayedPositionMs.round(),
+    );
+    final playEnabled = !preview && _error == null && !_isPreparing;
+    final statusText = preview
+        ? (identical(previewTrack, _previewNext) ? '下一首' : '上一首')
+        : (_error ??
+              (_isPlaying
+                  ? '正在播放'
+                  : (_isPreparing ? '正在加载音频...' : '已暂停')));
+    final statusColor = preview
+        ? Colors.white.withValues(alpha: 0.6)
+        : (_error == null
+              ? Colors.white.withValues(alpha: 0.82)
+              : const Color(0xFFFECACA));
+    final timeStyle = theme.textTheme.bodySmall?.copyWith(
+      color: Colors.white.withValues(alpha: 0.88),
+    );
+
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(24),
+      child: BackdropFilter.grouped(
+        filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: const Color(0x2A111827),
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.2)),
+            boxShadow: const [
+              BoxShadow(
+                color: Color(0x22000000),
+                blurRadius: 24,
+                offset: Offset(0, 12),
+              ),
+            ],
+          ),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(18, 14, 18, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: theme.textTheme.titleLarge?.copyWith(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  statusText,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: theme.textTheme.bodyMedium?.copyWith(
+                    color: statusColor,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  height: _LyricsPanelState._height,
+                  child: preview
+                      ? DecoratedBox(
+                          decoration: BoxDecoration(
+                            color: Colors.white.withValues(alpha: 0.02),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                        )
+                      : _LyricsPanel(
+                          lyrics: _lyricsText,
+                          loading: _lyricsLoading,
+                          error: _lyricsError,
+                          onFetch: _fetchLyrics,
+                          position: _position,
+                        ),
+                ),
+                const SizedBox(height: 10),
+                SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    activeTrackColor: Colors.white,
+                    inactiveTrackColor: Colors.white.withValues(alpha: 0.24),
+                    thumbColor: Colors.white,
+                    overlayColor: Colors.white.withValues(alpha: 0.16),
+                  ),
+                  child: Slider(
+                    min: 0,
+                    max: sliderMax,
+                    value: sliderValue,
+                    onChanged: canSeek
+                        ? (value) {
+                            setState(() {
+                              _dragValueMs = value;
+                            });
+                          }
+                        : null,
+                    onChangeEnd: canSeek ? _seekTo : null,
+                  ),
+                ),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(
+                      _formatMediaDuration(effectivePosition),
+                      style: timeStyle,
+                    ),
+                    Text(
+                      hasKnownDuration
+                          ? _formatMediaDuration(_duration)
+                          : '--:--',
+                      style: timeStyle,
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
+                    SizedBox(
+                      width: 56,
+                      height: 56,
+                      child: IconButton(
+                        tooltip: _mode.label,
+                        onPressed: preview ? null : _cycleMode,
+                        icon: Icon(
+                          _mode.icon,
+                          size: 26,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                    SizedBox(
+                      width: 64,
+                      height: 64,
+                      child: IconButton(
+                        tooltip: _isPlaying ? '暂停' : '播放',
+                        onPressed: playEnabled ? _togglePlayback : null,
+                        icon: Icon(
+                          !preview && _isPlaying
+                              ? Icons.pause_rounded
+                              : Icons.play_arrow_rounded,
+                          size: 44,
+                          color: playEnabled ? Colors.white : Colors.white54,
+                        ),
+                      ),
+                    ),
+                    SizedBox(
+                      width: 56,
+                      height: 56,
+                      child: IconButton(
+                        tooltip: '播放列表',
+                        onPressed: preview || _isPreparing
+                            ? null
+                            : _showPlaylist,
+                        icon: const Icon(
+                          Icons.queue_music_rounded,
+                          size: 26,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   void dispose() {
+    _cancelSettle();
     _positionSubscription?.cancel();
     _durationSubscription?.cancel();
     _playerStateSubscription?.cancel();
@@ -12815,28 +13147,11 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final totalMs = _duration.inMilliseconds.toDouble();
-    final hasKnownDuration = totalMs > 0;
-    final sliderMax = hasKnownDuration ? totalMs : 1.0;
-    final displayedPositionMs =
-        _dragValueMs ?? _position.inMilliseconds.toDouble();
-    final sliderValue = hasKnownDuration
-        ? displayedPositionMs.clamp(0.0, sliderMax)
-        : 0.0;
-    final canSeek = !_isPreparing && _error == null && hasKnownDuration;
-    final effectivePosition = Duration(
-      milliseconds: displayedPositionMs.round(),
-    );
-    final statusText =
-        _error ??
-        (_isPlaying
-            ? '正在播放'
-            : (_isPreparing
-                  ? (_preparingLabel ?? '正在加载音频...')
-                  : '已暂停'));
-    final statusColor = _error == null
-        ? Colors.white.withValues(alpha: 0.82)
-        : const Color(0xFFFECACA);
+    final screenHeight = MediaQuery.sizeOf(context).height;
+    if (screenHeight != _screenHeight) {
+      _screenHeight = screenHeight;
+      WidgetsBinding.instance.addPostFrameCallback((_) => _measureCard());
+    }
 
     return Scaffold(
       extendBodyBehindAppBar: true,
@@ -12867,204 +13182,75 @@ class _AudioPreviewPageState extends State<AudioPreviewPage> {
               ),
             ),
           ),
-          SafeArea(
-            child: Padding(
+          GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onVerticalDragStart: _handleCardDragStart,
+            onVerticalDragUpdate: _handleCardDragUpdate,
+            onVerticalDragEnd: _handleCardSwipe,
+            child: SafeArea(
+              child: Padding(
               padding: const EdgeInsets.fromLTRB(18, 12, 18, 20),
               child: Align(
                 alignment: const Alignment(0, -0.1),
                 child: ConstrainedBox(
                   constraints: const BoxConstraints(maxWidth: 560),
-                  child: ClipRRect(
-                    borderRadius: BorderRadius.circular(24),
-                    child: BackdropFilter(
-                      filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
-                      child: DecoratedBox(
-                        decoration: BoxDecoration(
-                          color: const Color(0x2A111827),
-                          borderRadius: BorderRadius.circular(24),
-                          border: Border.all(
-                            color: Colors.white.withValues(alpha: 0.2),
-                          ),
-                          boxShadow: const [
-                            BoxShadow(
-                              color: Color(0x22000000),
-                              blurRadius: 24,
-                              offset: Offset(0, 12),
+                  child: BackdropGroup(
+                    child: NotificationListener<SizeChangedLayoutNotification>(
+                      onNotification: (_) {
+                        WidgetsBinding.instance.addPostFrameCallback(
+                          (_) => _measureCard(),
+                        );
+                        return true;
+                      },
+                      child: Stack(
+                        clipBehavior: Clip.none,
+                        alignment: Alignment.center,
+                        children: [
+                          if (_stackOffset != 0 && _previewPrev != null)
+                            Transform.translate(
+                              offset: Offset(
+                                0,
+                                _stackOffset - _cardSpacing,
+                              ),
+                              child: IgnorePointer(
+                                child: _buildCard(
+                                  context,
+                                  theme,
+                                  previewTrack: _previewPrev,
+                                ),
+                              ),
                             ),
-                          ],
-                        ),
-                        child: Padding(
-                          padding: const EdgeInsets.fromLTRB(18, 14, 18, 16),
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: [
-                              Text(
-                                _currentName,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                textAlign: TextAlign.center,
-                                style: theme.textTheme.titleLarge?.copyWith(
-                                  color: Colors.white,
-                                  fontWeight: FontWeight.w700,
+                          if (_stackOffset != 0 && _previewNext != null)
+                            Transform.translate(
+                              offset: Offset(
+                                0,
+                                _stackOffset + _cardSpacing,
+                              ),
+                              child: IgnorePointer(
+                                child: _buildCard(
+                                  context,
+                                  theme,
+                                  previewTrack: _previewNext,
                                 ),
                               ),
-                              const SizedBox(height: 4),
-                              Text(
-                                statusText,
-                                textAlign: TextAlign.center,
-                                style: theme.textTheme.bodyMedium?.copyWith(
-                                  color: statusColor,
-                                ),
+                            ),
+                          SizeChangedLayoutNotifier(
+                            child: KeyedSubtree(
+                              key: _currentCardKey,
+                              child: Transform.translate(
+                                offset: Offset(0, _stackOffset),
+                                child: _buildCard(context, theme),
                               ),
-                              const SizedBox(height: 10),
-                              _LyricsPanel(
-                                lyrics: _lyricsText,
-                                loading: _lyricsLoading,
-                                error: _lyricsError,
-                                onFetch: _fetchLyrics,
-                                position: _position,
-                              ),
-                              const SizedBox(height: 10),
-                              SliderTheme(
-                                data: SliderTheme.of(context).copyWith(
-                                  activeTrackColor: Colors.white,
-                                  inactiveTrackColor: Colors.white.withValues(
-                                    alpha: 0.24,
-                                  ),
-                                  thumbColor: Colors.white,
-                                  overlayColor: Colors.white.withValues(
-                                    alpha: 0.16,
-                                  ),
-                                ),
-                                child: Slider(
-                                  min: 0,
-                                  max: sliderMax,
-                                  value: sliderValue,
-                                  onChanged: canSeek
-                                      ? (value) {
-                                          setState(() {
-                                            _dragValueMs = value;
-                                          });
-                                        }
-                                      : null,
-                                  onChangeEnd: canSeek ? _seekTo : null,
-                                ),
-                              ),
-                              Row(
-                                mainAxisAlignment:
-                                    MainAxisAlignment.spaceBetween,
-                                children: [
-                                  Text(
-                                    _formatMediaDuration(effectivePosition),
-                                    style: theme.textTheme.bodySmall?.copyWith(
-                                      color: Colors.white.withValues(
-                                        alpha: 0.88,
-                                      ),
-                                    ),
-                                  ),
-                                  Text(
-                                    hasKnownDuration
-                                        ? _formatMediaDuration(_duration)
-                                        : '--:--',
-                                    style: theme.textTheme.bodySmall?.copyWith(
-                                      color: Colors.white.withValues(
-                                        alpha: 0.88,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 8),
-                              Row(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  SizedBox(
-                                    width: 48,
-                                    height: 48,
-                                    child: IconButton(
-                                      tooltip: _mode.label,
-                                      onPressed: _cycleMode,
-                                      icon: Icon(
-                                        _mode.icon,
-                                        size: 24,
-                                        color: Colors.white,
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 12),
-                                  SizedBox(
-                                    width: 48,
-                                    height: 48,
-                                    child: IconButton(
-                                      tooltip: '上一曲',
-                                      onPressed: _isPreparing ? null : _playPrevious,
-                                      icon: const Icon(
-                                        Icons.skip_previous_rounded,
-                                        size: 30,
-                                        color: Colors.white,
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 10),
-                                  SizedBox(
-                                    width: 52,
-                                    height: 52,
-                                    child: IconButton(
-                                      tooltip: _isPlaying ? '暂停' : '播放',
-                                      onPressed: _error == null && !_isPreparing
-                                          ? _togglePlayback
-                                          : null,
-                                      icon: Icon(
-                                        _isPlaying
-                                            ? Icons.pause_rounded
-                                            : Icons.play_arrow_rounded,
-                                        size: 40,
-                                        color: _error == null && !_isPreparing
-                                            ? Colors.white
-                                            : Colors.white54,
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 10),
-                                  SizedBox(
-                                    width: 48,
-                                    height: 48,
-                                    child: IconButton(
-                                      tooltip: '下一曲',
-                                      onPressed: _isPreparing ? null : _playNext,
-                                      icon: const Icon(
-                                        Icons.skip_next_rounded,
-                                        size: 30,
-                                        color: Colors.white,
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 12),
-                                  SizedBox(
-                                    width: 48,
-                                    height: 48,
-                                    child: IconButton(
-                                      tooltip: '播放列表',
-                                      onPressed: _isPreparing ? null : _showPlaylist,
-                                      icon: const Icon(
-                                        Icons.queue_music_rounded,
-                                        size: 24,
-                                        color: Colors.white,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ],
+                            ),
                           ),
-                        ),
+                        ],
                       ),
                     ),
                   ),
                 ),
               ),
             ),
+          ),
           ),
         ],
       ),
@@ -13196,7 +13382,7 @@ class _LyricsPanelState extends State<_LyricsPanel> {
         height: 52,
         alignment: Alignment.center,
         decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.05),
+          color: Colors.white.withValues(alpha: 0.02),
           borderRadius: BorderRadius.circular(12),
         ),
         child: const Row(
@@ -13221,7 +13407,7 @@ class _LyricsPanelState extends State<_LyricsPanel> {
     return Container(
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 6),
       decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.05),
+        color: Colors.white.withValues(alpha: 0.02),
         borderRadius: BorderRadius.circular(12),
       ),
       child: Column(
@@ -13259,7 +13445,7 @@ class _LyricsPanelState extends State<_LyricsPanel> {
       height: _height,
       padding: const EdgeInsets.fromLTRB(14, 10, 14, 10),
       decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.05),
+        color: Colors.white.withValues(alpha: 0.02),
         borderRadius: BorderRadius.circular(12),
       ),
       child: SingleChildScrollView(
@@ -13280,7 +13466,7 @@ class _LyricsPanelState extends State<_LyricsPanel> {
       height: _height,
       clipBehavior: Clip.antiAlias,
       decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.05),
+        color: Colors.white.withValues(alpha: 0.02),
         borderRadius: BorderRadius.circular(12),
       ),
       child: ListView.builder(
